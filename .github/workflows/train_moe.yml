@@ -1,44 +1,24 @@
-name: Gerar Música (RAG+MoE)
+name: Treinar MoE (5000 épocas)
 
 on:
   workflow_dispatch:
     inputs:
-      prompt:
-        description: "Prompt em português"
+      epochs:
+        description: "Épocas (mínimo 5000)"
         required: false
-        default: ""
-      style:
-        description: "Estilo"
+        default: "5000"
+      num_experts:
+        description: "Número de experts"
         required: false
-        default: "epic"
-        type: choice
-        options: [epic, bossfight, dark, rock, ambient, electronic, jazz, classical, breakcore]
-      duration:
-        description: "Duração (segundos)"
-        required: false
-        default: "45"
-        type: choice
-        options: ["30", "45", "60", "90"]
-      count:
-        description: "Quantidade"
-        required: false
-        default: "1"
-        type: choice
-        options: ["1", "2", "3", "5"]
-      use_rag:
-        description: "Usar RAG?"
-        required: false
-        default: "true"
-        type: choice
-        options: ["true", "false"]
+        default: "8"
 
 permissions:
   contents: write
 
 jobs:
-  generate:
+  train:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
     - name: Checkout
@@ -55,33 +35,27 @@ jobs:
     - name: Install Dependencies
       run: pip install numpy scipy soundfile
 
-    - name: Generate Music
+    - name: Train MoE
       env:
-        PROMPT: ${{ github.event.inputs.prompt }}
-        STYLE: ${{ github.event.inputs.style }}
-        DURATION: ${{ github.event.inputs.duration }}
-        COUNT: ${{ github.event.inputs.count }}
-        USE_RAG: ${{ github.event.inputs.use_rag }}
+        EPOCHS: ${{ github.event.inputs.epochs }}
+        NUM_EXPERTS: ${{ github.event.inputs.num_experts }}
       run: |
-        mkdir -p song_output
-        for i in $(seq 1 $COUNT); do
-          echo "=== Música $i de $COUNT ==="
-          if [ -n "$PROMPT" ]; then
-            python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --use-rag $USE_RAG --batch
-          else
-            python music_generator.py --style "$STYLE" --duration "$DURATION" --use-rag $USE_RAG --batch
-          fi
-        done
+        echo "=========================================="
+        echo "  TREINAMENTO MoE"
+        echo "  Épocas: $EPOCHS"
+        echo "  Experts: $NUM_EXPERTS"
+        echo "=========================================="
+        python train.py --epochs $EPOCHS --num-experts $NUM_EXPERTS
 
-    - name: Commit Songs
+    - name: Commit Models
       run: |
-        git config --local user.email "music-bot@github.com"
-        git config --local user.name "Music Bot"
-        git add song_output/
+        git config --local user.email "train-bot@github.com"
+        git config --local user.name "Train Bot"
+        git add models/
         if git diff --staged --quiet; then
           echo "Nada para commitar"
         else
-          git commit -m "🎵 Músicas RAG+MoE: $(date '+%Y-%m-%d %H:%M')"
+          git commit -m "🧠 MoE treinado: $(date '+%Y-%m-%d %H:%M')"
           git pull --rebase origin main
           git push
         fi
@@ -89,6 +63,6 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: generated-songs
-        path: song_output/
-        retention-days: 30
+        name: moe-model
+        path: models/
+        retention-days: 90
