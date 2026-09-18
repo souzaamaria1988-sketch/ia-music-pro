@@ -1,47 +1,36 @@
-name: Gerar Música
+name: Gerar Música (RAG+MoE)
 
 on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: "Prompt em português (vazio = usar estilo)"
+        description: "Prompt em português"
         required: false
         default: ""
       style:
-        description: "Estilo musical"
+        description: "Estilo"
         required: false
         default: "epic"
         type: choice
-        options:
-          - epic
-          - bossfight
-          - dark
-          - rock
-          - ambient
-          - electronic
-          - jazz
-          - classical
-          - breakcore
+        options: [epic, bossfight, dark, rock, ambient, electronic, jazz, classical, breakcore]
       duration:
-        description: "Duração em segundos"
+        description: "Duração (segundos)"
         required: false
         default: "45"
         type: choice
-        options:
-          - "30"
-          - "45"
-          - "60"
-          - "90"
+        options: ["30", "45", "60", "90"]
       count:
-        description: "Quantas músicas gerar"
+        description: "Quantidade"
         required: false
         default: "1"
         type: choice
-        options:
-          - "1"
-          - "2"
-          - "3"
-          - "5"
+        options: ["1", "2", "3", "5"]
+      use_rag:
+        description: "Usar RAG?"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
 
 permissions:
   contents: write
@@ -63,30 +52,21 @@ jobs:
     - name: Install Dependencies
       run: pip install numpy scipy soundfile
 
-    - name: Create Output Directory
-      run: mkdir -p song_output
-
     - name: Generate Music
       env:
         PROMPT: ${{ github.event.inputs.prompt }}
         STYLE: ${{ github.event.inputs.style }}
         DURATION: ${{ github.event.inputs.duration }}
         COUNT: ${{ github.event.inputs.count }}
+        USE_RAG: ${{ github.event.inputs.use_rag }}
       run: |
-        echo "=========================================="
-        echo "  Prompt: '$PROMPT'"
-        echo "  Estilo: $STYLE"
-        echo "  Duração: ${DURATION}s"
-        echo "  Quantidade: $COUNT"
-        echo "=========================================="
-        
+        mkdir -p song_output
         for i in $(seq 1 $COUNT); do
-          echo ""
           echo "=== Música $i de $COUNT ==="
           if [ -n "$PROMPT" ]; then
-            python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --batch
+            python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --use-rag $USE_RAG --batch
           else
-            python music_generator.py --style "$STYLE" --duration "$DURATION" --batch
+            python music_generator.py --style "$STYLE" --duration "$DURATION" --use-rag $USE_RAG --batch
           fi
         done
 
@@ -95,10 +75,8 @@ jobs:
         git config --local user.email "music-bot@github.com"
         git config --local user.name "Music Bot"
         git add song_output/
-        if git diff --staged --quiet; then
-          echo "Nada para commitar"
-        else
-          git commit -m "🎵 Músicas geradas: $(date '+%Y-%m-%d %H:%M')"
+        if git diff --staged --quiet; then echo "Nada para commitar"; else
+          git commit -m "🎵 Músicas RAG+MoE: $(date '+%Y-%m-%d %H:%M')"
           git push
         fi
 
