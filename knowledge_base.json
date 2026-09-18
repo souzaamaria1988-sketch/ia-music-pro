@@ -1,0 +1,750 @@
+{
+  "version": "1.0",
+  "description": "Base de conhecimento musical para RAG",
+  "entries": [
+    {
+      "id": 1,
+      "tags": [
+        "epic",
+        "batalha",
+        "guerra",
+        "orquestal",
+        "heroico"
+      ],
+      "pattern": "progression_epic",
+      "scale": "major",
+      "bpm_range": [
+        120,
+        140
+      ],
+      "instruments": [
+        "strings",
+        "brass",
+        "drums",
+        "choir"
+      ],
+      "dynamics": "loud",
+      "description": "Progressão épica com acordes ascendentes e percussão pesada"
+    },
+    {
+      "id": 2,
+      "tags": [
+        "dark",
+        "sombrio",
+        "terror",
+        "medo",
+        "misterioso"
+      ],
+      "pattern": "progression_minor_desc",
+      "scale": "minor",
+      "bpm_range": [
+        60,
+        90
+      ],
+      "instruments": [
+        "strings",
+        "piano",
+        "pad"
+      ],
+      "dynamics": "quiet",
+      "description": "Progressão descendente em tom menor com atmosfera densa"
+    },
+    {
+      "id": 3,
+      "tags": [
+        "electronic",
+        "synth",
+        "dance",
+        "edm",
+        "techno"
+      ],
+      "pattern": "progression_electronic",
+      "scale": "minor",
+      "bpm_range": [
+        128,
+        150
+      ],
+      "instruments": [
+        "synth",
+        "bass",
+        "drums_machine"
+      ],
+      "dynamics": "loud",
+      "description": "Padrão four-on-the-floor com synth arpeggios"
+    },
+    {
+      "id": 4,
+      "tags": [
+        "jazz",
+        "swing",
+        "blues",
+        "saxofone",
+        "piano"
+      ],
+      "pattern": "progression_jazz",
+      "scale": "dorian",
+      "bpm_range": [
+        100,
+        140
+      ],
+      "instruments": [
+        "piano",
+        "bass",
+        "drums_brush",
+        "sax"
+      ],
+      "dynamics": "medium",
+      "description": "Progressão ii-V-I com sétimas e extensões"
+    },
+    {
+      "id": 5,
+      "tags": [
+        "breakcore",
+        "amen",
+        "glitch",
+        "jungle",
+        "dnb",
+        "caotico"
+      ],
+      "pattern": "amen_break_chopped",
+      "scale": "minor",
+      "bpm_range": [
+        180,
+        230
+      ],
+      "instruments": [
+        "breakbeat",
+        "reese_bass",
+        "glitch"
+      ],
+      "dynamics": "extreme",
+      "description": "Amen break cortado e rearranjado com glitches"
+    },
+    {
+      "id": 6,
+      "tags": [
+        "ambient",
+        "calmo",
+        "relaxante",
+        "espaço",
+        "atmosferico"
+      ],
+      "pattern": "progression_ambient",
+      "scale": "major",
+      "bpm_range": [
+        40,
+        70
+      ],
+      "instruments": [
+        "pad",
+        "flute",
+        "bells"
+      ],
+      "dynamics": "very_quiet",
+      "description": "Pads longos com evolução lenta e texturas"
+    },
+    {
+      "id": 7,
+      "tags": [
+        "rock",
+        "metal",
+        "guitarra",
+        "pesado",
+        "agressivo"
+      ],
+      "pattern": "progression_rock",
+      "scale": "minor",
+      "bpm_range": [
+        120,
+        160
+      ],
+      "instruments": [
+        "guitar_dist",
+        "bass",
+        "drums_heavy"
+      ],
+      "dynamics": "loud",
+      "description": "Power chords com palm muting e double bass"
+    },
+    {
+      "id": 8,
+      "tags": [
+        "classical",
+        "clássica",
+        "orquesta",
+        "piano",
+        "violino"
+      ],
+      "pattern": "progression_classical",
+      "scale": "major",
+      "bpm_range": [
+        60,
+        120
+      ],
+      "instruments": [
+        "strings",
+        "piano",
+        "woodwinds",
+        "brass"
+      ],
+      "dynamics": "varied",
+      "description": "Forma sonata com desenvolvimento temático"
+    },
+    {
+      "id": 9,
+      "tags": [
+        "triste",
+        "melancólico",
+        "chorar",
+        "depressivo"
+      ],
+      "pattern": "progression_sad",
+      "scale": "minor",
+      "bpm_range": [
+        60,
+        80
+      ],
+      "instruments": [
+        "piano",
+        "strings",
+        "cello"
+      ],
+      "dynamics": "quiet",
+      "description": "Progressão i-VI-III-VII com melodia descendente"
+    },
+    {
+      "id": 10,
+      "tags": [
+        "feliz",
+        "alegre",
+        "upbeat",
+        "pop",
+        "animado"
+      ],
+      "pattern": "progression_happy",
+      "scale": "major",
+      "bpm_range": [
+        100,
+        130
+      ],
+      "instruments": [
+        "guitar",
+        "piano",
+        "drums",
+        "bass"
+      ],
+      "dynamics": "medium",
+      "description": "Progressão I-V-vi-IV com ritmo animado"
+    },
+    {
+      "id": 11,
+      "tags": [
+        "boss",
+        "fight",
+        "intenso",
+        "perigo",
+        "urgente"
+      ],
+      "pattern": "progression_boss",
+      "scale": "minor",
+      "bpm_range": [
+        140,
+        180
+      ],
+      "instruments": [
+        "orchestra",
+        "drums",
+        "choir",
+        "guitar"
+      ],
+      "dynamics": "extreme",
+      "description": "Ostinato intenso com builds e drops"
+    },
+    {
+      "id": 12,
+      "tags": [
+        "medieval",
+        "fantasia",
+        "aventura",
+        "rpg"
+      ],
+      "pattern": "progression_medieval",
+      "scale": "dorian",
+      "bpm_range": [
+        90,
+        120
+      ],
+      "instruments": [
+        "flute",
+        "lute",
+        "drums_frame",
+        "strings"
+      ],
+      "dynamics": "medium",
+      "description": "Modo dórico com instrumentos medievais"
+    },
+    {
+      "id": 13,
+      "tags": [
+        "romântico",
+        "amor",
+        "suave",
+        "delicado"
+      ],
+      "pattern": "progression_romantic",
+      "scale": "major",
+      "bpm_range": [
+        60,
+        80
+      ],
+      "instruments": [
+        "piano",
+        "strings",
+        "harp"
+      ],
+      "dynamics": "quiet",
+      "description": "Progressão suave com arpejos delicados"
+    },
+    {
+      "id": 14,
+      "tags": [
+        "tensão",
+        "suspense",
+        "thriller",
+        "ansiedade"
+      ],
+      "pattern": "progression_tension",
+      "scale": "harmonic_minor",
+      "bpm_range": [
+        80,
+        120
+      ],
+      "instruments": [
+        "strings_pizz",
+        "percussion",
+        "pad_dark"
+      ],
+      "dynamics": "building",
+      "description": "Dissonâncias crescentes com resolução adiada"
+    },
+    {
+      "id": 15,
+      "tags": [
+        "vitória",
+        "triunfo",
+        "conquista",
+        "glorioso"
+      ],
+      "pattern": "progression_victory",
+      "scale": "major",
+      "bpm_range": [
+        100,
+        130
+      ],
+      "instruments": [
+        "brass",
+        "strings",
+        "timpani",
+        "choir"
+      ],
+      "dynamics": "loud",
+      "description": "Fanfarra com progressão ascendente gloriosa"
+    }
+  ],
+  "scales": {
+    "major": [
+      0,
+      2,
+      4,
+      5,
+      7,
+      9,
+      11
+    ],
+    "minor": [
+      0,
+      2,
+      3,
+      5,
+      7,
+      8,
+      10
+    ],
+    "dorian": [
+      0,
+      2,
+      3,
+      5,
+      7,
+      9,
+      10
+    ],
+    "harmonic_minor": [
+      0,
+      2,
+      3,
+      5,
+      7,
+      8,
+      11
+    ],
+    "pentatonic_major": [
+      0,
+      2,
+      4,
+      7,
+      9
+    ],
+    "pentatonic_minor": [
+      0,
+      3,
+      5,
+      7,
+      10
+    ],
+    "blues": [
+      0,
+      3,
+      5,
+      6,
+      7,
+      10
+    ]
+  },
+  "chord_progressions": {
+    "progression_epic": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        5,
+        0,
+        2
+      ],
+      [
+        3,
+        5,
+        0
+      ],
+      [
+        4,
+        6,
+        1
+      ]
+    ],
+    "progression_minor_desc": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        6,
+        1,
+        3
+      ],
+      [
+        5,
+        0,
+        2
+      ],
+      [
+        4,
+        6,
+        1
+      ]
+    ],
+    "progression_electronic": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        5,
+        0,
+        2
+      ],
+      [
+        4,
+        6,
+        1
+      ]
+    ],
+    "progression_jazz": [
+      [
+        1,
+        3,
+        5,
+        0
+      ],
+      [
+        4,
+        6,
+        1,
+        3
+      ],
+      [
+        0,
+        2,
+        4,
+        6
+      ],
+      [
+        0,
+        2,
+        4,
+        6
+      ]
+    ],
+    "progression_ambient": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        3,
+        5,
+        0
+      ],
+      [
+        4,
+        6,
+        1
+      ],
+      [
+        0,
+        2,
+        4
+      ]
+    ],
+    "progression_rock": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        5,
+        0,
+        2
+      ],
+      [
+        4,
+        6,
+        1
+      ]
+    ],
+    "progression_classical": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        3,
+        5,
+        0
+      ],
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        4,
+        6,
+        1
+      ]
+    ],
+    "progression_sad": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        5,
+        0,
+        2
+      ],
+      [
+        2,
+        4,
+        6
+      ],
+      [
+        4,
+        6,
+        1
+      ]
+    ],
+    "progression_happy": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        4,
+        6,
+        1
+      ],
+      [
+        5,
+        0,
+        2
+      ],
+      [
+        3,
+        5,
+        0
+      ]
+    ],
+    "progression_boss": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        5,
+        0,
+        2
+      ],
+      [
+        4,
+        6,
+        1
+      ]
+    ],
+    "progression_medieval": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        4,
+        6,
+        1
+      ],
+      [
+        0,
+        2,
+        4
+      ]
+    ],
+    "progression_romantic": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        3,
+        5,
+        0
+      ],
+      [
+        4,
+        6,
+        1
+      ],
+      [
+        0,
+        2,
+        4
+      ]
+    ],
+    "progression_tension": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        1,
+        3,
+        5
+      ],
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        6,
+        1,
+        3
+      ]
+    ],
+    "progression_victory": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        3,
+        5,
+        0
+      ],
+      [
+        4,
+        6,
+        1
+      ],
+      [
+        0,
+        2,
+        4
+      ]
+    ],
+    "amen_break_chopped": [
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        0,
+        2,
+        4
+      ],
+      [
+        0,
+        2,
+        4
+      ]
+    ]
+  }
+}
