@@ -1,494 +1,343 @@
 #!/usr/bin/env python3
 """
-🧠 TREINAMENTO EXTREMO - 50 Camadas, 5000 Épocas
-Rede neural profunda com skip connections (ResNet-like)
+🧠 TREINAMENTO MoE (Mixture of Experts)
+8 Experts especializados + Gate Network
+5000 épocas com skip connections
 """
-import os
-import sys
-import json
-import time
+import os, sys, json, time
 import numpy as np
 from pathlib import Path
 
 try:
-    from scipy.signal import lfilter, stft
+    from scipy.signal import lfilter
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
 
 MODEL_DIR = "models"
 MUSIC_DIR = "music_input"
-
-# ============================================================
-# REDE NEURAL PROFUNDA COM SKIP CONNECTIONS
-# ============================================================
+EXPERT_NAMES = ["epic", "dark", "electronic", "jazz", "breakcore", "ambient", "rock", "classical"]
 
 class ResidualBlock:
-    """Bloco residual: permite treinar 50+ camadas sem vanishing gradient"""
-    
-    def __init__(self, size, seed=None):
-        if seed is not None:
-            np.random.seed(seed)
-        # He initialization
+    def __init__(self, size, seed=42):
+        np.random.seed(seed)
         self.w1 = np.random.randn(size, size) * np.sqrt(2.0 / size)
         self.b1 = np.zeros(size)
         self.w2 = np.random.randn(size, size) * np.sqrt(2.0 / size)
         self.b2 = np.zeros(size)
-        
-        # Adam optimizer state
-        self.m_w1 = np.zeros_like(self.w1)
-        self.v_w1 = np.zeros_like(self.w1)
-        self.m_b1 = np.zeros_like(self.b1)
-        self.v_b1 = np.zeros_like(self.b1)
-        self.m_w2 = np.zeros_like(self.w2)
-        self.v_w2 = np.zeros_like(self.w2)
-        self.m_b2 = np.zeros_like(self.b2)
-        self.v_b2 = np.zeros_like(self.b2)
+        self.m_w1 = np.zeros_like(self.w1); self.v_w1 = np.zeros_like(self.w1)
+        self.m_b1 = np.zeros_like(self.b1); self.v_b1 = np.zeros_like(self.b1)
+        self.m_w2 = np.zeros_like(self.w2); self.v_w2 = np.zeros_like(self.w2)
+        self.m_b2 = np.zeros_like(self.b2); self.v_b2 = np.zeros_like(self.b2)
     
     def forward(self, x, training=True):
         self.input = x
-        # Primeira camada
         self.z1 = x @ self.w1 + self.b1
-        self.a1 = np.maximum(0, self.z1)  # ReLU
+        self.a1 = np.maximum(0, self.z1)
         if training:
-            # Dropout 10%
             self.mask = np.random.binomial(1, 0.9, size=self.a1.shape) / 0.9
-            self.a1 = self.a1 * self.mask
-        # Segunda camada
+            self.a1 *= self.mask
         self.z2 = self.a1 @ self.w2 + self.b2
-        # Skip connection (residual)
-        self.output = self.z2 + x
-        return self.output
+        return self.z2 + x  # skip connection
     
-    def backward(self, grad_output, lr, t, beta1=0.9, beta2=0.999, eps=1e-8):
-        batch_size = grad_output.shape[0]
-        
-        # Gradiente através do skip connection
-        grad_z2 = grad_output
-        grad_w2 = self.a1.T @ grad_z2 / batch_size
-        grad_b2 = np.mean(grad_z2, axis=0)
-        grad_a1 = grad_z2 @ self.w2.T
-        
-        if hasattr(self, 'mask'):
-            grad_a1 = grad_a1 * self.mask
-        
-        # ReLU derivative
-        grad_z1 = grad_a1 * (self.z1 > 0).astype(float)
-        grad_w1 = self.input.T @ grad_z1 / batch_size
-        grad_b1 = np.mean(grad_z1, axis=0)
-        
-        # Gradient clipping
-        grad_w1 = np.clip(grad_w1, -1.0, 1.0)
-        grad_w2 = np.clip(grad_w2, -1.0, 1.0)
-        
-        # Adam update
-        self.m_w1 = beta1 * self.m_w1 + (1 - beta1) * grad_w1
-        self.v_w1 = beta2 * self.v_w1 + (1 - beta2) * (grad_w1 ** 2)
-        m_hat = self.m_w1 / (1 - beta1 ** t)
-        v_hat = self.v_w1 / (1 - beta2 ** t)
-        self.w1 -= lr * m_hat / (np.sqrt(v_hat) + eps)
-        
-        self.m_b1 = beta1 * self.m_b1 + (1 - beta1) * grad_b1
-        self.v_b1 = beta2 * self.v_b1 + (1 - beta2) * (grad_b1 ** 2)
-        self.b1 -= lr * (self.m_b1 / (1 - beta1 ** t)) / (np.sqrt(self.v_b1 / (1 - beta2 ** t)) + eps)
-        
-        self.m_w2 = beta1 * self.m_w2 + (1 - beta1) * grad_w2
-        self.v_w2 = beta2 * self.v_w2 + (1 - beta2) * (grad_w2 ** 2)
-        m_hat = self.m_w2 / (1 - beta1 ** t)
-        v_hat = self.v_w2 / (1 - beta2 ** t)
-        self.w2 -= lr * m_hat / (np.sqrt(v_hat) + eps)
-        
-        self.m_b2 = beta1 * self.m_b2 + (1 - beta1) * grad_b2
-        self.v_b2 = beta2 * self.v_b2 + (1 - beta2) * (grad_b2 ** 2)
-        self.b2 -= lr * (self.m_b2 / (1 - beta1 ** t)) / (np.sqrt(self.v_b2 / (1 - beta2 ** t)) + eps)
-        
-        # Gradiente para próxima camada (input gradient)
-        grad_input = grad_z1 @ self.w1.T + grad_output  # skip connection gradient
-        return grad_input
+    def backward(self, grad, lr, t, b1=0.9, b2=0.999, eps=1e-8):
+        bs = grad.shape[0]
+        grad_z2 = grad
+        gw2 = np.clip(self.a1.T @ grad_z2 / bs, -1, 1)
+        gb2 = np.mean(grad_z2, axis=0)
+        ga1 = grad_z2 @ self.w2.T
+        if hasattr(self, 'mask'): ga1 *= self.mask
+        gz1 = ga1 * (self.z1 > 0)
+        gw1 = np.clip(self.input.T @ gz1 / bs, -1, 1)
+        gb1 = np.mean(gz1, axis=0)
+        for param, g, m_name, v_name in [
+            (self.w1, gw1, 'm_w1', 'v_w1'), (self.b1, gb1, 'm_b1', 'v_b1'),
+            (self.w2, gw2, 'm_w2', 'v_w2'), (self.b2, gb2, 'm_b2', 'v_b2')]:
+            m = getattr(self, m_name); v = getattr(self, v_name)
+            m[:] = b1 * m + (1-b1) * g
+            v[:] = b2 * v + (1-b2) * (g**2)
+            param -= lr * (m/(1-b1**t)) / (np.sqrt(v/(1-b2**t)) + eps)
+        return gz1 @ self.w1.T + grad
 
-
-class DeepMusicNet:
-    """Rede neural profunda para música com 50 camadas"""
-    
-    def __init__(self, input_size, hidden_size, num_layers=50, seed=42):
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        np.random.seed(seed)
-        
-        # Camada de entrada: input_size -> hidden_size
-        self.input_w = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / input_size)
+class Expert:
+    def __init__(self, input_size, hidden_size, num_blocks=6, seed=42, name="expert"):
+        self.name = name
+        self.input_w = np.random.randn(input_size, hidden_size) * np.sqrt(2.0/input_size)
         self.input_b = np.zeros(hidden_size)
-        
-        # 50 blocos residuais (cada bloco = 2 camadas, então 50 blocos = 100 camadas efetivas)
-        # Para ter exatamente 50 camadas, usamos 25 blocos residuais
-        self.num_blocks = num_layers // 2
-        self.blocks = []
-        for i in range(self.num_blocks):
-            self.blocks.append(ResidualBlock(hidden_size, seed=seed + i))
-        
-        # Camada de saída: hidden_size -> input_size
-        self.output_w = np.random.randn(hidden_size, input_size) * np.sqrt(2.0 / hidden_size)
+        self.blocks = [ResidualBlock(hidden_size, seed=seed+i) for i in range(num_blocks)]
+        self.output_w = np.random.randn(hidden_size, input_size) * np.sqrt(2.0/hidden_size)
         self.output_b = np.zeros(input_size)
-        
-        # Adam state para input/output
-        self.m_iw = np.zeros_like(self.input_w)
-        self.v_iw = np.zeros_like(self.input_w)
-        self.m_ib = np.zeros_like(self.input_b)
-        self.v_ib = np.zeros_like(self.input_b)
-        self.m_ow = np.zeros_like(self.output_w)
-        self.v_ow = np.zeros_like(self.output_w)
-        self.m_ob = np.zeros_like(self.output_b)
-        self.v_ob = np.zeros_like(self.output_b)
-        
-        self.t = 0
-        
-        total_params = self.count_params()
-        print(f"🧠 DeepMusicNet inicializada:")
-        print(f"   Input: {input_size}")
-        print(f"   Hidden: {hidden_size}")
-        print(f"   Blocos residuais: {self.num_blocks} (= {self.num_blocks * 2} camadas)")
-        print(f"   Total camadas efetivas: {self.num_blocks * 2 + 2}")
-        print(f"   Total parâmetros: {total_params:,}")
-    
-    def count_params(self):
-        count = self.input_w.size + self.input_b.size
-        count += self.output_w.size + self.output_b.size
-        for block in self.blocks:
-            count += block.w1.size + block.b1.size + block.w2.size + block.b2.size
-        return count
+        self.m_iw = np.zeros_like(self.input_w); self.v_iw = np.zeros_like(self.input_w)
+        self.m_ib = np.zeros_like(self.input_b); self.v_ib = np.zeros_like(self.input_b)
+        self.m_ow = np.zeros_like(self.output_w); self.v_ow = np.zeros_like(self.output_w)
+        self.m_ob = np.zeros_like(self.output_b); self.v_ob = np.zeros_like(self.output_b)
     
     def forward(self, x, training=True):
         self.x = x
-        # Input layer
-        self.h = x @ self.input_w + self.input_b
-        self.h = np.maximum(0, self.h)  # ReLU
-        
-        # Residual blocks
+        h = np.maximum(0, x @ self.input_w + self.input_b)
         for block in self.blocks:
-            self.h = block.forward(self.h, training)
-        
-        # Output layer
-        self.out = self.h @ self.output_w + self.output_b
-        return self.out
+            h = block.forward(h, training)
+        self.h = h
+        return h @ self.output_w + self.output_b
+    
+    def backward(self, grad, lr, t):
+        bs = grad.shape[0]
+        gow = np.clip(self.h.T @ grad / bs, -1, 1)
+        gob = np.mean(grad, axis=0)
+        gh = grad @ self.output_w.T
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        self.m_ow[:] = b1*self.m_ow + (1-b1)*gow; self.v_ow[:] = b2*self.v_ow + (1-b2)*(gow**2)
+        self.output_w -= lr * (self.m_ow/(1-b1**t)) / (np.sqrt(self.v_ow/(1-b2**t)) + eps)
+        self.m_ob[:] = b1*self.m_ob + (1-b1)*gob; self.v_ob[:] = b2*self.v_ob + (1-b2)*(gob**2)
+        self.output_b -= lr * (self.m_ob/(1-b1**t)) / (np.sqrt(self.v_ob/(1-b2**t)) + eps)
+        for block in reversed(self.blocks):
+            gh = block.backward(gh, lr, t, b1, b2, eps)
+        giw = np.clip(self.x.T @ gh / bs, -1, 1)
+        gib = np.mean(gh, axis=0)
+        self.m_iw[:] = b1*self.m_iw + (1-b1)*giw; self.v_iw[:] = b2*self.v_iw + (1-b2)*(giw**2)
+        self.input_w -= lr * (self.m_iw/(1-b1**t)) / (np.sqrt(self.v_iw/(1-b2**t)) + eps)
+        self.m_ib[:] = b1*self.m_ib + (1-b1)*gib; self.v_ib[:] = b2*self.v_ib + (1-b2)*(gib**2)
+        self.input_b -= lr * (self.m_ib/(1-b1**t)) / (np.sqrt(self.v_ib/(1-b2**t)) + eps)
+
+class GateNetwork:
+    def __init__(self, input_size, num_experts, seed=42):
+        np.random.seed(seed)
+        self.w = np.random.randn(input_size, num_experts) * np.sqrt(2.0/input_size)
+        self.b = np.zeros(num_experts)
+        self.m_w = np.zeros_like(self.w); self.v_w = np.zeros_like(self.w)
+        self.m_b = np.zeros_like(self.b); self.v_b = np.zeros_like(self.b)
+    
+    def forward(self, x, top_k=2):
+        self.x = x
+        logits = x @ self.w + self.b
+        # Softmax
+        exp_logits = np.exp(logits - np.max(logits, axis=-1, keepdims=True))
+        probs = exp_logits / np.sum(exp_logits, axis=-1, keepdims=True)
+        self.probs = probs
+        # Top-k selection
+        top_indices = np.argsort(probs, axis=-1)[:, -top_k:]
+        gates = np.zeros_like(probs)
+        for i in range(len(x)):
+            gates[i, top_indices[i]] = probs[i, top_indices[i]]
+        # Renormalizar
+        gate_sum = np.sum(gates, axis=-1, keepdims=True) + 1e-10
+        gates = gates / gate_sum
+        self.gates = gates
+        return gates
+    
+    def backward(self, grad_gates, lr, t):
+        bs = grad_gates.shape[0]
+        # Simplified: update gate weights based on gradient
+        gw = np.clip(self.x.T @ grad_gates / bs, -1, 1)
+        gb = np.mean(grad_gates, axis=0)
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        self.m_w[:] = b1*self.m_w + (1-b1)*gw; self.v_w[:] = b2*self.v_w + (1-b2)*(gw**2)
+        self.w -= lr * (self.m_w/(1-b1**t)) / (np.sqrt(self.v_w/(1-b2**t)) + eps)
+        self.m_b[:] = b1*self.m_b + (1-b1)*gb; self.v_b[:] = b2*self.v_b + (1-b2)*(gb**2)
+        self.b -= lr * (self.m_b/(1-b1**t)) / (np.sqrt(self.v_b/(1-b2**t)) + eps)
+
+class MixtureOfExperts:
+    def __init__(self, input_size, hidden_size=256, num_experts=8, blocks_per_expert=6, top_k=2):
+        self.input_size = input_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = GateNetwork(input_size, num_experts, seed=0)
+        self.experts = []
+        for i in range(num_experts):
+            name = EXPERT_NAMES[i] if i < len(EXPERT_NAMES) else f"expert_{i}"
+            self.experts.append(Expert(input_size, hidden_size, blocks_per_expert, seed=42+i*100, name=name))
+        self.t = 0
+        total = self.count_params()
+        print(f"🧠 MoE Inicializado:")
+        print(f"   Experts: {num_experts} ({', '.join(e.name for e in self.experts)})")
+        print(f"   Blocos por expert: {blocks_per_expert} (= {blocks_per_expert*2} camadas)")
+        print(f"   Total camadas: {num_experts * blocks_per_expert * 2 + 2}")
+        print(f"   Top-k routing: {top_k}")
+        print(f"   Total parâmetros: {total:,}")
+    
+    def count_params(self):
+        count = self.gate.w.size + self.gate.b.size
+        for e in self.experts:
+            count += e.input_w.size + e.input_b.size + e.output_w.size + e.output_b.size
+            for b in e.blocks:
+                count += b.w1.size + b.b1.size + b.w2.size + b.b2.size
+        return count
+    
+    def forward(self, x, training=True):
+        gates = self.gate.forward(x, self.top_k)
+        self.active_gates = gates
+        # Combinar saídas dos experts
+        output = np.zeros_like(x)
+        self.expert_outputs = []
+        for i, expert in enumerate(self.experts):
+            gate_i = gates[:, i:i+1]
+            if np.sum(gate_i) > 1e-6:  # Expert ativo
+                expert_out = expert.forward(x, training)
+                self.expert_outputs.append((i, expert_out))
+                output += expert_out * gate_i
+        return output
     
     def backward(self, y, lr):
         self.t += 1
-        batch_size = y.shape[0]
+        bs = y.shape[0]
+        grad = (self.forward_cache - y) * (2.0 / bs) if hasattr(self, 'forward_cache') else np.zeros_like(y)
         
-        # Output gradient
-        grad_out = (self.out - y) * (2.0 / batch_size)
+        # Gate gradient (simplificado)
+        gate_grad = np.zeros_like(self.active_gates)
+        for i, expert_out in self.expert_outputs:
+            expert_grad = np.sum((expert_out - y) ** 2, axis=1, keepdims=True)
+            gate_grad[:, i:i+1] = -expert_grad * self.active_gates[:, i:i+1]
+        self.gate.backward(gate_grad, lr, self.t)
         
-        grad_ow = self.h.T @ grad_out / batch_size
-        grad_ob = np.mean(grad_out, axis=0)
-        grad_h = grad_out @ self.output_w.T
-        
-        grad_ow = np.clip(grad_ow, -1.0, 1.0)
-        
-        # Adam para output
-        beta1, beta2, eps = 0.9, 0.999, 1e-8
-        self.m_ow = beta1 * self.m_ow + (1-beta1) * grad_ow
-        self.v_ow = beta2 * self.v_ow + (1-beta2) * (grad_ow**2)
-        self.output_w -= lr * (self.m_ow/(1-beta1**self.t)) / (np.sqrt(self.v_ow/(1-beta2**self.t)) + eps)
-        self.m_ob = beta1 * self.m_ob + (1-beta1) * grad_ob
-        self.v_ob = beta2 * self.v_ob + (1-beta2) * (grad_ob**2)
-        self.output_b -= lr * (self.m_ob/(1-beta1**self.t)) / (np.sqrt(self.v_ob/(1-beta2**self.t)) + eps)
-        
-        # Backward through residual blocks (reversed)
-        for block in reversed(self.blocks):
-            grad_h = block.backward(grad_h, lr, self.t, beta1, beta2, eps)
-        
-        # Input layer gradient
-        grad_h_relu = grad_h * (self.h > 0).astype(float) if hasattr(self, 'h') else grad_h
-        # Note: h já passou por ReLU, precisamos do pré-ativação
-        grad_iw = self.x.T @ grad_h_relu / batch_size if grad_h_relu.shape == self.h.shape else self.x.T @ grad_h / batch_size
-        grad_ib = np.mean(grad_h_relu, axis=0) if grad_h_relu.shape == self.h.shape else np.mean(grad_h, axis=0)
-        
-        grad_iw = np.clip(grad_iw, -1.0, 1.0)
-        
-        self.m_iw = beta1 * self.m_iw + (1-beta1) * grad_iw
-        self.v_iw = beta2 * self.v_iw + (1-beta2) * (grad_iw**2)
-        self.input_w -= lr * (self.m_iw/(1-beta1**self.t)) / (np.sqrt(self.v_iw/(1-beta2**self.t)) + eps)
-        self.m_ib = beta1 * self.m_ib + (1-beta1) * grad_ib
-        self.v_ib = beta2 * self.v_ib + (1-beta2) * (grad_ib**2)
-        self.input_b -= lr * (self.m_ib/(1-beta1**self.t)) / (np.sqrt(self.v_ib/(1-beta2**self.t)) + eps)
+        # Expert gradients
+        for i, expert_out in self.expert_outputs:
+            gate_i = self.active_gates[:, i:i+1]
+            expert_grad = grad * gate_i
+            self.experts[i].backward(expert_grad, lr, self.t)
     
     def train_step(self, x, y, lr):
         out = self.forward(x, training=True)
+        self.forward_cache = out
         loss = np.mean((out - y) ** 2)
         self.backward(y, lr)
         return loss
     
     def save(self, filepath):
         save_dict = {
-            'input_w': self.input_w,
-            'input_b': self.input_b,
-            'output_w': self.output_w,
-            'output_b': self.output_b,
+            'gate_w': self.gate.w, 'gate_b': self.gate.b,
             'input_size': np.array([self.input_size]),
-            'hidden_size': np.array([self.hidden_size]),
-            'num_layers': np.array([self.num_layers]),
+            'num_experts': np.array([self.num_experts]),
+            'top_k': np.array([self.top_k]),
         }
-        for i, block in enumerate(self.blocks):
-            save_dict[f'block_{i}_w1'] = block.w1
-            save_dict[f'block_{i}_b1'] = block.b1
-            save_dict[f'block_{i}_w2'] = block.w2
-            save_dict[f'block_{i}_b2'] = block.b2
+        for i, expert in enumerate(self.experts):
+            save_dict[f'expert_{i}_iw'] = expert.input_w
+            save_dict[f'expert_{i}_ib'] = expert.input_b
+            save_dict[f'expert_{i}_ow'] = expert.output_w
+            save_dict[f'expert_{i}_ob'] = expert.output_b
+            for j, block in enumerate(expert.blocks):
+                save_dict[f'expert_{i}_block_{j}_w1'] = block.w1
+                save_dict[f'expert_{i}_block_{j}_b1'] = block.b1
+                save_dict[f'expert_{i}_block_{j}_w2'] = block.w2
+                save_dict[f'expert_{i}_block_{j}_b2'] = block.b2
         np.savez(filepath, **save_dict)
-        print(f"💾 Modelo salvo: {filepath}")
+        print(f"💾 MoE salvo: {filepath}")
 
-
-# ============================================================
-# EXTRAÇÃO DE FEATURES DE ÁUDIO
-# ============================================================
-
-def extract_features_from_audio(filepath, sr=22050, n_features=128):
-    """Extrai features espectrais de um arquivo de áudio"""
+def extract_features(filepath, sr=22050, n_features=128):
     try:
         import soundfile as sf
-        audio, file_sr = sf.read(filepath, dtype='float32')
-        if len(audio.shape) > 1:
-            audio = np.mean(audio, axis=1)
-        # Resample se necessário
-        if file_sr != sr:
-            indices = np.round(np.arange(0, len(audio), file_sr / sr)).astype(int)
-            indices = indices[indices < len(audio)]
-            audio = audio[indices]
-    except Exception as e:
-        print(f"  ⚠️ Erro ao ler {filepath}: {e}")
-        return None
-    
-    if len(audio) < sr:  # mínimo 1 segundo
-        return None
-    
-    # Extrair múltiplos segmentos
+        audio, fsr = sf.read(filepath, dtype='float32')
+        if len(audio.shape) > 1: audio = np.mean(audio, axis=1)
+        if fsr != sr:
+            idx = np.round(np.arange(0, len(audio), fsr/sr)).astype(int)
+            audio = audio[idx[idx < len(audio)]]
+    except: return None
+    if len(audio) < sr: return None
     features = []
-    segment_length = sr  # 1 segundo por segmento
-    n_segments = min(len(audio) // segment_length, 20)  # máximo 20 segmentos
-    
-    for i in range(n_segments):
-        start = i * segment_length
-        segment = audio[start:start + segment_length]
-        
-        # FFT features
-        fft = np.abs(np.fft.rfft(segment))[:n_features]
-        # Normalizar
+    seg_len = sr
+    n_segs = min(len(audio) // seg_len, 20)
+    for i in range(n_segs):
+        seg = audio[i*seg_len:(i+1)*seg_len]
+        fft = np.abs(np.fft.rfft(seg))[:n_features]
         fft = fft / (np.max(fft) + 1e-10)
-        
-        # Completar se necessário
-        if len(fft) < n_features:
-            fft = np.pad(fft, (0, n_features - len(fft)))
-        
+        if len(fft) < n_features: fft = np.pad(fft, (0, n_features-len(fft)))
         features.append(fft)
-    
     return features
 
-
-def generate_synthetic_data(n_samples=200, n_features=128):
-    """Gera dados sintéticos se não houver músicas"""
-    print("  Gerando dados sintéticos para treinamento...")
+def generate_synthetic_data(n_samples=300, n_features=128):
+    print("  Gerando dados sintéticos...")
     X = []
     for i in range(n_samples):
-        # Gerar padrões espectrais variados
-        freq_base = np.random.uniform(100, 2000)
+        freq = np.random.uniform(100, 2000)
         t = np.linspace(0, 1, 44100)
-        
-        # Combinação de harmônicos
         signal = np.zeros_like(t)
-        n_harmonics = np.random.randint(3, 12)
-        for h in range(1, n_harmonics + 1):
-            signal += np.sin(2 * np.pi * freq_base * h * t) / h
-        
-        # Adicionar ruído
+        for h in range(1, np.random.randint(3, 12)):
+            signal += np.sin(2*np.pi*freq*h*t) / h
         signal += np.random.randn(len(t)) * 0.1
-        
-        # FFT
         fft = np.abs(np.fft.rfft(signal))[:n_features]
         fft = fft / (np.max(fft) + 1e-10)
-        
-        if len(fft) < n_features:
-            fft = np.pad(fft, (0, n_features - len(fft)))
-        
+        if len(fft) < n_features: fft = np.pad(fft, (0, n_features-len(fft)))
         X.append(fft)
-    
     return np.array(X)
 
-
-def prepare_training_data(n_features=128):
-    """Prepara dados de treinamento"""
-    print("📊 Preparando dados de treinamento...")
-    
+def prepare_data(n_features=128):
+    print("📊 Preparando dados...")
     all_features = []
-    
-    # Tentar ler músicas de music_input/
     music_path = Path(MUSIC_DIR)
     if music_path.exists():
-        audio_files = []
+        files = []
         for ext in ['*.mp3', '*.wav', '*.flac', '*.ogg']:
-            audio_files.extend(list(music_path.glob(ext)))
-        
-        print(f"  Encontradas {len(audio_files)} músicas")
-        
-        for filepath in audio_files[:30]:  # máximo 30 arquivos
-            print(f"  Processando: {filepath.name}")
-            features = extract_features_from_audio(filepath, n_features=n_features)
-            if features:
-                all_features.extend(features)
-    
-    # Se não houver dados suficientes, gerar sintéticos
+            files.extend(list(music_path.glob(ext)))
+        print(f"  {len(files)} músicas encontradas")
+        for f in files[:30]:
+            feats = extract_features(f, n_features=n_features)
+            if feats: all_features.extend(feats)
     if len(all_features) < 50:
-        print(f"  Poucos dados ({len(all_features)}). Completando com sintéticos...")
-        synthetic = generate_synthetic_data(n_samples=200, n_features=n_features)
+        synthetic = generate_synthetic_data(300, n_features)
         all_features.extend(synthetic.tolist())
-    
     X = np.array(all_features)
-    print(f"  Dataset final: {X.shape[0]} amostras x {X.shape[1]} features")
-    
-    # Normalizar
-    X_mean = np.mean(X, axis=0)
-    X_std = np.std(X, axis=0) + 1e-8
-    X_normalized = (X - X_mean) / X_std
-    
-    # Autoencoder: input = output (aprender representação)
-    # Adicionar ruído para denoising autoencoder
-    noise = np.random.randn(*X_normalized.shape) * 0.15
-    X_noisy = X_normalized + noise
-    
-    return X_noisy, X_normalized, X_mean, X_std
+    print(f"  Dataset: {X.shape[0]} amostras x {X.shape[1]} features")
+    X_mean = np.mean(X, axis=0); X_std = np.std(X, axis=0) + 1e-8
+    X_norm = (X - X_mean) / X_std
+    noise = np.random.randn(*X_norm.shape) * 0.15
+    return X_norm + noise, X_norm, X_mean, X_std
 
-
-# ============================================================
-# TREINAMENTO PRINCIPAL
-# ============================================================
-
-def train(epochs=5000, num_layers=50, batch_size=32, n_features=128):
-    """Treinamento principal"""
+def train(epochs=5000, num_experts=8, batch_size=32, n_features=128):
     print("=" * 60)
-    print("🧠 TREINAMENTO EXTREMO")
-    print(f"   Épocas: {epochs}")
-    print(f"   Camadas: {num_layers}")
-    print(f"   Batch size: {batch_size}")
+    print("🧠 TREINAMENTO MoE (Mixture of Experts)")
+    print(f"   Épocas: {epochs} | Experts: {num_experts}")
     print("=" * 60)
-    print()
-    
-    # Criar pasta de modelos
     os.makedirs(MODEL_DIR, exist_ok=True)
-    
-    # Preparar dados
-    X_noisy, X_clean, X_mean, X_std = prepare_training_data(n_features)
-    
-    # Criar modelo
-    hidden_size = 256  # Tamanho das camadas ocultas
-    model = DeepMusicNet(n_features, hidden_size, num_layers=num_layers)
-    
-    print()
-    print("🚀 INICIANDO TREINAMENTO...")
+    X_noisy, X_clean, X_mean, X_std = prepare_data(n_features)
+    model = MixtureOfExperts(n_features, hidden_size=256, num_experts=num_experts, blocks_per_expert=6, top_k=2)
+    print("\n🚀 TREINANDO...")
     print("-" * 60)
-    
-    # Training loop
-    history = []
-    best_loss = float('inf')
-    start_time = time.time()
-    
-    # Learning rate schedule
-    initial_lr = 0.001
-    
+    history = []; best_loss = float('inf'); start = time.time()
+    lr_init = 0.001
     for epoch in range(1, epochs + 1):
-        # Learning rate decay
-        lr = initial_lr * (0.999 ** epoch)
-        lr = max(lr, 0.00001)  # mínimo
-        
-        # Shuffle
+        lr = max(lr_init * (0.999 ** epoch), 0.00001)
         indices = np.random.permutation(len(X_noisy))
-        epoch_loss = 0
-        n_batches = 0
-        
+        epoch_loss = 0; n_batches = 0
         for i in range(0, len(X_noisy), batch_size):
-            batch_idx = indices[i:i + batch_size]
-            x_batch = X_noisy[batch_idx]
-            y_batch = X_clean[batch_idx]
-            
-            loss = model.train_step(x_batch, y_batch, lr)
-            epoch_loss += loss
-            n_batches += 1
-        
+            idx = indices[i:i+batch_size]
+            loss = model.train_step(X_noisy[idx], X_clean[idx], lr)
+            epoch_loss += loss; n_batches += 1
         avg_loss = epoch_loss / n_batches
         history.append(float(avg_loss))
-        
-        # Log a cada 50 épocas
         if epoch % 50 == 0 or epoch == 1:
-            elapsed = time.time() - start_time
+            elapsed = time.time() - start
             eta = (elapsed / epoch) * (epochs - epoch)
             print(f"  Epoch {epoch:5d}/{epochs} | Loss: {avg_loss:.6f} | LR: {lr:.6f} | ETA: {eta/60:.1f}min")
-        
-        # Checkpoint a cada 500 épocas
         if epoch % 500 == 0:
-            checkpoint_path = os.path.join(MODEL_DIR, f"checkpoint_epoch_{epoch}.npz")
-            model.save(checkpoint_path)
-            print(f"  💾 Checkpoint salvo: epoch {epoch}")
-        
-        # Salvar melhor modelo
+            model.save(os.path.join(MODEL_DIR, f"checkpoint_{epoch}.npz"))
+            print(f"  💾 Checkpoint: epoch {epoch}")
         if avg_loss < best_loss:
             best_loss = avg_loss
-            best_path = os.path.join(MODEL_DIR, "best_model.npz")
-            model.save(best_path)
-    
-    # Salvar modelo final
-    final_path = os.path.join(MODEL_DIR, "final_model.npz")
-    model.save(final_path)
-    
-    # Salvar metadata
-    total_time = time.time() - start_time
+            model.save(os.path.join(MODEL_DIR, "best_moe_model.npz"))
+    model.save(os.path.join(MODEL_DIR, "final_moe_model.npz"))
+    np.savez(os.path.join(MODEL_DIR, "normalization.npz"), mean=X_mean, std=X_std)
+    total_time = time.time() - start
     metadata = {
-        "epochs_trained": epochs,
-        "num_layers": num_layers,
-        "hidden_size": hidden_size,
-        "batch_size": batch_size,
-        "final_loss": float(history[-1]),
-        "best_loss": float(best_loss),
-        "initial_loss": float(history[0]),
-        "improvement": float(history[0] - history[-1]),
-        "total_parameters": int(model.count_params()),
-        "training_time_seconds": float(total_time),
-        "training_time_minutes": float(total_time / 60),
-        "dataset_size": int(len(X_noisy)),
-        "n_features": n_features,
-        "history_sample": history[::max(1, len(history)//100)]  # amostra da história
+        "type": "MixtureOfExperts", "epochs": epochs, "num_experts": num_experts,
+        "expert_names": [e.name for e in model.experts],
+        "top_k": model.top_k, "final_loss": float(history[-1]),
+        "best_loss": float(best_loss), "total_params": int(model.count_params()),
+        "training_time_min": float(total_time/60), "dataset_size": int(len(X_noisy)),
+        "history_sample": history[::max(1, len(history)//100)]
     }
-    
     with open(os.path.join(MODEL_DIR, "training_log.json"), 'w') as f:
         json.dump(metadata, f, indent=2)
-    
-    # Salvar normalização (necessário para geração)
-    np.savez(os.path.join(MODEL_DIR, "normalization.npz"), mean=X_mean, std=X_std)
-    
-    print()
+    print("\n" + "=" * 60)
+    print("✅ TREINAMENTO MoE CONCLUÍDO!")
+    print(f"   Loss: {history[0]:.6f} → {history[-1]:.6f}")
+    print(f"   Tempo: {total_time/60:.1f} min")
+    print(f"   Parâmetros: {model.count_params():,}")
     print("=" * 60)
-    print("✅ TREINAMENTO CONCLUÍDO!")
-    print(f"   Loss inicial: {history[0]:.6f}")
-    print(f"   Loss final:   {history[-1]:.6f}")
-    print(f"   Melhor loss:  {best_loss:.6f}")
-    print(f"   Tempo total:  {total_time/60:.1f} minutos")
-    print(f"   Parâmetros:   {model.count_params():,}")
-    print("=" * 60)
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=5000)
-    parser.add_argument("--layers", type=int, default=50)
+    parser.add_argument("--num-experts", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--features", type=int, default=128)
     args = parser.parse_args()
-    
-    # Garantir mínimo de 5000 épocas
-    epochs = max(args.epochs, 5000)
-    layers = max(args.layers, 50)
-    
-    train(epochs=epochs, num_layers=layers, batch_size=args.batch_size, n_features=args.features)
+    train(epochs=max(args.epochs, 5000), num_experts=max(args.num_experts, 8), batch_size=args.batch_size)
