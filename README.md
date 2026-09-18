@@ -1,49 +1,56 @@
-# 🎵 IA Music Generator Pro - TREINO EXTREMO
+# 🎵 IA Music Generator Pro - MoE + RAG
 
-## Modelo
-- **50 Camadas Neurais** (blocos residuais)
-- **5.000 Épocas** de treinamento
-- **~15-20 milhões de parâmetros**
-- Skip connections (ResNet-like)
-- Adam Optimizer + Learning Rate Decay
+## Arquitetura
+
+### 🧠 MoE (Mixture of Experts)
+- **8 Experts** especializados (epic, dark, electronic, jazz, breakcore, ambient, rock, classical)
+- **Gate Network** com Top-2 Routing
+- **6 Blocos Residuais por Expert** (= 12 camadas por expert)
+- **5000 Épocas** de treinamento
+- Adam Optimizer + Dropout + Gradient Clipping
+
+### 📚 RAG (Retrieval-Augmented Generation)
+- **Base de Conhecimento** com 15+ padrões musicais
+- **Embedding TF-IDF** para busca semântica
+- **Retrieval Top-3** baseado no prompt
+- **Context Injection**: escala, BPM, instrumentos, dinâmica recuperados do conhecimento
 
 ## Como Usar
 
-### 1. TREINAR (primeiro!)
+### 1. TREINAR MoE
 ```
-Actions → "Treinar Modelo (5000 épocas)" → Run workflow
+Actions → "Treinar MoE (5000 épocas)" → Run workflow
 ```
-⚠️ **Treino leva 2-5 horas!**
+⚠️ Treino leva 2-5 horas!
 
-### 2. GERAR MÚSICAS
+### 2. GERAR com RAG
 ```
-Actions → "Gerar Música" → Run workflow
+Actions → "Gerar Música (RAG+MoE)" → Run workflow
 ```
-Músicas aparecem em `song_output/` numeradas (1.wav, 2.wav, 3.wav...)
 
 ## Local (Termux)
 ```bash
 pip install numpy scipy soundfile
-python train.py --epochs 5000 --layers 50
+python train.py --epochs 5000 --num-experts 8
 python music_generator.py
 ```
 
 ## Estrutura
 ```
 ├── .github/workflows/
-│   ├── train_model.yml (treino 5000 épocas)
-│   └── generate_music.yml (geração)
-├── models/ (modelos treinados)
-│   ├── best_model.npz
-│   ├── final_model.npz
+│   ├── train_moe.yml
+│   └── generate_music.yml
+├── models/ (modelos MoE)
+│   ├── best_moe_model.npz
+│   ├── final_moe_model.npz
 │   └── training_log.json
 ├── song_output/ (músicas geradas)
 │   ├── 1.wav + 1.json
-│   ├── 2.wav + 2.json
 │   └── ...
-├── music_input/ (coloque músicas aqui)
-├── train.py (treinamento 50 camadas)
-└── music_generator.py (geração)
+├── music_input/ (músicas para treino)
+├── knowledge_base.json (RAG)
+├── train.py (MoE training)
+└── music_generator.py (RAG + geração)
 ```
 
 ## Estilos
