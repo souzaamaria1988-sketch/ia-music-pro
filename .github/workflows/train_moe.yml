@@ -1,0 +1,64 @@
+name: Treinar MoE (5000 épocas)
+
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "Épocas (mínimo 5000)"
+        required: false
+        default: "5000"
+      num_experts:
+        description: "Número de experts"
+        required: false
+        default: "8"
+
+permissions:
+  contents: write
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install Dependencies
+      run: pip install numpy scipy soundfile
+
+    - name: Train MoE
+      env:
+        EPOCHS: ${{ github.event.inputs.epochs }}
+        NUM_EXPERTS: ${{ github.event.inputs.num_experts }}
+      run: |
+        echo "=========================================="
+        echo "  TREINAMENTO MoE"
+        echo "  Épocas: $EPOCHS"
+        echo "  Experts: $NUM_EXPERTS"
+        echo "=========================================="
+        python train.py --epochs $EPOCHS --num-experts $NUM_EXPERTS
+
+    - name: Commit Models
+      run: |
+        git config --local user.email "train-bot@github.com"
+        git config --local user.name "Train Bot"
+        git add models/
+        if git diff --staged --quiet; then
+          echo "Nada para commitar"
+        else
+          git commit -m "🧠 MoE treinado: $(date '+%Y-%m-%d %H:%M')"
+          git push
+        fi
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: moe-model
+        path: models/
+        retention-days: 90
