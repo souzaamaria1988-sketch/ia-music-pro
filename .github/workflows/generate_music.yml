@@ -1,4 +1,4 @@
-name: Gerar Música Automática
+name: Gerar Música
 
 on:
   workflow_dispatch:
@@ -83,19 +83,12 @@ jobs:
         for i in $(seq 1 $COUNT); do
           echo ""
           echo "=== Música $i de $COUNT ==="
-          
           if [ -n "$PROMPT" ]; then
-            python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --model-size xlarge --batch
+            python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --batch
           else
-            python music_generator.py --style "$STYLE" --duration "$DURATION" --model-size xlarge --batch
+            python music_generator.py --style "$STYLE" --duration "$DURATION" --batch
           fi
         done
-
-    - name: List Generated Songs
-      run: |
-        echo "📁 song_output/:"
-        ls -la song_output/ 2>/dev/null || echo "Vazio"
-        echo "Total WAVs: $(find song_output -name '*.wav' 2>/dev/null | wc -l)"
 
     - name: Commit Songs
       run: |
