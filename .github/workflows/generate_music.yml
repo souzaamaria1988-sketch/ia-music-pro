@@ -1,0 +1,117 @@
+name: Gerar Música Automática
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt em português (vazio = usar estilo)"
+        required: false
+        default: ""
+      style:
+        description: "Estilo musical"
+        required: false
+        default: "epic"
+        type: choice
+        options:
+          - epic
+          - bossfight
+          - dark
+          - rock
+          - ambient
+          - electronic
+          - jazz
+          - classical
+          - breakcore
+      duration:
+        description: "Duração em segundos"
+        required: false
+        default: "45"
+        type: choice
+        options:
+          - "30"
+          - "45"
+          - "60"
+          - "90"
+      count:
+        description: "Quantas músicas gerar"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "5"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install Dependencies
+      run: pip install numpy scipy soundfile
+
+    - name: Create Output Directory
+      run: mkdir -p song_output
+
+    - name: Generate Music
+      env:
+        PROMPT: ${{ github.event.inputs.prompt }}
+        STYLE: ${{ github.event.inputs.style }}
+        DURATION: ${{ github.event.inputs.duration }}
+        COUNT: ${{ github.event.inputs.count }}
+      run: |
+        echo "=========================================="
+        echo "  Prompt: '$PROMPT'"
+        echo "  Estilo: $STYLE"
+        echo "  Duração: ${DURATION}s"
+        echo "  Quantidade: $COUNT"
+        echo "=========================================="
+        
+        for i in $(seq 1 $COUNT); do
+          echo ""
+          echo "=== Música $i de $COUNT ==="
+          
+          if [ -n "$PROMPT" ]; then
+            python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --model-size xlarge --batch
+          else
+            python music_generator.py --style "$STYLE" --duration "$DURATION" --model-size xlarge --batch
+          fi
+        done
+
+    - name: List Generated Songs
+      run: |
+        echo "📁 song_output/:"
+        ls -la song_output/ 2>/dev/null || echo "Vazio"
+        echo "Total WAVs: $(find song_output -name '*.wav' 2>/dev/null | wc -l)"
+
+    - name: Commit Songs
+      run: |
+        git config --local user.email "music-bot@github.com"
+        git config --local user.name "Music Bot"
+        git add song_output/
+        if git diff --staged --quiet; then
+          echo "Nada para commitar"
+        else
+          git commit -m "🎵 Músicas geradas: $(date '+%Y-%m-%d %H:%M')"
+          git push
+        fi
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: generated-songs
+        path: song_output/
+        retention-days: 30
