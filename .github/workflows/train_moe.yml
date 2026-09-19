@@ -1,4 +1,4 @@
-name: Treinar MoE (5000 épocas)
+name: Treinar MoE (macOS MAX - 14GB)
 
 on:
   workflow_dispatch:
@@ -8,16 +8,16 @@ on:
         required: false
         default: "5000"
       num_experts:
-        description: "Número de experts"
+        description: "Número de experts (16 recomendado)"
         required: false
-        default: "8"
+        default: "16"
 
 permissions:
   contents: write
 
 jobs:
   train:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     timeout-minutes: 360
 
     steps:
@@ -32,20 +32,49 @@ jobs:
       with:
         python-version: "3.11"
 
-    - name: Install Dependencies
-      run: pip install numpy scipy soundfile
+    - name: Install System Dependencies
+      run: |
+        brew install ffmpeg libsndfile
+        echo "✅ System dependencies instaladas"
 
-    - name: Train MoE
+    - name: Install Python Dependencies
+      run: |
+        pip install --upgrade pip
+        pip install numpy scipy soundfile librosa
+        echo "✅ Python dependencies instaladas"
+
+    - name: Check RAM Available
+      run: |
+        echo "💾 RAM disponível:"
+        sysctl -n hw.memsize | awk '{print "  " $1/1024/1024/1024 " GB"}'
+        echo "💻 CPUs disponíveis:"
+        sysctl -n hw.ncpu
+
+    - name: Train MoE (MAX)
       env:
         EPOCHS: ${{ github.event.inputs.epochs }}
         NUM_EXPERTS: ${{ github.event.inputs.num_experts }}
       run: |
         echo "=========================================="
-        echo "  TREINAMENTO MoE"
+        echo "  🍎 TREINAMENTO MoE MAX (macOS)"
+        echo "  RAM: 14 GB"
         echo "  Épocas: $EPOCHS"
         echo "  Experts: $NUM_EXPERTS"
+        echo "  Features: 256"
+        echo "  Hidden: 512"
+        echo "  Blocos/Expert: 8"
+        echo "  Batch size: 64"
         echo "=========================================="
-        python train.py --epochs $EPOCHS --num-experts $NUM_EXPERTS
+        python train.py --epochs $EPOCHS --num-experts $NUM_EXPERTS --batch-size 64 --features 256 --hidden 512 --blocks 8
+
+    - name: Show Results
+      run: |
+        echo "📁 Modelos salvos:"
+        ls -lh models/ 2>/dev/null || echo "Nenhum modelo"
+        if [ -f models/training_log.json ]; then
+          echo "📊 Log de treino:"
+          cat models/training_log.json
+        fi
 
     - name: Commit Models
       run: |
@@ -55,14 +84,14 @@ jobs:
         if git diff --staged --quiet; then
           echo "Nada para commitar"
         else
-          git commit -m "🧠 MoE treinado: $(date '+%Y-%m-%d %H:%M')"
-          git pull --rebase origin main
+          git commit -m "🧠 MoE MAX treinado (macOS 14GB): $(date '+%Y-%m-%d %H:%M')"
+          git pull --rebase origin main || true
           git push
         fi
 
-    - name: Upload Artifacts
+    - name: Upload Model Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: moe-model
+        name: moe-model-max
         path: models/
         retention-days: 90
