@@ -1,4 +1,4 @@
-name: Gerar Música (macOS MAX)
+name: Gerar Música (Linux)
 
 on:
   workflow_dispatch:
@@ -8,90 +8,60 @@ on:
         required: false
         default: ""
       style:
-        description: "Estilo"
+        description: "Estilo (100+ disponíveis)"
         required: false
         default: "epic"
-        type: choice
-        options: [epic, bossfight, dark, rock, ambient, electronic, jazz, classical, breakcore]
       duration:
-        description: "Duração (segundos)"
+        description: "Duração"
         required: false
         default: "45"
-        type: choice
-        options: ["30", "45", "60", "90"]
-      count:
-        description: "Quantidade"
+      remix:
+        description: "Número da música para remixar (vazio = gerar nova)"
         required: false
-        default: "1"
+        default: ""
+      remix_type:
+        description: "Tipo de remix"
+        required: false
+        default: "variations"
         type: choice
-        options: ["1", "2", "3", "5"]
+        options: [variations, style_change, speed_up, slow_down, acoustic, electronic, heavy, soft]
 
 permissions:
   contents: write
 
 jobs:
   generate:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: "3.11"
-
-    - name: Install System Dependencies
-      run: |
-        brew install ffmpeg libsndfile
-
-    - name: Install Python Dependencies
-      run: |
-        pip install numpy scipy soundfile
-
-    - name: Check RAM
-      run: |
-        echo "💾 RAM disponível:"
-        sysctl -n hw.memsize | awk '{print "  " $1/1024/1024/1024 " GB"}'
-
-    - name: Generate Music
+    - run: pip install numpy scipy soundfile
+    - name: Generate or Remix
       env:
         PROMPT: ${{ github.event.inputs.prompt }}
         STYLE: ${{ github.event.inputs.style }}
         DURATION: ${{ github.event.inputs.duration }}
-        COUNT: ${{ github.event.inputs.count }}
+        REMIX: ${{ github.event.inputs.remix }}
+        REMIX_TYPE: ${{ github.event.inputs.remix_type }}
       run: |
         mkdir -p song_output
-        for i in $(seq 1 $COUNT); do
-          echo "=== Música $i de $COUNT ==="
-          if [ -n "$PROMPT" ]; then
-            python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --use-rag true --batch
-          else
-            python music_generator.py --style "$STYLE" --duration "$DURATION" --use-rag true --batch
-          fi
-        done
-
-    - name: Commit Songs
-      run: |
-        git config --local user.email "music-bot@github.com"
-        git config --local user.name "Music Bot"
-        git add song_output/
-        if git diff --staged --quiet; then
-          echo "Nada para commitar"
+        if [ -n "$REMIX" ]; then
+          python music_generator.py --remix "$REMIX" --remix-type "$REMIX_TYPE" --style "$STYLE" --batch
+        elif [ -n "$PROMPT" ]; then
+          python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --use-rag true --batch
         else
-          git commit -m "🎵 Músicas geradas (macOS): $(date '+%Y-%m-%d %H:%M')"
-          git pull --rebase origin main || true
-          git push
+          python music_generator.py --style "$STYLE" --duration "$DURATION" --use-rag true --batch
         fi
-
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: generated-songs
-        path: song_output/
-        retention-days: 30
+    - name: Commit
+      run: |
+        git config user.email "bot@github.com"
+        git config user.name "Music Bot"
+        git add song_output/
+        git commit -m "🎵 Música: $(date)" || true
+        git pull --rebase origin main || true
+        git push
