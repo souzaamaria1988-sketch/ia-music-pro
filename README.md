@@ -1,3 +1,7 @@
+[![Gerar Música (macOS MAX)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/generate_music.yml/badge.svg?branch=main&event=workflow_run)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/generate_music.yml)
+
+
+
 [![Treinar MoE (macOS MAX - 14GB)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/train_moe.yml/badge.svg?branch=main)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/train_moe.yml)
 
 
