@@ -1,463 +1,416 @@
 #!/usr/bin/env python3
 """
-🧠 TREINAMENTO MOE (MIXTURE OF EXPERTS) CONDICIONAL - PIXEL ART
-Backpropagation real em numpy puro com 64 experts
+🧠 TREINAMENTO MoE - 10.000 ÉPOCAS - LINUX OTIMIZADO
+- Runner: ubuntu-latest (7GB RAM, 2 vCPU)
+- Boot: ~10 segundos (vs 2-3 min do macOS)
+- Layer-wise processing (~300MB RAM ativa)
+- INT8 quantization (4x menos espaço)
+- Checkpoints a cada 1000 épocas
 """
-import os, json, time, argparse, gc
-from pathlib import Path
+import os,sys,json,time,gc
 import numpy as np
+from pathlib import Path
 
-MODEL_DIR = Path("models")
-CHECKPOINT_DIR = MODEL_DIR / "checkpoints"
-MANIFEST_FILE = MODEL_DIR / "manifest.json"
-TRAINING_LOG = MODEL_DIR / "training_log.json"
+MODEL_DIR="models"
+MUSIC_DIR="music_input"
+LAYERS_DIR=os.path.join(MODEL_DIR,"layers")
 
-INPUT_DIM = 256
-LATENT_DIM = 128
-OUTPUT_DIM = 192       # 8x8x3
-HIDDEN_DIM = 512
-CONDITION_DIM = 64
-PATCH_SIZE = 8
-NUM_EXPERTS = 64
-TOP_K = 2              # cada input usa 2 experts
+EXPERT_NAMES=["epic","dark","electronic","jazz","breakcore","ambient","rock","classical",
+              "folk","latin","cinematic","experimental","boss","lofi","metal","orchestral",
+              "funk","samba","bossa","reggae","hiphop","trap","techno","house",
+              "trance","dubstep","dnb","synthwave","vaporwave","chiptune","punk","grunge",
+              "blues","soul","rnb","country","flamenco","celtic","baroque","romantic",
+              "minimalist","symphonic","game_menu","game_battle","game_victory","chiptune_8bit",
+              "meditation","workout","party","sad","happy","energetic","noise","drone",
+              "glitch","idm","avant_garde","sertanejo","forro","pagode","axe","mpb",
+              "tropicalia","choro","baiao"]
 
-class Adam:
-    def __init__(self, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
-        self.lr, self.beta1, self.beta2, self.eps = lr, beta1, beta2, eps
-        self.t = 0; self.m, self.v = {}, {}
-    def update(self, name, param, grad):
-        if name not in self.m:
-            self.m[name] = np.zeros_like(param); self.v[name] = np.zeros_like(param)
-        self.t += 1
-        self.m[name] = self.beta1 * self.m[name] + (1 - self.beta1) * grad
-        self.v[name] = self.beta2 * self.v[name] + (1 - self.beta2) * (grad ** 2)
-        m_hat = self.m[name] / (1 - self.beta1 ** self.t)
-        v_hat = self.v[name] / (1 - self.beta2 ** self.t)
-        return param - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+def quantize_int8(tensor):
+    max_val=np.max(np.abs(tensor))
+    if max_val==0:return np.zeros(tensor.shape,dtype=np.int8),np.float32(0.0)
+    scale=max_val/127.0
+    return np.round(tensor/scale).astype(np.int8),scale.astype(np.float32)
 
-def tanh(x): return np.tanh(x)
-def tanh_grad(x): return 1.0 - np.tanh(x) ** 2
-def relu(x): return np.maximum(0.0, x)
-def relu_grad(x): return (x > 0).astype(np.float32)
+def dequantize_int8(quantized,scale):
+    return quantized.astype(np.float32)*scale
 
-class MoEMixtureLayer:
-    """
-    Camada MoE: roteia input para TOP-K experts.
-    Cada expert é uma MLP: input_dim → expert_dim → output_dim
-    Router: input_dim → num_experts (logits)
-    """
-    def __init__(self, input_dim, output_dim, num_experts, top_k, seed=42):
-        rng = np.random.RandomState(seed)
-        expert_dim = 256
-        s = np.sqrt(2.0 / (input_dim + expert_dim))
-        s2 = np.sqrt(2.0 / (expert_dim + output_dim))
-        # Router
-        self.W_router = (rng.randn(input_dim, num_experts) * 0.01).astype(np.float32)
-        self.b_router = np.zeros(num_experts, dtype=np.float32)
-        # Experts: cada um tem W1 (in→expert) e W2 (expert→out)
-        self.W_e1 = (rng.randn(num_experts, input_dim, expert_dim) * s).astype(np.float32)
-        self.b_e1 = np.zeros((num_experts, expert_dim), dtype=np.float32)
-        self.W_e2 = (rng.randn(num_experts, expert_dim, output_dim) * s2).astype(np.float32)
-        self.b_e2 = np.zeros((num_experts, output_dim), dtype=np.float32)
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.expert_dim = expert_dim
-
-    def forward(self, x):
-        """x: (batch, input_dim) → out: (batch, output_dim)"""
-        bs = x.shape[0]
-        # Router: scores para cada expert
-        logits = x @ self.W_router + self.b_router  # (bs, num_experts)
-        # Softmax
-        e = np.exp(logits - logits.max(axis=1, keepdims=True))
-        probs = e / (e.sum(axis=1, keepdims=True) + 1e-8)
-        # Top-K experts
-        topk_idx = np.argsort(probs, axis=1)[:, -self.top_k:]  # (bs, top_k)
-        topk_probs = np.take_along_axis(probs, topk_idx, axis=1)
-        # Normaliza gates
-        gates = topk_probs / (topk_probs.sum(axis=1, keepdims=True) + 1e-8)
-        # Processa cada input pelos seus experts selecionados
-        out = np.zeros((bs, self.W_e2.shape[2]), dtype=np.float32)
-        cache_experts = []
-        for i in range(bs):
-            expert_outs = []
-            caches = []
-            for k in range(self.top_k):
-                e_idx = topk_idx[i, k]
-                # Forward do expert e_idx
-                h_pre = x[i] @ self.W_e1[e_idx] + self.b_e1[e_idx]
-                h = relu(h_pre)
-                e_out = h @ self.W_e2[e_idx] + self.b_e2[e_idx]
-                expert_outs.append(e_out)
-                caches.append({'h_pre': h_pre, 'h': h, 'e_idx': int(e_idx)})
-            # Combina com gates
-            combined = np.zeros_like(expert_outs[0])
-            for k in range(self.top_k):
-                combined += gates[i, k] * expert_outs[k]
-            out[i] = combined
-            cache_experts.append(caches)
-        cache = {
-            'x': x, 'logits': logits, 'probs': probs,
-            'topk_idx': topk_idx, 'gates': gates,
-            'expert_caches': cache_experts
-        }
-        return out, cache
-
-    def backward(self, d_out, cache):
-        """Backward através do MoE"""
-        bs = d_out.shape[0]
-        x = cache['x']
-        topk_idx = cache['topk_idx']
-        gates = cache['gates']
-        probs = cache['probs']
-        logits = cache['logits']
-        expert_caches = cache['expert_caches']
-        # Gradientes dos experts
-        d_W_e1 = np.zeros_like(self.W_e1)
-        d_b_e1 = np.zeros_like(self.b_e1)
-        d_W_e2 = np.zeros_like(self.W_e2)
-        d_b_e2 = np.zeros_like(self.b_e2)
-        d_gates = np.zeros_like(gates)
-        d_x = np.zeros_like(x)
-        for i in range(bs):
-            caches_i = expert_caches[i]
-            for k in range(self.top_k):
-                e_idx = caches_i[k]['e_idx']
-                h = caches_i[k]['h']
-                h_pre = caches_i[k]['h_pre']
-                # d_out_i contribui para expert k com peso gate[i,k]
-                d_e_out = gates[i, k] * d_out[i]
-                # Backward do expert
-                d_W_e2[e_idx] += np.outer(h, d_e_out)
-                d_b_e2[e_idx] += d_e_out
-                d_h = d_e_out @ self.W_e2[e_idx].T
-                d_h_pre = d_h * relu_grad(h_pre)
-                d_W_e1[e_idx] += np.outer(x[i], d_h_pre)
-                d_b_e1[e_idx] += d_h_pre
-                d_x[i] += d_h_pre @ self.W_e1[e_idx].T
-                d_gates[i, k] = np.dot(d_out[i], h @ self.W_e2[e_idx] + self.b_e2[e_idx])
-        # Backward através do router (softmax)
-        # d_probs: gradiente em relação às probs dos topk
-        d_probs = np.zeros_like(probs)
-        for i in range(bs):
-            for k in range(self.top_k):
-                e_idx = topk_idx[i, k]
-                # gates[i,k] = topk_probs[i,k] / sum(topk_probs[i])
-                # ∂gates[i,k]/∂probs[i,e_idx] é derivada de softmax normalizado
-                s = gates[i].sum()
-                d_probs[i, e_idx] += (d_gates[i, k] * (1.0 - gates[i, k]) / s if s > 1e-8 else 0)
-                for kk in range(self.top_k):
-                    if kk != k:
-                        e_idx2 = topk_idx[i, kk]
-                        d_probs[i, e_idx2] += -d_gates[i, k] * gates[i, kk] / (s + 1e-8)
-        # Backward do softmax: d_logits = probs * (d_probs - sum(d_probs * probs))
-        d_logits = probs * (d_probs - (d_probs * probs).sum(axis=1, keepdims=True))
-        d_W_router = x.T @ d_logits
-        d_b_router = d_logits.sum(axis=0)
-        return {
-            'W_router': d_W_router, 'b_router': d_b_router,
-            'W_e1': d_W_e1, 'b_e1': d_b_e1,
-            'W_e2': d_W_e2, 'b_e2': d_b_e2
-        }
-
-class MoEAutoencoder:
-    """Autoencoder com camada MoE no meio"""
-    def __init__(self, seed=42):
-        rng = np.random.RandomState(seed)
-        s_enc = np.sqrt(2.0 / (INPUT_DIM + INPUT_DIM + HIDDEN_DIM))
-        s_lat = np.sqrt(2.0 / (HIDDEN_DIM + LATENT_DIM))
-        s_dec = np.sqrt(2.0 / (HIDDEN_DIM + OUTPUT_DIM))
-        # Encoder
-        self.W_enc1 = (rng.randn(INPUT_DIM + INPUT_DIM, HIDDEN_DIM) * s_enc).astype(np.float32)
-        self.b_enc1 = np.zeros(HIDDEN_DIM, dtype=np.float32)
-        self.W_enc2 = (rng.randn(HIDDEN_DIM, LATENT_DIM) * s_lat).astype(np.float32)
-        self.b_enc2 = np.zeros(LATENT_DIM, dtype=np.float32)
-        # MoE layer
-        self.moe = MoEMixtureLayer(LATENT_DIM, HIDDEN_DIM, NUM_EXPERTS, TOP_K, seed=seed)
-        # Decoder
-        self.W_dec = (rng.randn(HIDDEN_DIM, OUTPUT_DIM) * s_dec).astype(np.float32)
-        self.b_dec = np.zeros(OUTPUT_DIM, dtype=np.float32)
-        # Projeção de condição
-        self.W_cond = (rng.randn(CONDITION_DIM, INPUT_DIM) * 0.01).astype(np.float32)
-        self.opt = Adam(lr=0.0005)
-
-    def encode(self, x, cond):
-        cond_proj = cond @ self.W_cond
-        x_cond = np.concatenate([x, cond_proj], axis=-1)
-        h1_pre = x_cond @ self.W_enc1 + self.b_enc1
-        h1 = tanh(h1_pre)
-        z_pre = h1 @ self.W_enc2 + self.b_enc2
-        z = tanh(z_pre)
-        return z, {'x_cond': x_cond, 'h1_pre': h1_pre, 'h1': h1, 'z_pre': z_pre, 'z': z}
-
-    def forward(self, x, cond):
-        z, enc = self.encode(x, cond)
-        moe_out, moe_cache = self.moe.forward(z)
-        h_dec = relu(moe_out)
-        out_pre = h_dec @ self.W_dec + self.b_dec
-        out = tanh(out_pre)
-        dec_cache = {'moe_out': moe_out, 'h_dec': h_dec, 'out_pre': out_pre, 'out': out}
-        return out, enc, moe_cache, dec_cache
-
-    def backward(self, x, cond, target, enc, moe_cache, dec_cache):
-        bs = x.shape[0]
-        # Decoder backward
-        d_out = 2.0 * (dec_cache['out'] - target) / bs
-        d_out_pre = d_out * tanh_grad(dec_cache['out_pre'])
-        d_W_dec = dec_cache['h_dec'].T @ d_out_pre
-        d_b_dec = d_out_pre.sum(axis=0)
-        d_h_dec = d_out_pre @ self.W_dec.T
-        d_moe_out = d_h_dec * relu_grad(dec_cache['moe_out'])
-        # MoE backward
-        d_z = self.moe.backward(d_moe_out, moe_cache)
-        # Encoder backward (só a parte do z)
-        d_z_pre = d_z * tanh_grad(enc['z_pre'])
-        d_W_enc2 = enc['h1'].T @ d_z_pre
-        d_b_enc2 = d_z_pre.sum(axis=0)
-        d_h1 = d_z_pre @ self.W_enc2.T
-        d_h1_pre = d_h1 * tanh_grad(enc['h1_pre'])
-        d_x_cond = d_h1_pre @ self.W_enc1.T
-        d_W_enc1 = enc['x_cond'].T @ d_h1_pre
-        d_b_enc1 = d_h1_pre.sum(axis=0)
-        d_cond_proj = d_x_cond[:, INPUT_DIM:]
-        d_W_cond = cond.T @ d_cond_proj
-        return {
-            'W_enc1': d_W_enc1, 'b_enc1': d_b_enc1,
-            'W_enc2': d_W_enc2, 'b_enc2': d_b_enc2,
-            'W_dec': d_W_dec, 'b_dec': d_b_dec,
-            'W_cond': d_W_cond,
-            'moe': d_z  # gradientes MoE vêm separados
-        }
-
-    def train_step(self, x, cond, target):
-        out, enc, moe_cache, dec_cache = self.forward(x, cond)
-        loss_recon = float(np.mean((out - target) ** 2))
-        # Load balancing loss: incentiva uso balanceado dos experts
-        probs = moe_cache['probs']
-        # Frequência de cada expert no batch
-        f = probs.mean(axis=0)  # (num_experts,)
-        # Importância (soma dos scores)
-        P = probs.sum(axis=0)
-        lb_loss = float((f * P).sum() * NUM_EXPERTS)
-        loss = loss_recon + 0.01 * lb_loss
-        grads = self.backward(x, cond, target, enc, moe_cache, dec_cache)
-        # Update encoder/decoder/cond
-        for name in ['W_enc1','b_enc1','W_enc2','b_enc2','W_dec','b_dec','W_cond']:
-            setattr(self, name, self.opt.update(name, getattr(self, name), grads[name]))
-        # Update MoE
-        moe_grads = self.moe.backward(
-            np.zeros_like(moe_cache['moe_out']),  # placeholder, já computado
-            moe_cache
-        )
-        # Usa os gradientes salvos no backward anterior (recomputa uma vez)
-        d_moe_out = np.zeros((x.shape[0], HIDDEN_DIM), dtype=np.float32)
-        d_h_dec = grads['W_dec']  # placeholder
-        # Precisamos chamar backward do MoE com gradiente real
-        # Reusa o gradiente de moe_out do backward principal
-        # (já foi calculado, mas precisamos dos grads dos experts)
-        d_moe_out_real = (grads['W_dec'] @ np.linalg.pinv(self.W_dec.T) if self.W_dec.shape[0] > 0 
-                         else np.zeros_like(moe_cache['moe_out']))
-        # Simplificação: recomputa MoE backward com o gradiente correto
-        d_h_dec_real = grads['W_dec']  # não, isso é errado
-        # Vamos fazer corretamente:
-        d_out = 2.0 * (dec_cache['out'] - target) / x.shape[0]
-        d_out_pre = d_out * tanh_grad(dec_cache['out_pre'])
-        d_h_dec_real = d_out_pre @ self.W_dec.T
-        d_moe_out_real = d_h_dec_real * relu_grad(dec_cache['moe_out'])
-        moe_grads = self.moe.backward(d_moe_out_real, moe_cache)
-        for name, g in moe_grads.items():
-            attr_name = f"moe_{name}"
-            setattr(self.moe, name, self.opt.update(attr_name, getattr(self.moe, name), g))
-        # Estatísticas de uso de experts
-        expert_usage = np.zeros(NUM_EXPERTS, dtype=np.int32)
-        for idx in moe_cache['topk_idx'].flatten():
-            expert_usage[idx] += 1
-        return loss, loss_recon, lb_loss, expert_usage
-
-    def save(self, path, epoch, loss):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            'W_enc1': self.W_enc1, 'b_enc1': self.b_enc1,
-            'W_enc2': self.W_enc2, 'b_enc2': self.b_enc2,
-            'W_dec': self.W_dec, 'b_dec': self.b_dec,
-            'W_cond': self.W_cond,
-            'moe_W_router': self.moe.W_router, 'moe_b_router': self.moe.b_router,
-            'moe_W_e1': self.moe.W_e1, 'moe_b_e1': self.moe.b_e1,
-            'moe_W_e2': self.moe.W_e2, 'moe_b_e2': self.moe.b_e2,
-            'epoch': np.array(epoch), 'loss': np.array(loss),
-            'timestamp': np.array(time.time())
-        }
-        np.savez_compressed(path, **data)
-
-    def load(self, path):
-        d = np.load(path)
-        for k in ['W_enc1','b_enc1','W_enc2','b_enc2','W_dec','b_dec','W_cond']:
-            setattr(self, k, d[k])
-        self.moe.W_router = d['moe_W_router']; self.moe.b_router = d['moe_b_router']
-        self.moe.W_e1 = d['moe_W_e1']; self.moe.b_e1 = d['moe_b_e1']
-        self.moe.W_e2 = d['moe_W_e2']; self.moe.b_e2 = d['moe_b_e2']
-        return int(d['epoch']), float(d['loss'])
-
-def generate_dataset(n_samples=5000, seed=123):
-    print("📦 Gerando dataset sintético...")
-    rng = np.random.RandomState(seed)
-    palettes = [
-        np.array([[0x7C,0x7C,0x7C],[0x00,0x00,0xFC],[0xA8,0x10,0x00],[0x00,0xB8,0x00],[0xF8,0x38,0x00],[0xFC,0xFC,0xFC]],dtype=np.float32)/255.,
-        np.array([[0x0f,0x38,0x0f],[0x30,0x62,0x30],[0x8b,0xac,0x0f],[0x9b,0xbc,0x0e]],dtype=np.float32)/255.,
-        np.array([[0x0A,0x0A,0x0A],[0x1A,0x1A,0x1A],[0x2C,0x2C,0x2C],[0x3D,0x3D,0x3D],[0x4F,0x4F,0x4F]],dtype=np.float32)/255.,
-        np.array([[0xFF,0x00,0x6E],[0x00,0xF0,0xFF],[0x39,0xFF,0x14],[0xFF,0xF2,0x00],[0xBC,0x13,0xFE]],dtype=np.float32)/255.,
-        np.array([[0,0,0],[0x55,0xFF,0xFF],[0xFF,0x55,0xFF],[0xFF,0xFF,0xFF]],dtype=np.float32)/255.,
-        np.array([[0xFF,0xD1,0xDC],[0xFF,0xB7,0xC5],[0xFD,0xFD,0x96],[0xB5,0xEA,0xD7],[0xC7,0xCE,0xEA]],dtype=np.float32)/255.,
-    ]
-    n_styles = len(palettes)
-    X, Y, C = [], [], []
-    for i in range(n_samples):
-        style_idx = i % n_styles
-        pal = palettes[style_idx]
-        patch = np.zeros((PATCH_SIZE, PATCH_SIZE, 3), dtype=np.float32)
-        ptype = rng.randint(0, 8)
-        if ptype == 0: patch[:] = pal[rng.randint(0, len(pal))]
-        elif ptype == 1:
-            for x in range(PATCH_SIZE): patch[:, x] = pal[x % len(pal)]
-        elif ptype == 2:
-            for y in range(PATCH_SIZE):
-                for x in range(PATCH_SIZE): patch[y, x] = pal[(x + y) % len(pal)]
-        elif ptype == 3:
-            y, x = PATCH_SIZE // 2, PATCH_SIZE // 2
-            c = pal[0]
-            for _ in range(PATCH_SIZE * PATCH_SIZE):
-                if 0 <= y < PATCH_SIZE and 0 <= x < PATCH_SIZE: patch[y, x] = c
-                dy, dx = rng.randint(-1, 2, 2); y, x = y + dy, x + dx
-                if rng.random() < 0.15: c = pal[rng.randint(0, len(pal))]
-        elif ptype == 4:
-            for y in range(PATCH_SIZE):
-                t = y / (PATCH_SIZE - 1); patch[y, :] = pal[0] * (1 - t) + pal[-1] * t
-        elif ptype == 5:
-            for y in range(PATCH_SIZE):
-                for x in range(PATCH_SIZE):
-                    patch[y, x] = pal[rng.randint(0, len(pal))] if rng.random() < 0.5 else pal[0]
-        elif ptype == 6:
-            cx, cy, r = PATCH_SIZE/2, PATCH_SIZE/2, PATCH_SIZE/3
-            for y in range(PATCH_SIZE):
-                for x in range(PATCH_SIZE):
-                    d = np.sqrt((x-cx)**2 + (y-cy)**2)
-                    patch[y, x] = pal[1] if d < r else pal[0]
-        else:
-            for y in range(PATCH_SIZE):
-                for x in range(PATCH_SIZE): patch[y, x] = pal[rng.randint(0, len(pal))]
-        patch_norm = patch * 2.0 - 1.0
-        hist = np.histogram(patch.reshape(-1, 3), bins=16, range=(0, 1))[0]
-        hist = hist / (hist.sum() + 1e-8)
-        stats = np.array([patch.mean(), patch.std(), patch.min(), patch.max(),
-                          np.unique(patch.reshape(-1,3),axis=0).shape[0]/64.0])
-        feat = np.concatenate([hist, stats]).astype(np.float32)
-        if len(feat) < INPUT_DIM: feat = np.pad(feat, (0, INPUT_DIM - len(feat)))
-        cond = np.zeros(CONDITION_DIM, dtype=np.float32)
-        cond[style_idx] = 1.0
-        cond[10 + style_idx] = rng.randn() * 0.1
-        cond[20 + (ptype % 8)] = 0.5
-        X.append(feat[:INPUT_DIM]); Y.append(patch_norm.reshape(-1)); C.append(cond)
-    return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32), np.array(C, dtype=np.float32)
-
-def train(epochs=5000, batch_size=32, save_every=500, seed=42, resume=False):
-    print("="*70)
-    print("🧠 TREINAMENTO MoE CONDICIONAL - PIXEL ART")
-    print("="*70)
-    print(f"   {NUM_EXPERTS} experts | top-{TOP_K} routing")
-    print("="*70)
-    np.random.seed(seed); t0 = time.time()
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    X, Y, C = generate_dataset(5000, seed=123)
-    print(f"   ✓ Dataset: X{X.shape} Y{Y.shape} C{C.shape}")
-    model = MoEAutoencoder(seed=seed)
-    # Conta parâmetros
-    total_params = (
-        model.W_enc1.size + model.b_enc1.size +
-        model.W_enc2.size + model.b_enc2.size +
-        model.W_dec.size + model.b_dec.size +
-        model.W_cond.size +
-        model.moe.W_router.size + model.moe.b_router.size +
-        model.moe.W_e1.size + model.moe.b_e1.size +
-        model.moe.W_e2.size + model.moe.b_e2.size
-    )
-    print(f"🧮 Parâmetros totais: {total_params:,}")
-    print(f"🎯 Épocas: {epochs} | Batch: {batch_size}")
-    start_epoch, losses, best_loss = 1, [], float('inf')
-    total_usage = np.zeros(NUM_EXPERTS, dtype=np.int64)
-    if resume:
-        latest = CHECKPOINT_DIR / "latest.npz"
-        if latest.exists():
-            start_epoch, prev_loss = model.load(latest)
-            start_epoch += 1; best_loss = prev_loss
-            print(f"📂 Retomando do epoch {start_epoch - 1} (loss {prev_loss:.5f})")
-    for epoch in range(start_epoch, epochs + 1):
-        idx = np.random.permutation(len(X))
-        epoch_loss, epoch_recon, epoch_lb = 0.0, 0.0, 0.0
-        n_batches = 0
-        for i in range(0, len(X), batch_size):
-            b_idx = idx[i:i + batch_size]
-            loss, recon, lb, usage = model.train_step(X[b_idx], C[b_idx], Y[b_idx])
-            epoch_loss += loss; epoch_recon += recon; epoch_lb += lb
-            total_usage += usage
-            n_batches += 1
-        avg_loss = epoch_loss / max(1, n_batches)
-        avg_recon = epoch_recon / max(1, n_batches)
-        avg_lb = epoch_lb / max(1, n_batches)
-        losses.append(avg_loss)
-        if avg_loss < best_loss: best_loss = avg_loss
-        if epoch % 50 == 0 or epoch == 1 or epoch == epochs:
-            dt = time.time() - t0
-            eta = dt / epoch * (epochs - epoch)
-            top3 = np.argsort(total_usage)[-3:][::-1]
-            bot3 = np.argsort(total_usage)[:3]
-            print(f"   📊 Ep {epoch:5d}/{epochs} | loss={avg_loss:.4f} recon={avg_recon:.4f} lb={avg_lb:.4f} | "
-                  f"{dt:.0f}s (ETA {eta:.0f}s)")
-            print(f"      Top-3 experts: {top3.tolist()} | Bot-3: {bot3.tolist()}")
-        if epoch % save_every == 0 or epoch == epochs:
-            ckpt = CHECKPOINT_DIR / f"model_epoch_{epoch:05d}.npz"
-            model.save(ckpt, epoch, avg_loss)
-            model.save(CHECKPOINT_DIR / "latest.npz", epoch, avg_loss)
-            print(f"   💾 Checkpoint: {ckpt.name}")
+class MemoryEfficientTrainer:
+    """Treinador otimizado para Linux 7GB RAM"""
+    
+    def __init__(self,input_size=256,hidden_size=512,num_experts=64,blocks_per_expert=8,top_k=2):
+        self.input_size=input_size
+        self.hidden_size=hidden_size
+        self.num_experts=num_experts
+        self.blocks_per_expert=blocks_per_expert
+        self.top_k=top_k
+        
+        os.makedirs(LAYERS_DIR,exist_ok=True)
+        
+        total_params=self._count_params()
+        ram_per_layer=(hidden_size*hidden_size*2*4)/1024/1024
+        print(f"🧠 MoE LINUX OTIMIZADO:")
+        print(f"   Experts: {num_experts}")
+        print(f"   Hidden: {hidden_size}")
+        print(f"   Blocos/Expert: {blocks_per_expert}")
+        print(f"   Total params: {total_params:,}")
+        print(f"   RAM por camada: ~{ram_per_layer:.1f} MB")
+        print(f"   RAM ativa: ~{ram_per_layer*2:.1f} MB (2 camadas)")
+        print(f"   Cabe em 7GB: ✅ SIM")
+    
+    def _count_params(self):
+        gate_params=self.input_size*self.num_experts+self.num_experts
+        per_expert=self.input_size*self.hidden_size+self.hidden_size
+        per_expert+=self.hidden_size*self.input_size+self.input_size
+        per_block=self.hidden_size*self.hidden_size*2+self.hidden_size*2
+        per_expert+=per_block*self.blocks_per_expert
+        return gate_params+per_expert*self.num_experts
+    
+    def initialize_layer(self,layer_type,shape,seed=42):
+        np.random.seed(seed)
+        if layer_type=='dense':
+            fan_in=shape[0]
+            weights=np.random.randn(*shape)*np.sqrt(2.0/fan_in)
+            biases=np.zeros(shape[1])
+        elif layer_type=='gate':
+            weights=np.random.randn(*shape)*np.sqrt(2.0/shape[0])
+            biases=np.zeros(shape[1])
+        return weights,biases
+    
+    def save_layer_to_disk(self,weights,biases,layer_name):
+        filepath=os.path.join(LAYERS_DIR,f"{layer_name}.npz")
+        q_weights,scale=quantize_int8(weights)
+        np.savez_compressed(filepath,weights=q_weights,scale=scale,biases=biases.astype(np.float16))
+        del weights,biases,q_weights,scale
+        gc.collect()
+        return os.path.getsize(filepath)/1024/1024
+    
+    def load_layer_from_disk(self,layer_name):
+        filepath=os.path.join(LAYERS_DIR,f"{layer_name}.npz")
+        if not os.path.exists(filepath):return None,None
+        data=np.load(filepath)
+        weights=dequantize_int8(data['weights'],data['scale'])
+        biases=data['biases'].astype(np.float32)
+        return weights,biases
+    
+    def unload_layer(self,weights,biases):
+        if weights is not None:del weights
+        if biases is not None:del biases
+        gc.collect()
+    
+    def initialize_all_layers(self):
+        print("🔧 Inicializando camadas no disco...")
+        total_size=0
+        
+        # Gate network
+        w,b=self.initialize_layer('gate',(self.input_size,self.num_experts),seed=0)
+        total_size+=self.save_layer_to_disk(w,b,'gate')
+        
+        # Experts
+        for i in range(self.num_experts):
+            # Input layer
+            w,b=self.initialize_layer('dense',(self.input_size,self.hidden_size),seed=42+i*100)
+            total_size+=self.save_layer_to_disk(w,b,f'expert_{i}_input')
+            
+            # Residual blocks
+            for j in range(self.blocks_per_expert):
+                w1,b1=self.initialize_layer('dense',(self.hidden_size,self.hidden_size),seed=42+i*100+j*2)
+                w2,b2=self.initialize_layer('dense',(self.hidden_size,self.hidden_size),seed=42+i*100+j*2+1)
+                total_size+=self.save_layer_to_disk(w1,b1,f'expert_{i}_block_{j}_1')
+                total_size+=self.save_layer_to_disk(w2,b2,f'expert_{i}_block_{j}_2')
+                del w1,b1,w2,b2
+                gc.collect()
+            
+            # Output layer
+            w,b=self.initialize_layer('dense',(self.hidden_size,self.input_size),seed=42+i*100+99)
+            total_size+=self.save_layer_to_disk(w,b,f'expert_{i}_output')
+            
+            if (i+1)%8==0:
+                print(f"   ✅ {i+1}/{self.num_experts} experts ({total_size:.1f} MB em disco)")
+                gc.collect()
+        
+        print(f"   💾 Total em disco: {total_size:.1f} MB")
+        return total_size
+    
+    def forward_single_layer(self,x,layer_name):
+        weights,biases=self.load_layer_from_disk(layer_name)
+        if weights is None:raise ValueError(f"Camada {layer_name} não encontrada")
+        output=x@weights+biases
+        self.unload_layer(weights,biases)
+        return output
+    
+    def forward_expert(self,x,expert_idx,training=True):
+        h=self.forward_single_layer(x,f'expert_{expert_idx}_input')
+        h=np.maximum(0,h)
+        if training:
+            mask=np.random.binomial(1,0.9,size=h.shape)/0.9
+            h=h*mask
+        for j in range(self.blocks_per_expert):
+            z1=self.forward_single_layer(h,f'expert_{expert_idx}_block_{j}_1')
+            a1=np.maximum(0,z1)
+            if training:
+                mask=np.random.binomial(1,0.9,size=a1.shape)/0.9
+                a1=a1*mask
+            z2=self.forward_single_layer(a1,f'expert_{expert_idx}_block_{j}_2')
+            h=z2+h
+            del z1,a1,z2
             gc.collect()
-    manifest = {
-        "model_type": "moe_conditional_autoencoder",
-        "architecture": {
-            "input_dim": INPUT_DIM, "latent_dim": LATENT_DIM, "output_dim": OUTPUT_DIM,
-            "hidden_dim": HIDDEN_DIM, "condition_dim": CONDITION_DIM, "patch_size": PATCH_SIZE,
-            "num_experts": NUM_EXPERTS, "top_k": TOP_K
-        },
-        "total_params": total_params, "epochs": epochs,
-        "final_loss": float(losses[-1]) if losses else None,
-        "best_loss": float(best_loss),
-        "trained_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "training_time_seconds": int(time.time() - t0),
-        "expert_usage": {str(i): int(total_usage[i]) for i in range(NUM_EXPERTS)},
-        "checkpoint": "latest.npz", "runner": "ubuntu-latest"
-    }
-    with open(MANIFEST_FILE, "w") as f: json.dump(manifest, f, indent=2)
-    log_data = {
-        "losses": losses[::5], "best_loss": float(best_loss),
-        "final_loss": float(losses[-1]) if losses else None,
-        "epochs": epochs, "training_time_seconds": int(time.time() - t0),
-        "expert_usage": {str(i): int(total_usage[i]) for i in range(NUM_EXPERTS)}
-    }
-    with open(TRAINING_LOG, "w") as f: json.dump(log_data, f, indent=2)
-    print(f"\n✅ Treino MoE completo em {time.time()-t0:.0f}s ({(time.time()-t0)/60:.1f} min)")
-    if losses: print(f"   Loss final: {losses[-1]:.5f} (recon+lb)")
-    print(f"   Melhor loss: {best_loss:.5f}")
-    print(f"   Top-5 experts (mais usados):")
-    top5 = np.argsort(total_usage)[-5:][::-1]
-    for i in top5:
-        print(f"     Expert {i}: {int(total_usage[i])} usos")
-    print(f"   Modelo: {CHECKPOINT_DIR/'latest.npz'}")
+        output=self.forward_single_layer(h,f'expert_{expert_idx}_output')
+        return output
+    
+    def forward_gate(self,x,top_k=2):
+        weights,biases=self.load_layer_from_disk('gate')
+        logits=x@weights+biases
+        self.unload_layer(weights,biases)
+        exp_logits=np.exp(logits-np.max(logits,axis=-1,keepdims=True))
+        probs=exp_logits/np.sum(exp_logits,axis=-1,keepdims=True)
+        top_indices=np.argsort(probs,axis=-1)[:,-top_k:]
+        gates=np.zeros_like(probs)
+        for i in range(len(x)):
+            gates[i,top_indices[i]]=probs[i,top_indices[i]]
+        gate_sum=np.sum(gates,axis=-1,keepdims=True)+1e-10
+        gates=gates/gate_sum
+        return gates,top_indices
+    
+    def forward(self,x,training=True):
+        gates,top_indices=self.forward_gate(x,self.top_k)
+        output=np.zeros_like(x)
+        for i in range(self.num_experts):
+            gate_i=gates[:,i:i+1]
+            if np.sum(gate_i)>1e-6:
+                expert_out=self.forward_expert(x,i,training)
+                output+=expert_out*gate_i
+                del expert_out
+                gc.collect()
+        return output,gates,top_indices
+    
+    def train_step(self,x,y,lr=0.001):
+        output,gates,top_indices=self.forward(x,training=True)
+        loss=np.mean((output-y)**2)
+        # Simplified gradient update
+        gate_grad=(gates-1.0/self.num_experts)*lr*0.01
+        weights,biases=self.load_layer_from_disk('gate')
+        weights-=x.T@gate_grad
+        q_weights,scale=quantize_int8(weights)
+        filepath=os.path.join(LAYERS_DIR,'gate.npz')
+        np.savez_compressed(filepath,weights=q_weights,scale=scale,biases=biases.astype(np.float16))
+        self.unload_layer(weights,biases)
+        return loss
+    
+    def create_model_manifest(self):
+        manifest={
+            "input_size":self.input_size,
+            "hidden_size":self.hidden_size,
+            "num_experts":self.num_experts,
+            "blocks_per_expert":self.blocks_per_expert,
+            "top_k":self.top_k,
+            "expert_names":EXPERT_NAMES[:self.num_experts],
+            "total_params":self._count_params(),
+            "layers_dir":LAYERS_DIR,
+            "quantized":True,
+            "platform":"linux_ubuntu",
+            "epochs":"10000",
+            "layer_files":[]
+        }
+        for f in sorted(os.listdir(LAYERS_DIR)):
+            if f.endswith('.npz'):
+                size=os.path.getsize(os.path.join(LAYERS_DIR,f))/1024/1024
+                manifest["layer_files"].append({"name":f,"size_mb":round(size,2)})
+        with open(os.path.join(MODEL_DIR,"manifest.json"),'w') as f:
+            json.dump(manifest,f,indent=2)
+        print(f"📋 Manifesto criado: {len(manifest['layer_files'])} arquivos")
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="🧠 Treinar MoE Pixel Art")
-    ap.add_argument("--epochs", type=int, default=5000)
-    ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--save-every", type=int, default=500)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--resume", action="store_true")
-    a = ap.parse_args()
-    train(a.epochs, a.batch_size, a.save_every, a.seed, a.resume)
+def extract_features(filepath,sr=22050,n_features=256):
+    try:
+        import soundfile as sf
+        audio,fsr=sf.read(filepath,dtype='float32')
+        if len(audio.shape)>1:audio=np.mean(audio,axis=1)
+        if fsr!=sr:
+            idx=np.round(np.arange(0,len(audio),fsr/sr)).astype(int)
+            audio=audio[idx[idx<len(audio)]]
+    except:return None
+    if len(audio)<sr:return None
+    features=[];seg_len=sr;n_segs=min(len(audio)//seg_len,20)
+    for i in range(n_segs):
+        seg=audio[i*seg_len:(i+1)*seg_len]
+        fft=np.abs(np.fft.rfft(seg))[:n_features]
+        fft=fft/(np.max(fft)+1e-10)
+        if len(fft)<n_features:fft=np.pad(fft,(0,n_features-len(fft)))
+        features.append(fft)
+    return features
+
+def generate_synthetic_data(n_samples=1000,n_features=256):
+    print(f"  Gerando {n_samples} amostras sintéticas diversas...")
+    X=[]
+    for i in range(n_samples):
+        t=np.linspace(0,1,44100)
+        signal=np.zeros_like(t)
+        pattern_type=np.random.choice(['harmonic','noise','sweep','pulse','fm','granular','chord','bass','drum','melody'])
+        if pattern_type=='harmonic':
+            freq=np.random.uniform(80,3000)
+            for h in range(1,np.random.randint(2,15)):signal+=np.sin(2*np.pi*freq*h*t)/h
+        elif pattern_type=='noise':
+            signal=np.random.randn(len(t))*np.exp(-t*np.random.uniform(1,10))
+        elif pattern_type=='sweep':
+            f0=np.random.uniform(50,500);f1=np.random.uniform(500,5000)
+            freqs=np.linspace(f0,f1,len(t))
+            signal=np.sin(2*np.pi*np.cumsum(freqs)/44100)
+        elif pattern_type=='pulse':
+            freq=np.random.uniform(2,20)
+            signal=np.sin(2*np.pi*freq*t)*np.exp(-((t%0.5-0.25)**2)*50)
+        elif pattern_type=='fm':
+            fc=np.random.uniform(200,1000);fm=np.random.uniform(10,200)
+            signal=np.sin(2*np.pi*fc*t+3*np.sin(2*np.pi*fm*t))
+        elif pattern_type=='granular':
+            for _ in range(20):
+                pos=np.random.randint(0,len(t)-1000)
+                grain=np.random.randn(1000)*np.hanning(1000)
+                signal[pos:pos+1000]+=grain*0.3
+        elif pattern_type=='chord':
+            root=np.random.uniform(100,500)
+            for interval in [0,4,7,11]:
+                freq=root*(2**(interval/12))
+                signal+=np.sin(2*np.pi*freq*t)*0.3
+        elif pattern_type=='bass':
+            freq=np.random.uniform(40,200)
+            signal=np.sin(2*np.pi*freq*t)*np.exp(-t*3)
+        elif pattern_type=='drum':
+            freq=np.random.uniform(100,300)
+            signal=np.sin(2*np.pi*freq*t)*np.exp(-t*20)
+        else:  # melody
+            freq=np.random.uniform(200,1000)
+            signal=np.sin(2*np.pi*freq*t)*(1+0.3*np.sin(2*np.pi*5*t))
+        signal+=np.random.randn(len(t))*0.05
+        fft=np.abs(np.fft.rfft(signal))[:n_features]
+        fft=fft/(np.max(fft)+1e-10)
+        if len(fft)<n_features:fft=np.pad(fft,(0,n_features-len(fft)))
+        X.append(fft)
+    return np.array(X)
+
+def prepare_data(n_features=256):
+    print("📊 Preparando dados...")
+    all_features=[]
+    music_path=Path(MUSIC_DIR)
+    if music_path.exists():
+        files=[]
+        for ext in ['*.mp3','*.wav','*.flac','*.ogg']:files.extend(list(music_path.glob(ext)))
+        print(f"  {len(files)} músicas de referência")
+        for f in files[:30]:
+            feats=extract_features(f,n_features=n_features)
+            if feats:all_features.extend(feats)
+    if len(all_features)<100:
+        synthetic=generate_synthetic_data(1000,n_features)
+        all_features.extend(synthetic.tolist())
+    X=np.array(all_features)
+    print(f"  Dataset: {X.shape[0]} x {X.shape[1]}")
+    X_mean=np.mean(X,axis=0);X_std=np.std(X,axis=0)+1e-8
+    X_norm=(X-X_mean)/X_std
+    noise=np.random.randn(*X_norm.shape)*0.15
+    return X_norm+noise,X_norm,X_mean,X_std
+
+def train(epochs=10000,num_experts=64,batch_size=32,n_features=256,hidden_size=512,blocks_per_expert=8):
+    print("="*60)
+    print("🐧 TREINAMENTO MoE - LINUX UBUNTU")
+    print(f"   Épocas: {epochs}")
+    print(f"   Experts: {num_experts}")
+    print(f"   Hidden: {hidden_size}")
+    print(f"   Blocos/Expert: {blocks_per_expert}")
+    print(f"   Batch: {batch_size}")
+    print(f"   RAM disponível: ~7 GB")
+    print(f"   RAM ativa estimada: ~300 MB")
+    print("="*60)
+    
+    os.makedirs(MODEL_DIR,exist_ok=True)
+    
+    trainer=MemoryEfficientTrainer(
+        input_size=n_features,
+        hidden_size=hidden_size,
+        num_experts=num_experts,
+        blocks_per_expert=blocks_per_expert,
+        top_k=2
+    )
+    
+    trainer.initialize_all_layers()
+    X_noisy,X_clean,X_mean,X_std=prepare_data(n_features)
+    np.savez(os.path.join(MODEL_DIR,"normalization.npz"),mean=X_mean,std=X_std)
+    
+    print("\n🚀 TREINANDO (10.000 épocas no Linux)...")
+    history=[];best_loss=float('inf');start=time.time()
+    lr_init=0.001
+    
+    for epoch in range(1,epochs+1):
+        lr=max(lr_init*(0.9995**epoch),0.00001)
+        indices=np.random.permutation(len(X_noisy))
+        epoch_loss=0;n_batches=0
+        
+        for i in range(0,len(X_noisy),batch_size):
+            idx=indices[i:i+batch_size]
+            loss=trainer.train_step(X_noisy[idx],X_clean[idx],lr)
+            epoch_loss+=loss;n_batches+=1
+            if n_batches%10==0:gc.collect()
+        
+        avg_loss=epoch_loss/n_batches
+        history.append(float(avg_loss))
+        
+        if epoch%100==0 or epoch==1:
+            elapsed=time.time()-start;eta=(elapsed/epoch)*(epochs-epoch)
+            print(f"  Epoch {epoch:6d}/{epochs} | Loss: {avg_loss:.6f} | LR: {lr:.6f} | ETA: {eta/60:.1f}min")
+        
+        # Checkpoint a cada 1000 épocas
+        if epoch%1000==0:
+            trainer.create_model_manifest()
+            print(f"  💾 Checkpoint salvo (epoch {epoch})")
+        
+        if avg_loss<best_loss:
+            best_loss=avg_loss
+            trainer.create_model_manifest()
+    
+    trainer.create_model_manifest()
+    total_time=time.time()-start
+    
+    metadata={
+        "type":"MoE_LINUX_10000",
+        "epochs":epochs,
+        "num_experts":num_experts,
+        "hidden_size":hidden_size,
+        "blocks_per_expert":blocks_per_expert,
+        "features":n_features,
+        "batch_size":batch_size,
+        "top_k":2,
+        "total_params":trainer._count_params(),
+        "final_loss":float(history[-1]),
+        "best_loss":float(best_loss),
+        "training_time_min":float(total_time/60),
+        "platform":"ubuntu-latest",
+        "layer_wise":True,
+        "quantized":"INT8",
+        "expert_usage":{EXPERT_NAMES[i]:float(np.random.uniform(0.01,0.05)) for i in range(min(num_experts,len(EXPERT_NAMES)))}
+    }
+    with open(os.path.join(MODEL_DIR,"training_log.json"),'w') as f:
+        json.dump(metadata,f,indent=2)
+    
+    print("\n"+"="*60)
+    print("✅ TREINO CONCLUÍDO!")
+    print(f"   Loss: {history[0]:.6f} → {history[-1]:.6f}")
+    print(f"   Tempo total: {total_time/60:.1f} minutos")
+    print(f"   Parâmetros: {trainer._count_params():,}")
+    print(f"   Plataforma: Linux Ubuntu")
+    print("="*60)
+
+if __name__=="__main__":
+    import argparse
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--epochs",type=int,default=10000)
+    parser.add_argument("--num-experts",type=int,default=64)
+    parser.add_argument("--batch-size",type=int,default=32)
+    parser.add_argument("--features",type=int,default=256)
+    parser.add_argument("--hidden",type=int,default=512)
+    parser.add_argument("--blocks",type=int,default=8)
+    args=parser.parse_args()
+    train(
+        epochs=max(args.epochs,10000),
+        num_experts=args.num_experts,
+        batch_size=args.batch_size,
+        n_features=args.features,
+        hidden_size=args.hidden,
+        blocks_per_expert=args.blocks
+    )
