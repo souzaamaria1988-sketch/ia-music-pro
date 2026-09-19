@@ -1,4 +1,4 @@
-name: Treinar Modelo (10.000 épocas - LINUX)
+name: Treinar Autoencoder (10.000 épocas - LINUX)
 
 on:
   workflow_dispatch:
@@ -7,10 +7,6 @@ on:
         description: "Épocas (padrão 10000)"
         required: false
         default: "10000"
-      num_experts:
-        description: "Número de experts (padrão 64)"
-        required: false
-        default: "64"
 
 permissions:
   contents: write
@@ -33,41 +29,14 @@ jobs:
         python-version: "3.11"
 
     - name: Install Dependencies
-      run: |
-        pip install --upgrade pip
-        pip install numpy scipy soundfile
+      run: pip install numpy scipy soundfile
 
-    - name: Check System
-      run: |
-        echo "🐧 Sistema:"
-        uname -a
-        echo "💾 RAM disponível:"
-        free -h
-        echo "💻 CPUs:"
-        nproc
-
-    - name: Train MoE (10.000 épocas)
+    - name: Train Autoencoder
       env:
         EPOCHS: ${{ github.event.inputs.epochs }}
-        NUM_EXPERTS: ${{ github.event.inputs.num_experts }}
       run: |
-        echo "=========================================="
-        echo "  🐧 TREINAMENTO LINUX"
-        echo "  Épocas: $EPOCHS"
-        echo "  Experts: $NUM_EXPERTS"
-        echo "  Runner: ubuntu-latest"
-        echo "  RAM: ~7 GB"
-        echo "=========================================="
-        python train.py --epochs $EPOCHS --num-experts $NUM_EXPERTS --batch-size 32
-
-    - name: Show Results
-      run: |
-        echo "📁 Modelos salvos:"
-        ls -lh models/ 2>/dev/null || echo "Nenhum modelo"
-        if [ -f models/training_log.json ]; then
-          echo "📊 Log de treino:"
-          cat models/training_log.json
-        fi
+        echo "🧠 Treinando Autoencoder ($EPOCHS épocas)..."
+        python train.py --epochs $EPOCHS --batch-size 64
 
     - name: Commit Models
       run: |
@@ -77,14 +46,14 @@ jobs:
         if git diff --staged --quiet; then
           echo "Nada para commitar"
         else
-          git commit -m "🧠 MoE treinado (10.000 épocas Linux): $(date '+%Y-%m-%d %H:%M')"
+          git commit -m "🧠 Autoencoder treinado: $(date)"
           git pull --rebase origin main || true
           git push
         fi
 
-    - name: Upload Model Artifact
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: moe-model-linux
-        path: models/
+        name: autoencoder-model
+        path: models/autoencoder/
         retention-days: 90
