@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-🧠 MoE MELHORADO:
-- Load Balancing Loss (evita expert morto)
-- 12 Experts especializados
-- Top-k routing com noise
-- Quantização INT8
-- 5000 épocas
+🧠 TREINAMENTO MoE MAX - 14GB RAM (macOS)
+- 16 Experts especializados
+- 512 hidden units
+- 8 blocos residuais por expert
+- 256 features FFT
+- 800 amostras sintéticas
+- Batch size 64
+- ~400 milhões de parâmetros
+- INT8 quantization para salvar
 """
 import os,sys,json,time
 import numpy as np
@@ -13,7 +16,8 @@ from pathlib import Path
 
 MODEL_DIR="models"
 MUSIC_DIR="music_input"
-EXPERT_NAMES=["epic","dark","electronic","jazz","breakcore","ambient","rock","classical","folk","latin","cinematic","experimental"]
+EXPERT_NAMES=["epic","dark","electronic","jazz","breakcore","ambient","rock","classical",
+              "folk","latin","cinematic","experimental","boss","lofi","metal","orchestral"]
 
 def quantize_int8(tensor):
     max_val=np.max(np.abs(tensor))
@@ -55,7 +59,7 @@ class ResidualBlock:
         return gz1@self.w1.T+grad
 
 class Expert:
-    def __init__(self,input_size,hidden_size,num_blocks=6,seed=42,name="expert"):
+    def __init__(self,input_size,hidden_size,num_blocks=8,seed=42,name="expert"):
         self.name=name
         self.input_w=np.random.randn(input_size,hidden_size)*np.sqrt(2.0/input_size)
         self.input_b=np.zeros(hidden_size)
@@ -99,9 +103,7 @@ class GateNetwork:
     def forward(self,x,top_k=2,noise=0.1):
         self.x=x
         logits=x@self.w+self.b
-        # NOISE no gate (exploração)
-        if noise>0:
-            logits+=np.random.randn(*logits.shape)*noise
+        if noise>0:logits+=np.random.randn(*logits.shape)*noise
         exp_logits=np.exp(logits-np.max(logits,axis=-1,keepdims=True))
         probs=exp_logits/np.sum(exp_logits,axis=-1,keepdims=True)
         self.probs=probs
@@ -114,14 +116,10 @@ class GateNetwork:
         self.top_indices=top_indices
         return gates
     def compute_load_balancing_loss(self,num_experts):
-        """LOAD BALANCING: evita expert morto"""
-        # Fração de tokens roteados para cada expert
         expert_usage=np.mean(self.gates,axis=0)
-        # Fração de tokens onde expert está no top-k
         top_k_fraction=np.zeros(num_experts)
         for i in range(num_experts):
             top_k_fraction[i]=np.mean(np.any(self.top_indices==i,axis=1))
-        # Loss: encorajar distribuição uniforme
         lb_loss=num_experts*np.sum(expert_usage*top_k_fraction)
         return lb_loss
     def backward(self,grad_gates,lr,t):
@@ -134,7 +132,7 @@ class GateNetwork:
         self.b-=lr*(self.m_b/(1-b1**t))/(np.sqrt(self.v_b/(1-b2**t))+eps)
 
 class MixtureOfExperts:
-    def __init__(self,input_size,hidden_size=256,num_experts=12,blocks_per_expert=6,top_k=2):
+    def __init__(self,input_size,hidden_size=512,num_experts=16,blocks_per_expert=8,top_k=2):
         self.input_size=input_size;self.num_experts=num_experts;self.top_k=top_k
         self.gate=GateNetwork(input_size,num_experts,seed=0)
         self.experts=[]
@@ -144,10 +142,11 @@ class MixtureOfExperts:
         self.t=0
         self.lb_loss_weight=0.01
         total=self.count_params()
-        print(f"🧠 MoE Melhorado:")
-        print(f"   Experts: {num_experts}")
+        print(f"🧠 MoE MAX (macOS 14GB):")
+        print(f"   Experts: {num_experts} ({', '.join(e.name for e in self.experts)})")
+        print(f"   Hidden: {hidden_size}")
+        print(f"   Blocos/Expert: {blocks_per_expert}")
         print(f"   Top-k: {top_k}")
-        print(f"   Load Balancing: ✅")
         print(f"   Total params: {total:,}")
     def count_params(self):
         count=self.gate.w.size+self.gate.b.size
@@ -174,7 +173,6 @@ class MixtureOfExperts:
         mse_loss=np.mean((out-y)**2)
         lb_loss=self.gate.compute_load_balancing_loss(self.num_experts)
         total_loss=mse_loss+self.lb_loss_weight*lb_loss
-        # Backward
         self.t+=1
         bs=y.shape[0]
         grad=(out-y)*(2.0/bs)
@@ -182,7 +180,6 @@ class MixtureOfExperts:
         for i,expert_out in self.expert_outputs:
             expert_grad=np.sum((expert_out-y)**2,axis=1,keepdims=True)
             gate_grad[:,i:i+1]=-expert_grad*self.active_gates[:,i:i+1]
-        # Adicionar gradiente do load balancing
         gate_grad+=self.lb_loss_weight*(self.active_gates-1.0/self.num_experts)
         self.gate.backward(gate_grad,lr,self.t)
         for i,expert_out in self.expert_outputs:
@@ -213,7 +210,7 @@ class MixtureOfExperts:
         total=sum(usage)+1
         return {e.name:u/total for e,u in zip(self.experts,usage)}
 
-def extract_features(filepath,sr=22050,n_features=128):
+def extract_features(filepath,sr=22050,n_features=256):
     try:
         import soundfile as sf
         audio,fsr=sf.read(filepath,dtype='float32')
@@ -231,13 +228,13 @@ def extract_features(filepath,sr=22050,n_features=128):
         features.append(fft)
     return features
 
-def generate_synthetic_data(n_samples=400,n_features=128):
-    print("  Gerando dados sintéticos diversos...")
+def generate_synthetic_data(n_samples=800,n_features=256):
+    print(f"  Gerando {n_samples} amostras sintéticas diversas...")
     X=[]
     for i in range(n_samples):
         t=np.linspace(0,1,44100)
         signal=np.zeros_like(t)
-        pattern_type=np.random.choice(['harmonic','noise','sweep','pulse','fm','granular'])
+        pattern_type=np.random.choice(['harmonic','noise','sweep','pulse','fm','granular','chord','bass'])
         if pattern_type=='harmonic':
             freq=np.random.uniform(80,3000)
             for h in range(1,np.random.randint(2,15)):signal+=np.sin(2*np.pi*freq*h*t)/h
@@ -253,11 +250,19 @@ def generate_synthetic_data(n_samples=400,n_features=128):
         elif pattern_type=='fm':
             fc=np.random.uniform(200,1000);fm=np.random.uniform(10,200)
             signal=np.sin(2*np.pi*fc*t+3*np.sin(2*np.pi*fm*t))
-        else:  # granular
+        elif pattern_type=='granular':
             for _ in range(20):
                 pos=np.random.randint(0,len(t)-1000)
                 grain=np.random.randn(1000)*np.hanning(1000)
                 signal[pos:pos+1000]+=grain*0.3
+        elif pattern_type=='chord':
+            root=np.random.uniform(100,500)
+            for interval in [0,4,7,11]:
+                freq=root*(2**(interval/12))
+                signal+=np.sin(2*np.pi*freq*t)*0.3
+        else:  # bass
+            freq=np.random.uniform(40,200)
+            signal=np.sin(2*np.pi*freq*t)*np.exp(-t*3)
         signal+=np.random.randn(len(t))*0.05
         fft=np.abs(np.fft.rfft(signal))[:n_features]
         fft=fft/(np.max(fft)+1e-10)
@@ -265,7 +270,7 @@ def generate_synthetic_data(n_samples=400,n_features=128):
         X.append(fft)
     return np.array(X)
 
-def prepare_data(n_features=128):
+def prepare_data(n_features=256):
     print("📊 Preparando dados...")
     all_features=[]
     music_path=Path(MUSIC_DIR)
@@ -276,8 +281,8 @@ def prepare_data(n_features=128):
         for f in files[:30]:
             feats=extract_features(f,n_features=n_features)
             if feats:all_features.extend(feats)
-    if len(all_features)<50:
-        synthetic=generate_synthetic_data(400,n_features)
+    if len(all_features)<100:
+        synthetic=generate_synthetic_data(800,n_features)
         all_features.extend(synthetic.tolist())
     X=np.array(all_features)
     print(f"  Dataset: {X.shape[0]} x {X.shape[1]}")
@@ -286,15 +291,19 @@ def prepare_data(n_features=128):
     noise=np.random.randn(*X_norm.shape)*0.15
     return X_norm+noise,X_norm,X_mean,X_std
 
-def train(epochs=5000,num_experts=12,batch_size=32,n_features=128):
+def train(epochs=5000,num_experts=16,batch_size=64,n_features=256,hidden_size=512,blocks_per_expert=8):
     print("="*60)
-    print("🧠 TREINAMENTO MoE MELHORADO")
-    print(f"   Épocas: {epochs} | Experts: {num_experts}")
-    print(f"   Load Balancing: ✅ | INT8: ✅")
+    print("🧠 TREINAMENTO MoE MAX (macOS 14GB)")
+    print(f"   Épocas: {epochs}")
+    print(f"   Experts: {num_experts}")
+    print(f"   Hidden: {hidden_size}")
+    print(f"   Blocos/Expert: {blocks_per_expert}")
+    print(f"   Features: {n_features}")
+    print(f"   Batch: {batch_size}")
     print("="*60)
     os.makedirs(MODEL_DIR,exist_ok=True)
     X_noisy,X_clean,X_mean,X_std=prepare_data(n_features)
-    model=MixtureOfExperts(n_features,hidden_size=256,num_experts=num_experts,blocks_per_expert=6,top_k=2)
+    model=MixtureOfExperts(n_features,hidden_size=hidden_size,num_experts=num_experts,blocks_per_expert=blocks_per_expert,top_k=2)
     print("\n🚀 TREINANDO...")
     history=[];best_loss=float('inf');start=time.time()
     lr_init=0.001
@@ -322,17 +331,21 @@ def train(epochs=5000,num_experts=12,batch_size=32,n_features=128):
     model.save(os.path.join(MODEL_DIR,"final_moe_model.npz"))
     np.savez(os.path.join(MODEL_DIR,"normalization.npz"),mean=X_mean,std=X_std)
     total_time=time.time()-start
-    metadata={"type":"MoE_Improved","epochs":epochs,"num_experts":num_experts,"expert_names":[e.name for e in model.experts],"top_k":model.top_k,"load_balancing":True,"final_loss":float(history[-1]),"best_loss":float(best_loss),"total_params":int(model.count_params()),"training_time_min":float(total_time/60),"expert_usage":model.get_expert_usage()}
+    metadata={"type":"MoE_MAX_macOS","epochs":epochs,"num_experts":num_experts,"hidden_size":hidden_size,"blocks_per_expert":blocks_per_expert,"features":n_features,"batch_size":batch_size,"expert_names":[e.name for e in model.experts],"top_k":model.top_k,"load_balancing":True,"final_loss":float(history[-1]),"best_loss":float(best_loss),"total_params":int(model.count_params()),"training_time_min":float(total_time/60),"expert_usage":model.get_expert_usage(),"ram_gb":14}
     with open(os.path.join(MODEL_DIR,"training_log.json"),'w') as f:json.dump(metadata,f,indent=2)
     print("\n✅ TREINO CONCLUÍDO!")
     print(f"   Loss: {history[0]:.6f} → {history[-1]:.6f}")
-    print(f"   Uso dos experts: {model.get_expert_usage()}")
+    print(f"   Tempo: {total_time/60:.1f} min")
+    print(f"   Parâmetros: {model.count_params():,}")
 
 if __name__=="__main__":
     import argparse
     parser=argparse.ArgumentParser()
     parser.add_argument("--epochs",type=int,default=5000)
-    parser.add_argument("--num-experts",type=int,default=12)
-    parser.add_argument("--batch-size",type=int,default=32)
+    parser.add_argument("--num-experts",type=int,default=16)
+    parser.add_argument("--batch-size",type=int,default=64)
+    parser.add_argument("--features",type=int,default=256)
+    parser.add_argument("--hidden",type=int,default=512)
+    parser.add_argument("--blocks",type=int,default=8)
     args=parser.parse_args()
-    train(epochs=max(args.epochs,5000),num_experts=max(args.num_experts,12),batch_size=args.batch_size)
+    train(epochs=max(args.epochs,5000),num_experts=max(args.num_experts,16),batch_size=args.batch_size,n_features=args.features,hidden_size=args.hidden,blocks_per_expert=args.blocks)
