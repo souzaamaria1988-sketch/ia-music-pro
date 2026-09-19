@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-🧠 IA MUSIC GENERATOR PRO - INTELIGÊNCIA MÁXIMA (CORRIGIDO)
-- Fix: hihat UnboundLocalError (renomeado samples)
-- Fix: model loading (usa .item() para escalares)
+🧠 IA MUSIC GENERATOR PRO - Otimizado para macOS 14GB
+- Cache de samples (economia RAM)
+- Modelo MoE MAX
+- Análise de referência
+- RAG + Prompt Interpreter
 """
 import os,sys,json,time
 import numpy as np
@@ -17,6 +19,9 @@ except ImportError:
 OUTPUT_DIR="song_output"
 MODEL_DIR="models"
 MUSIC_DIR="music_input"
+
+# Cache global de samples (economiza RAM)
+SAMPLE_CACHE={}
 
 def get_dynamic_seed():
     return int(time.time()*1000)%(2**32)^np.random.randint(0,2**31)
@@ -49,10 +54,6 @@ def save_song(audio,sr,metadata=None):
     print(f"💾 Salvo: {filepath}")
     return filepath,number
 
-# ============================================================
-# ANÁLISE DE ÁUDIO
-# ============================================================
-
 class AudioAnalyzer:
     def analyze_file(self, filepath, sr=22050):
         try:
@@ -67,27 +68,22 @@ class AudioAnalyzer:
             return None
         if len(audio) < sr:
             return None
-        
         features = {}
         features['duration'] = len(audio) / sr
         features['rms'] = float(np.sqrt(np.mean(audio**2)))
-        
         fft_result = np.abs(np.fft.rfft(audio))
         freqs = np.fft.rfftfreq(len(audio), 1/sr)
         total_energy = np.sum(fft_result) + 1e-10
         features['spectral_centroid'] = float(np.sum(freqs * fft_result) / total_energy)
-        
         bands = {'sub_bass': (20, 60), 'bass': (60, 250), 'low_mids': (250, 500),
                 'mids': (500, 2000), 'high_mids': (2000, 6000), 'highs': (6000, 20000)}
         features['frequency_bands'] = {}
         for band_name, (low, high) in bands.items():
             mask = (freqs >= low) & (freqs < high)
             features['frequency_bands'][band_name] = float(np.sum(fft_result[mask]**2))
-        
         analysis_audio = audio[:sr*10] if len(audio) > sr*10 else audio
         autocorr = np.correlate(analysis_audio, analysis_audio, mode='full')
         autocorr = autocorr[len(autocorr)//2:]
-        
         peaks = []
         min_lag = int(sr * 60 / 200)
         max_lag = int(sr * 60 / 40)
@@ -97,14 +93,12 @@ class AudioAnalyzer:
                     peaks.append(i)
                     if len(peaks) >= 5:
                         break
-        
         if len(peaks) >= 2:
             avg_period = np.mean(np.diff(peaks))
             bpm = 60.0 / (avg_period / sr)
             features['estimated_bpm'] = float(np.clip(bpm, 40, 200))
         else:
             features['estimated_bpm'] = 120.0
-        
         return features
     
     def analyze_directory(self, music_dir=MUSIC_DIR):
@@ -116,7 +110,6 @@ class AudioAnalyzer:
             audio_files.extend(list(music_path.glob(ext)))
         if not audio_files:
             return None
-        
         print(f"  🔍 Analisando {min(len(audio_files), 10)} músicas de referência...")
         all_features = []
         for filepath in audio_files[:10]:
@@ -124,57 +117,37 @@ class AudioAnalyzer:
             features = self.analyze_file(filepath)
             if features:
                 all_features.append(features)
-        
         if not all_features:
             return None
-        
         aggregated = {
             'num_files': len(all_features),
             'avg_bpm': float(np.mean([f['estimated_bpm'] for f in all_features])),
             'avg_spectral_centroid': float(np.mean([f['spectral_centroid'] for f in all_features])),
             'avg_rms': float(np.mean([f['rms'] for f in all_features])),
         }
-        
-        print(f"  ✅ Análise completa:")
-        print(f"     BPM médio: {aggregated['avg_bpm']:.1f}")
-        print(f"     Brilho: {aggregated['avg_spectral_centroid']:.0f} Hz")
-        
+        print(f"  ✅ Análise completa: BPM={aggregated['avg_bpm']:.1f}")
         return aggregated
-
-# ============================================================
-# CARREGADOR DE MODELO MoE (CORRIGIDO)
-# ============================================================
 
 class MoELoader:
     def __init__(self):
         self.model_data = None
         self.is_loaded = False
-    
     def load_model(self, model_path=None):
         if model_path is None:
             model_path = os.path.join(MODEL_DIR, "best_moe_model.npz")
-        
         if not os.path.exists(model_path):
             print("  ⚠️ Modelo MoE não encontrado")
             return False
-        
         try:
             self.model_data = np.load(model_path, allow_pickle=True)
             self.is_loaded = True
-            
-            # CORREÇÃO: usar .item() para extrair escalar de array 0-d
-            num_experts = int(self.model_data['num_experts'].item()) if 'num_experts' in self.model_data else 8
-            input_size = int(self.model_data['input_size'].item()) if 'input_size' in self.model_data else 128
-            
+            num_experts = int(self.model_data['num_experts'].item()) if 'num_experts' in self.model_data else 16
+            input_size = int(self.model_data['input_size'].item()) if 'input_size' in self.model_data else 256
             print(f"  🧠 Modelo MoE carregado: {num_experts} experts, input={input_size}")
             return True
         except Exception as e:
             print(f"  ❌ Erro ao carregar modelo: {e}")
             return False
-
-# ============================================================
-# PROMPT INTERPRETER
-# ============================================================
 
 class PromptInterpreter:
     KEYWORDS = {
@@ -189,8 +162,13 @@ class PromptInterpreter:
         "breakcore": {"breakcore": 3.0, "intensity": 1.0, "bpm_mult": 1.8, "style": "breakcore"},
         "amen": {"breakcore": 2.5, "style": "breakcore"},
         "glitch": {"breakcore": 2.0, "style": "breakcore"},
+        "boss": {"intensity": 0.95, "style": "boss"},
+        "rock": {"intensity": 0.95, "style": "rock"},
+        "jazz": {"intensity": 0.7, "style": "jazz"},
+        "ambient": {"intensity": 0.4, "style": "ambient"},
+        "metal": {"intensity": 0.95, "style": "metal"},
+        "orchestral": {"intensity": 0.8, "style": "orchestral"},
     }
-    
     def interpret(self, prompt):
         if not prompt:
             return self._default_params()
@@ -211,22 +189,64 @@ class PromptInterpreter:
                     elif isinstance(value, str):
                         params[key] = value
         if matched:
-            print(f"  🧠 Keywords detectadas: {matched}")
+            print(f"  🧠 Keywords: {matched}")
         return params
-    
     def _default_params(self):
-        return {
-            "intensity": 0.7, "bpm_mult": 1.0, "orchestral": 1.0,
-            "guitar": 1.0, "piano": 1.0, "drums": 1.0, "strings": 1.0,
-            "synth": 1.0, "distortion": 1.0, "bass": 1.0,
-            "flute": 1.0, "brass": 1.0, "jazz": 1.0,
-            "minor": False, "major": True, "breakcore": 0.0,
-            "style": None,
-        }
+        return {"intensity": 0.7, "bpm_mult": 1.0, "orchestral": 1.0, "guitar": 1.0, "piano": 1.0, "drums": 1.0, "strings": 1.0, "synth": 1.0, "distortion": 1.0, "bass": 1.0, "flute": 1.0, "brass": 1.0, "jazz": 1.0, "minor": False, "major": True, "breakcore": 0.0, "style": None}
 
-# ============================================================
-# INSTRUMENTOS (CORRIGIDO: nomes de samples renomeados)
-# ============================================================
+# Instrumentos com cache
+def make_kick(sr=44100,velocity=1.0):
+    key=('kick',sr,velocity)
+    if key in SAMPLE_CACHE:return SAMPLE_CACHE[key].copy()
+    t=np.linspace(0,0.35,int(0.35*sr),endpoint=False)
+    freq_curve=160*np.exp(-t*25)+45;phase=2*np.pi*np.cumsum(freq_curve)/sr
+    signal=np.sin(phase)*np.exp(-t*12)*velocity
+    result=signal/(np.max(np.abs(signal))+1e-10)
+    SAMPLE_CACHE[key]=result
+    return result.copy()
+
+def make_snare(sr=44100,velocity=1.0):
+    key=('snare',sr,velocity)
+    if key in SAMPLE_CACHE:return SAMPLE_CACHE[key].copy()
+    t=np.linspace(0,0.22,int(0.22*sr),endpoint=False)
+    tone=np.sin(2*np.pi*195*t)*np.exp(-t*35)+0.5*np.sin(2*np.pi*330*t)*np.exp(-t*40)
+    noise=np.random.randn(len(t))*np.exp(-t*22)
+    signal=(0.4*tone+0.6*noise)*velocity
+    result=signal/(np.max(np.abs(signal))+1e-10)
+    SAMPLE_CACHE[key]=result
+    return result.copy()
+
+def make_hihat(sr=44100,velocity=1.0):
+    key=('hihat',sr,velocity)
+    if key in SAMPLE_CACHE:return SAMPLE_CACHE[key].copy()
+    t=np.linspace(0,0.06,int(0.06*sr),endpoint=False)
+    noise=np.random.randn(len(t));filtered=np.diff(noise,prepend=noise[0])
+    result=filtered*np.exp(-t*45)*velocity/(np.max(np.abs(filtered))+1e-10)
+    SAMPLE_CACHE[key]=result
+    return result.copy()
+
+def make_tom(freq=120,sr=44100,velocity=1.0):
+    key=('tom',freq,sr,velocity)
+    if key in SAMPLE_CACHE:return SAMPLE_CACHE[key].copy()
+    t=np.linspace(0,0.3,int(0.3*sr),endpoint=False)
+    freq_curve=freq*np.exp(-t*8)+freq*0.7;phase=2*np.pi*np.cumsum(freq_curve)/sr
+    signal=np.sin(phase)*np.exp(-t*10)*velocity
+    result=signal/(np.max(np.abs(signal))+1e-10)
+    SAMPLE_CACHE[key]=result
+    return result.copy()
+
+def make_crash(sr=44100,velocity=1.0):
+    key=('crash',sr,velocity)
+    if key in SAMPLE_CACHE:return SAMPLE_CACHE[key].copy()
+    t=np.linspace(0,1.5,int(1.5*sr),endpoint=False)
+    noise=np.random.randn(len(t))
+    metallic=0
+    for f in [5000,6500,8000,9500,11000,13000]:
+        metallic+=0.15*np.sin(2*np.pi*f*t+np.random.uniform(0,2*np.pi))
+    signal=(noise*0.4+metallic*0.4)*np.exp(-t*3)*velocity
+    result=signal/(np.max(np.abs(signal))+1e-10)
+    SAMPLE_CACHE[key]=result
+    return result.copy()
 
 def karplus_strong(freq,duration,sr=44100,damping=0.996,brightness=0.5):
     N=max(2,int(sr/freq));n_samples=int(duration*sr)
@@ -298,44 +318,9 @@ def brass_note(freq,duration,sr=44100):
     if 0<rel<len(t):envelope[-rel:]=np.linspace(1,0,rel)
     return signal*envelope*0.25*1.5/(np.max(np.abs(signal))+1e-10)
 
-# CORREÇÃO: funções de bateria retornam samples
-def make_kick(sr=44100,velocity=1.0):
-    t=np.linspace(0,0.35,int(0.35*sr),endpoint=False)
-    freq_curve=160*np.exp(-t*25)+45;phase=2*np.pi*np.cumsum(freq_curve)/sr
-    signal=np.sin(phase)*np.exp(-t*12)*velocity
-    return signal/(np.max(np.abs(signal))+1e-10)
-
-def make_snare(sr=44100,velocity=1.0):
-    t=np.linspace(0,0.22,int(0.22*sr),endpoint=False)
-    tone=np.sin(2*np.pi*195*t)*np.exp(-t*35)+0.5*np.sin(2*np.pi*330*t)*np.exp(-t*40)
-    noise=np.random.randn(len(t))*np.exp(-t*22)
-    signal=(0.4*tone+0.6*noise)*velocity
-    return signal/(np.max(np.abs(signal))+1e-10)
-
-def make_hihat(sr=44100,velocity=1.0):
-    t=np.linspace(0,0.06,int(0.06*sr),endpoint=False)
-    noise=np.random.randn(len(t));filtered=np.diff(noise,prepend=noise[0])
-    return filtered*np.exp(-t*45)*velocity/(np.max(np.abs(filtered))+1e-10)
-
-def make_tom(freq=120,sr=44100,velocity=1.0):
-    t=np.linspace(0,0.3,int(0.3*sr),endpoint=False)
-    freq_curve=freq*np.exp(-t*8)+freq*0.7;phase=2*np.pi*np.cumsum(freq_curve)/sr
-    signal=np.sin(phase)*np.exp(-t*10)*velocity
-    return signal/(np.max(np.abs(signal))+1e-10)
-
-def make_crash(sr=44100,velocity=1.0):
-    t=np.linspace(0,1.5,int(1.5*sr),endpoint=False)
-    noise=np.random.randn(len(t))
-    metallic=0
-    for f in [5000,6500,8000,9500,11000,13000]:
-        metallic+=0.15*np.sin(2*np.pi*f*t+np.random.uniform(0,2*np.pi))
-    signal=(noise*0.4+metallic*0.4)*np.exp(-t*3)*velocity
-    return signal/(np.max(np.abs(signal))+1e-10)
-
 def riser_sweep(duration,sr=44100):
     t=np.linspace(0,duration,int(duration*sr),endpoint=False)
-    freq_start=200;freq_end=2000
-    freqs=np.linspace(freq_start,freq_end,len(t))
+    freqs=np.linspace(200,2000,len(t))
     signal=np.sin(2*np.pi*np.cumsum(freqs)/sr)+np.random.randn(len(t))*0.3
     envelope=np.linspace(0,1,len(t))**2
     return signal*envelope/(np.max(np.abs(signal))+1e-10)
@@ -414,21 +399,12 @@ def soft_compress(audio,threshold=0.6,ratio=3.0):
 def note_to_freq(semitone,base_freq=261.63):
     return base_freq*(2**(semitone/12.0))
 
-# ============================================================
-# PROGRESSÕES E ESCALAS
-# ============================================================
-
 ALL_PROGRESSIONS=[
-    [[0,2,4],[5,0,2],[3,5,0],[4,6,1]],
-    [[0,2,4],[3,5,0],[4,6,1],[5,0,2]],
-    [[5,0,2],[3,5,0],[0,2,4],[4,6,1]],
-    [[0,2,4],[0,2,4],[5,0,2],[4,6,1]],
-    [[1,3,5],[4,6,1],[0,2,4],[5,0,2]],
-    [[0,2,4,6],[4,6,1,3],[5,0,2,4],[0,2,4,6]],
-    [[0,3,5],[5,0,2],[4,6,1],[0,2,4]],
-    [[0,2,4],[4,6,1],[0,2,4],[5,0,2]],
-    [[0,4,6],[3,5,0],[2,4,6],[5,0,2]],
-    [[0,2,4],[5,0,2],[4,6,1],[0,2,4]],
+    [[0,2,4],[5,0,2],[3,5,0],[4,6,1]],[[0,2,4],[3,5,0],[4,6,1],[5,0,2]],
+    [[5,0,2],[3,5,0],[0,2,4],[4,6,1]],[[0,2,4],[0,2,4],[5,0,2],[4,6,1]],
+    [[1,3,5],[4,6,1],[0,2,4],[5,0,2]],[[0,2,4,6],[4,6,1,3],[5,0,2,4],[0,2,4,6]],
+    [[0,3,5],[5,0,2],[4,6,1],[0,2,4]],[[0,2,4],[4,6,1],[0,2,4],[5,0,2]],
+    [[0,4,6],[3,5,0],[2,4,6],[5,0,2]],[[0,2,4],[5,0,2],[4,6,1],[0,2,4]],
 ]
 
 ALL_SCALES={
@@ -439,10 +415,6 @@ ALL_SCALES={
     'blues':[0,3,5,6,7,10],'whole_tone':[0,2,4,6,8,10],
 }
 SCALE_NAMES=list(ALL_SCALES.keys())
-
-# ============================================================
-# SONG STRUCTURE
-# ============================================================
 
 class SongStructure:
     STRUCTURES={
@@ -456,24 +428,23 @@ class SongStructure:
         'classical':['exposition','development','recapitulation','coda'],
         'dark':['intro','verse','chorus','verse','chorus','bridge','chorus','outro'],
         'epic':['intro','theme','development','climax','resolution','outro'],
+        'boss':['intro','theme','intensity','climax','break','climax','outro'],
+        'metal':['intro','verse','chorus','verse','chorus','solo','chorus','outro'],
+        'orchestral':['intro','theme','development','climax','resolution','outro'],
+        'lofi':['intro','verse','chorus','verse','chorus','outro'],
     }
-    
     SECTION_ENERGY={
         'intro':0.3,'verse':0.5,'chorus':0.9,'bridge':0.6,'outro':0.4,
         'buildup':0.7,'drop':1.0,'breakdown':0.2,'solo':0.7,'head':0.6,
         'theme':0.5,'development':0.7,'climax':1.0,'resolution':0.5,
         'exposition':0.5,'recapitulation':0.7,'coda':0.4,
         'chaos1':0.8,'chaos2':0.9,'chaos3':1.0,'break':0.3,
-        'section1':0.4,'section2':0.5,'section3':0.6,'section4':0.5,
+        'section1':0.4,'section2':0.5,'section3':0.6,'section4':0.5,'intensity':0.8,
     }
-    
     def __init__(self,style='pop',duration=45,bpm=120):
-        self.style=style
-        self.duration=duration
-        self.bpm=bpm
+        self.style=style;self.duration=duration;self.bpm=bpm
         self.sections=self._generate_sections()
         self.section_times=self._calculate_times()
-    
     def _generate_sections(self):
         base_structure=self.STRUCTURES.get(self.style,self.STRUCTURES['pop'])
         sections=[]
@@ -489,12 +460,8 @@ class SongStructure:
             else:bars=8
             sections.append({'name':section,'bars':bars,'energy':self.SECTION_ENERGY.get(section,0.5)})
         return sections
-    
     def _calculate_times(self):
-        beats_per_bar=4
-        beat_duration=60.0/self.bpm
-        times=[]
-        current_time=0.0
+        beats_per_bar=4;beat_duration=60.0/self.bpm;times=[];current_time=0.0
         for section in self.sections:
             section_duration=section['bars']*beats_per_bar*beat_duration
             times.append({'name':section['name'],'start':current_time,'end':current_time+section_duration,'duration':section_duration,'energy':section['energy']})
@@ -502,47 +469,26 @@ class SongStructure:
         total_time=current_time
         if total_time>0:
             scale=self.duration/total_time
-            for t in times:
-                t['start']*=scale
-                t['end']*=scale
-                t['duration']*=scale
+            for t in times:t['start']*=scale;t['end']*=scale;t['duration']*=scale
         return times
-    
     def get_section_at_time(self,time):
         for section in self.section_times:
-            if section['start']<=time<section['end']:
-                return section
+            if section['start']<=time<section['end']:return section
         return self.section_times[-1]
-    
     def get_energy_at_time(self,time):
         section=self.get_section_at_time(time)
-        section_start=section['start']
-        section_end=section['end']
         section_duration=section['duration']
-        position=(time-section_start)/section_duration if section_duration>0 else 0
+        position=(time-section['start'])/section_duration if section_duration>0 else 0
         base_energy=section['energy']
-        if section['name']=='buildup':
-            return base_energy*(0.3+0.7*position)
-        elif section['name']=='drop':
-            if position<0.1:return 1.0
-            else:return base_energy*(1.0-0.2*(position-0.1)/0.9)
-        elif section['name']=='outro':
-            return base_energy*(1.0-position*0.7)
-        else:
-            variation=0.1*np.sin(position*np.pi*2)
-            return base_energy+variation
-    
+        if section['name']=='buildup':return base_energy*(0.3+0.7*position)
+        elif section['name']=='drop':return 1.0 if position<0.1 else base_energy*(1.0-0.2*(position-0.1)/0.9)
+        elif section['name']=='outro':return base_energy*(1.0-position*0.7)
+        else:return base_energy+0.1*np.sin(position*np.pi*2)
     def get_fill_probability(self,time):
         section=self.get_section_at_time(time)
-        section_start=section['start']
-        section_end=section['end']
-        position=(time-section_start)/(section_end-section_start) if (section_end-section_start)>0 else 0
-        if position>0.85:return 0.5
-        return 0.02
-
-# ============================================================
-# RAG
-# ============================================================
+        section_duration=section['duration']
+        position=(time-section['start'])/section_duration if section_duration>0 else 0
+        return 0.5 if position>0.85 else 0.02
 
 class MusicRAG:
     def __init__(self):
@@ -554,139 +500,83 @@ class MusicRAG:
             {"tags":["rock","metal","pesado"],"scale":"phrygian","dynamics":"loud","style":"rock"},
             {"tags":["eletrônica","techno","edm"],"scale":"minor","dynamics":"loud","style":"electronic"},
             {"tags":["feliz","alegre","pop"],"scale":"major","dynamics":"medium","style":"pop"},
+            {"tags":["boss","intenso"],"scale":"phrygian","dynamics":"extreme","style":"boss"},
+            {"tags":["jazz","swing"],"scale":"dorian","dynamics":"medium","style":"jazz"},
+            {"tags":["classical","orquestra"],"scale":"major","dynamics":"varied","style":"orchestral"},
+            {"tags":["lofi","relaxante"],"scale":"major","dynamics":"quiet","style":"lofi"},
         ]
-    
     def get_context(self,query,style_hint=None):
-        if not query and not style_hint:
-            return self._random_context()
-        
+        if not query and not style_hint:return self._random_context()
         query_lower=(query or '').lower()
         scores=[]
         for entry in self.entries:
             score=sum(1 for tag in entry['tags'] if tag in query_lower)
-            if style_hint and entry['style']==style_hint:
-                score+=2
+            if style_hint and entry['style']==style_hint:score+=2
             if score>0:scores.append((score,entry))
-        
-        if scores:
-            scores.sort(key=lambda x:x[0],reverse=True)
-            best=scores[0][1]
-        else:
-            best=np.random.choice(self.entries)
-        
+        best=scores[0][1] if scores else np.random.choice(self.entries)
         progression=ALL_PROGRESSIONS[np.random.randint(0,len(ALL_PROGRESSIONS))]
         scale_name=best.get('scale','major')
         if np.random.random()<0.3:scale_name=np.random.choice(SCALE_NAMES)
         scale=ALL_SCALES.get(scale_name,ALL_SCALES['major'])
         dynamics=best.get('dynamics','medium')
-        bpm_map={'very_quiet':(40,70),'quiet':(60,90),'medium':(90,130),'loud':(120,160),'extreme':(160,230)}
-        bpm_range=bpm_map.get(dynamics,(90,130))
-        bpm=np.random.randint(bpm_range[0],bpm_range[1]+1)
-        intensity_map={'very_quiet':0.35,'quiet':0.55,'medium':0.7,'loud':0.85,'extreme':0.95}
-        intensity=intensity_map.get(dynamics,0.7)+np.random.uniform(-0.1,0.1)
-        intensity=np.clip(intensity,0.2,0.98)
+        bpm_map={'very_quiet':(40,70),'quiet':(60,90),'medium':(90,130),'loud':(120,160),'extreme':(160,230),'varied':(70,140)}
+        bpm=np.random.randint(*bpm_map.get(dynamics,(90,130)))
+        intensity_map={'very_quiet':0.35,'quiet':0.55,'medium':0.7,'loud':0.85,'extreme':0.95,'varied':0.65}
+        intensity=np.clip(intensity_map.get(dynamics,0.7)+np.random.uniform(-0.1,0.1),0.2,0.98)
         style=style_hint or best.get('style','pop')
-        
         print(f"  📚 RAG: estilo={style}, escala={scale_name}, BPM={bpm}")
         return {'scale':scale,'scale_name':scale_name,'progression':progression,'bpm':bpm,'intensity':intensity,'style':style,'seed':get_dynamic_seed()}
-    
     def _random_context(self):
         scale_name=np.random.choice(SCALE_NAMES)
         progression=ALL_PROGRESSIONS[np.random.randint(0,len(ALL_PROGRESSIONS))]
         style=np.random.choice(list(SongStructure.STRUCTURES.keys()))
         return {'scale':ALL_SCALES[scale_name],'scale_name':scale_name,'progression':progression,'bpm':np.random.randint(50,200),'intensity':np.random.uniform(0.3,0.95),'style':style,'seed':get_dynamic_seed()}
 
-# ============================================================
-# GERAÇÃO COM INTELIGÊNCIA (CORRIGIDO)
-# ============================================================
-
 def generate_with_intelligence(duration, prompt=None, style=None, use_rag=True, sr=44100):
     print("="*60)
-    print("🧠 INTELIGÊNCIA MÁXIMA ATIVADA")
+    print("🧠 INTELIGÊNCIA MÁXIMA (macOS 14GB)")
     print("="*60)
-    
-    interpreter = PromptInterpreter()
-    prompt_params = interpreter.interpret(prompt)
-    
-    analyzer = AudioAnalyzer()
-    reference_analysis = analyzer.analyze_directory()
-    
-    moe_loader = MoELoader()
-    model_loaded = moe_loader.load_model()
-    
-    final_style = style
-    if prompt_params.get('style'):
-        final_style = prompt_params['style']
-    
-    if not final_style:
-        final_style = 'pop'
-    
-    rag = MusicRAG() if use_rag else None
-    if use_rag and rag:
-        rag_context = rag.get_context(prompt, style_hint=final_style)
-    else:
-        rag_context = rag._random_context() if rag else {
-            'scale':[0,2,4,5,7,9,11],'scale_name':'major',
-            'progression':ALL_PROGRESSIONS[0],'bpm':120,
-            'intensity':0.7,'style':final_style,'seed':get_dynamic_seed()
-        }
-    
+    interpreter=PromptInterpreter()
+    prompt_params=interpreter.interpret(prompt)
+    analyzer=AudioAnalyzer()
+    reference_analysis=analyzer.analyze_directory()
+    moe_loader=MoELoader()
+    model_loaded=moe_loader.load_model()
+    final_style=style
+    if prompt_params.get('style'):final_style=prompt_params['style']
+    if not final_style:final_style='pop'
+    rag=MusicRAG() if use_rag else None
+    if use_rag and rag:rag_context=rag.get_context(prompt,style_hint=final_style)
+    else:rag_context=rag._random_context() if rag else {'scale':[0,2,4,5,7,9,11],'scale_name':'major','progression':ALL_PROGRESSIONS[0],'bpm':120,'intensity':0.7,'style':final_style,'seed':get_dynamic_seed()}
     if reference_analysis:
-        ref_bpm = reference_analysis['avg_bpm']
-        rag_context['bpm'] = int(rag_context['bpm'] * 0.6 + ref_bpm * 0.4)
+        rag_context['bpm']=int(rag_context['bpm']*0.6+reference_analysis['avg_bpm']*0.4)
         print(f"  🎵 BPM ajustado: {rag_context['bpm']}")
-    
-    if prompt_params.get('breakcore', 0) > 1.5 or final_style == 'breakcore':
+    if prompt_params.get('breakcore',0)>1.5 or final_style=='breakcore':
         print("💥 Modo BREAKCORE")
         return generate_breakcore(duration)
-    
     print(f"\n🎵 Gerando música final...")
-    return generate_with_structure(duration, rag_context, sr)
+    return generate_with_structure(duration,rag_context,sr)
 
 def generate_with_structure(duration,rag_context,sr=44100):
     np.random.seed(rag_context['seed'])
-    
-    bpm=rag_context['bpm']
-    style=rag_context.get('style','pop')
-    base_freq_options=[220.0,246.94,261.63,293.66,329.63,349.23]
-    base_freq=np.random.choice(base_freq_options)
-    scale=rag_context['scale']
-    progression=rag_context['progression']
-    
+    bpm=rag_context['bpm'];style=rag_context.get('style','pop')
+    base_freq=np.random.choice([220.0,246.94,261.63,293.66,329.63,349.23])
+    scale=rag_context['scale'];progression=rag_context['progression']
     structure=SongStructure(style=style,duration=duration,bpm=bpm)
-    
     print(f"   Estrutura: {[s['name'] for s in structure.sections]}")
-    
-    total_samples=int(duration*sr)
-    beat_duration=60.0/bpm
-    
-    drums_track=np.zeros(total_samples)
-    bass_track=np.zeros(total_samples)
-    chords_track=np.zeros(total_samples)
-    melody_track=np.zeros(total_samples)
+    total_samples=int(duration*sr);beat_duration=60.0/bpm
+    drums_track=np.zeros(total_samples);bass_track=np.zeros(total_samples)
+    chords_track=np.zeros(total_samples);melody_track=np.zeros(total_samples)
     fx_track=np.zeros(total_samples)
-    
-    # CORREÇÃO: renomear samples para evitar conflito com nomes de função
-    kick_sample = make_kick(sr)
-    snare_sample = make_snare(sr)
-    hihat_sample = make_hihat(sr)
-    tom1_sample = make_tom(200,sr)
-    tom2_sample = make_tom(150,sr)
-    tom3_sample = make_tom(100,sr)
-    crash_sample = make_crash(sr)
-    
+    kick_sample=make_kick(sr);snare_sample=make_snare(sr);hihat_sample=make_hihat(sr)
+    tom1_sample=make_tom(200,sr);tom2_sample=make_tom(150,sr);tom3_sample=make_tom(100,sr)
+    crash_sample=make_crash(sr)
     n_beats=int(duration/beat_duration)
-    
-    # Bateria
     print("  🥁 Bateria...")
     for beat in range(n_beats):
-        time=beat*beat_duration
-        section=structure.get_section_at_time(time)
-        section_name=section['name']
-        energy=structure.get_energy_at_time(time)
-        vel=0.4+0.6*energy
-        pos=int(beat*beat_duration*sr)
-        
+        time=beat*beat_duration;section=structure.get_section_at_time(time)
+        section_name=section['name'];energy=structure.get_energy_at_time(time)
+        vel=0.4+0.6*energy;pos=int(beat*beat_duration*sr)
         if section_name in ['intro','breakdown','break']:
             if beat%4==0 and pos+len(kick_sample)<=total_samples:drums_track[pos:pos+len(kick_sample)]+=kick_sample*vel*0.6
             if beat%4==2 and pos+len(snare_sample)<=total_samples:drums_track[pos:pos+len(snare_sample)]+=snare_sample*vel*0.5
@@ -695,7 +585,7 @@ def generate_with_structure(duration,rag_context,sr=44100):
             if beat%4 in [0,2] and pos+len(kick_sample)<=total_samples:drums_track[pos:pos+len(kick_sample)]+=kick_sample*vel*0.8
             if beat%4 in [1,3] and pos+len(snare_sample)<=total_samples:drums_track[pos:pos+len(snare_sample)]+=snare_sample*vel*0.7
             if pos+len(hihat_sample)<=total_samples:drums_track[pos:pos+len(hihat_sample)]+=hihat_sample*vel*0.4
-        elif section_name in ['chorus','drop','climax','chaos1','chaos2','chaos3']:
+        elif section_name in ['chorus','drop','climax','chaos1','chaos2','chaos3','intensity']:
             if beat%2==0 and pos+len(kick_sample)<=total_samples:drums_track[pos:pos+len(kick_sample)]+=kick_sample*vel*0.9
             if beat%4 in [1,3] and pos+len(snare_sample)<=total_samples:drums_track[pos:pos+len(snare_sample)]+=snare_sample*vel*0.8
             for sub in [0,0.5]:
@@ -716,31 +606,21 @@ def generate_with_structure(duration,rag_context,sr=44100):
             if beat%4 in [0,2] and pos+len(kick_sample)<=total_samples:drums_track[pos:pos+len(kick_sample)]+=kick_sample*vel*0.7
             if beat%4 in [1,3] and pos+len(snare_sample)<=total_samples:drums_track[pos:pos+len(snare_sample)]+=snare_sample*vel*0.6
             if pos+len(hihat_sample)<=total_samples:drums_track[pos:pos+len(hihat_sample)]+=hihat_sample*vel*0.35
-        
-        # Drum fills
         fill_prob=structure.get_fill_probability(time)
         if np.random.random()<fill_prob:
             fill_start=pos
-            fill_duration=int(beat_duration*sr)
-            if fill_start+fill_duration<=total_samples:
+            if fill_start+int(beat_duration*sr)<=total_samples:
                 toms=[tom1_sample,tom2_sample,tom3_sample,tom2_sample]
                 for i,tom in enumerate(toms):
                     tom_pos=fill_start+int(i*beat_duration*sr/4)
                     if tom_pos+len(tom)<=total_samples:drums_track[tom_pos:tom_pos+len(tom)]+=tom*vel*0.7
                 crash_pos=fill_start+int(beat_duration*sr*0.9)
                 if crash_pos+len(crash_sample)<=total_samples:drums_track[crash_pos:crash_pos+len(crash_sample)]+=crash_sample*vel*0.8
-    
-    # Baixo
     print("  🎸 Baixo...")
     for beat in range(n_beats):
-        time=beat*beat_duration
-        section=structure.get_section_at_time(time)
-        energy=structure.get_energy_at_time(time)
-        chord_idx=(beat//4)%len(progression)
-        root=progression[chord_idx][0]
-        root_freq=note_to_freq(scale[root%len(scale)],base_freq)/2
-        vel=0.3+0.7*energy
-        
+        time=beat*beat_duration;section=structure.get_section_at_time(time);energy=structure.get_energy_at_time(time)
+        chord_idx=(beat//4)%len(progression);root=progression[chord_idx][0]
+        root_freq=note_to_freq(scale[root%len(scale)],base_freq)/2;vel=0.3+0.7*energy
         if section['name'] in ['intro','breakdown','break']:
             if beat%4==0:
                 note=karplus_strong(root_freq,beat_duration*3,sr,damping=0.998)
@@ -751,7 +631,7 @@ def generate_with_structure(duration,rag_context,sr=44100):
                 note=karplus_strong(root_freq,beat_duration*1.5,sr,damping=0.997)
                 pos=int(beat*beat_duration*sr)
                 if pos+len(note)<=total_samples:bass_track[pos:pos+len(note)]+=note*vel*0.4
-        elif section['name'] in ['chorus','drop','climax']:
+        elif section['name'] in ['chorus','drop','climax','intensity']:
             freq=root_freq if beat%2==0 else root_freq*2
             note=karplus_strong(freq,beat_duration*0.9,sr)
             pos=int(beat*beat_duration*sr)
@@ -761,18 +641,11 @@ def generate_with_structure(duration,rag_context,sr=44100):
                 note=karplus_strong(root_freq,beat_duration*1.2,sr)
                 pos=int(beat*beat_duration*sr)
                 if pos+len(note)<=total_samples:bass_track[pos:pos+len(note)]+=note*vel*0.4
-    
-    # Acordes
     print("  🎹 Acordes...")
     chord_duration=beat_duration*4
     for i in range(int(duration/chord_duration)):
-        time=i*chord_duration
-        section=structure.get_section_at_time(time)
-        energy=structure.get_energy_at_time(time)
-        chord=progression[i%len(progression)]
-        pos=int(i*chord_duration*sr)
-        vel=0.2+0.6*energy
-        
+        time=i*chord_duration;section=structure.get_section_at_time(time);energy=structure.get_energy_at_time(time)
+        chord=progression[i%len(progression)];pos=int(i*chord_duration*sr);vel=0.2+0.6*energy
         if section['name'] in ['intro','breakdown','break','outro']:
             for nd in chord:
                 freq=note_to_freq(scale[nd%len(scale)],base_freq)
@@ -783,7 +656,7 @@ def generate_with_structure(duration,rag_context,sr=44100):
                 freq=note_to_freq(scale[nd%len(scale)],base_freq)
                 note=piano_note(freq,chord_duration*0.9,sr)
                 if pos+len(note)<=total_samples:chords_track[pos:pos+len(note)]+=note*vel*0.2
-        elif section['name'] in ['chorus','drop','climax']:
+        elif section['name'] in ['chorus','drop','climax','intensity']:
             for nd in chord:
                 freq=note_to_freq(scale[nd%len(scale)],base_freq)
                 note_p=piano_note(freq,chord_duration*0.9,sr)
@@ -795,49 +668,34 @@ def generate_with_structure(duration,rag_context,sr=44100):
                 freq=note_to_freq(scale[nd%len(scale)],base_freq)
                 note=piano_note(freq,chord_duration*0.9,sr)
                 if pos+len(note)<=total_samples:chords_track[pos:pos+len(note)]+=note*vel*0.18
-    
-    # Melodia
     print("  🎶 Melodia...")
-    note_duration=beat_duration/2
-    current_degree=0
-    prev_section=None
-    
+    note_duration=beat_duration/2;current_degree=0;prev_section=None
     for i in range(int(duration/note_duration)):
-        time=i*note_duration
-        section=structure.get_section_at_time(time)
-        section_name=section['name']
-        energy=structure.get_energy_at_time(time)
-        
-        if section!=prev_section:
-            current_degree=np.random.randint(0,len(scale))
-            prev_section=section
-        
+        time=i*note_duration;section=structure.get_section_at_time(time)
+        section_name=section['name'];energy=structure.get_energy_at_time(time)
+        if section!=prev_section:current_degree=np.random.randint(0,len(scale));prev_section=section
         if section_name in ['intro','breakdown','break']:
             if np.random.random()<0.3:
                 step=np.random.choice([-1,0,1])
                 current_degree=max(0,min(current_degree+step,len(scale)-1))
                 freq=note_to_freq(scale[current_degree],base_freq)
-                pos=int(time*sr)
-                nlen=int(note_duration*sr*3)
+                pos=int(time*sr);nlen=int(note_duration*sr*3)
                 note=flute_note(freq,nlen/sr,sr)
                 if pos+len(note)<=total_samples:melody_track[pos:pos+len(note)]+=note*energy*0.25
         elif section_name in ['verse','head','theme']:
             if np.random.random()<0.7:
                 step=np.random.choice([-2,-1,0,1,2],p=[0.1,0.25,0.3,0.25,0.1])
                 current_degree=max(0,min(current_degree+step,len(scale)*2-1))
-                octave=current_degree//len(scale)
-                degree=current_degree%len(scale)
+                octave=current_degree//len(scale);degree=current_degree%len(scale)
                 freq=note_to_freq(scale[degree],base_freq)*(2**octave)
-                pos=int(time*sr)
-                nlen=int(note_duration*sr*1.5)
+                pos=int(time*sr);nlen=int(note_duration*sr*1.5)
                 note=piano_note(freq,nlen/sr,sr)
                 if pos+len(note)<=total_samples:melody_track[pos:pos+len(note)]+=note*energy*0.3
-        elif section_name in ['chorus','drop','climax']:
+        elif section_name in ['chorus','drop','climax','intensity']:
             if np.random.random()<0.85:
                 step=np.random.choice([-3,-2,-1,0,1,2,3],p=[0.05,0.15,0.2,0.2,0.2,0.15,0.05])
                 current_degree=max(0,min(current_degree+step,len(scale)*3-1))
-                octave=current_degree//len(scale)
-                degree=current_degree%len(scale)
+                octave=current_degree//len(scale);degree=current_degree%len(scale)
                 freq=note_to_freq(scale[degree],base_freq)*(2**octave)
                 pos=int(time*sr)
                 dur_mult=np.random.choice([0.5,1.0,1.5,2.0],p=[0.3,0.4,0.2,0.1])
@@ -852,15 +710,11 @@ def generate_with_structure(duration,rag_context,sr=44100):
             if np.random.random()<0.6:
                 step=np.random.choice([-1,0,1,2])
                 current_degree=max(0,min(current_degree+step,len(scale)*2-1))
-                octave=current_degree//len(scale)
-                degree=current_degree%len(scale)
+                octave=current_degree//len(scale);degree=current_degree%len(scale)
                 freq=note_to_freq(scale[degree],base_freq)*(2**octave)
-                pos=int(time*sr)
-                nlen=int(note_duration*sr*1.5)
+                pos=int(time*sr);nlen=int(note_duration*sr*1.5)
                 note=piano_note(freq,nlen/sr,sr)
                 if pos+len(note)<=total_samples:melody_track[pos:pos+len(note)]+=note*energy*0.3
-    
-    # Efeitos
     print("  ✨ Efeitos...")
     for section in structure.section_times:
         if section['name']=='buildup':
@@ -868,30 +722,24 @@ def generate_with_structure(duration,rag_context,sr=44100):
             if riser_start>0 and riser_start+int(2.0*sr)<=total_samples:
                 riser=riser_sweep(2.0,sr)
                 fx_track[riser_start:riser_start+len(riser)]+=riser*0.15
-    
     for i in range(len(structure.section_times)-1):
         transition_time=structure.section_times[i]['end']
         sweep_start=int((transition_time-0.5)*sr)
         if sweep_start>0 and sweep_start+int(0.5*sr)<=total_samples:
             sweep=noise_sweep(0.5,sr)
             fx_track[sweep_start:sweep_start+len(sweep)]+=sweep*0.1
-    
-    # Mixagem
     print("  🎛️ Mixagem...")
     mix=drums_track+bass_track+chords_track+melody_track+fx_track
-    reverb_amount=np.random.uniform(0.15,0.3)
-    mix=add_reverb(mix,sr,decay=0.35,mix=reverb_amount)
+    mix=add_reverb(mix,sr,decay=0.35,mix=np.random.uniform(0.15,0.3))
     mix=soft_compress(mix,threshold=0.5,ratio=3.0)
     mix=mix/(np.max(np.abs(mix))+1e-10)*0.9
     fade_in=int(0.5*sr);fade_out=int(1.5*sr)
     if fade_in<len(mix):mix[:fade_in]*=np.linspace(0,1,fade_in)
     if fade_out<len(mix):mix[-fade_out:]*=np.linspace(1,0,fade_out)
-    
     return mix,sr
 
 def generate_breakcore(duration,sr=44100,intensity=1.0):
-    seed=get_dynamic_seed()
-    np.random.seed(seed)
+    seed=get_dynamic_seed();np.random.seed(seed)
     total_samples=int(duration*sr);bpm=np.random.randint(180,230)
     print(f"  💥 BREAKCORE: BPM={bpm}")
     break_source=make_amen_break(sr,tempo_factor=bpm/180)
@@ -914,8 +762,7 @@ def generate_breakcore(duration,sr=44100,intensity=1.0):
             chunk=chunk[idx[idx<len(chunk)]]
         if np.random.random()<0.4:chunk=np.tanh(chunk*np.random.uniform(2,6))
         end=min(pos+len(chunk),total_samples)
-        if pos<total_samples and len(chunk)>0:
-            drums_track[pos:end]+=chunk[:end-pos]*np.random.uniform(0.5,1.0)*intensity*0.8
+        if pos<total_samples and len(chunk)>0:drums_track[pos:end]+=chunk[:end-pos]*np.random.uniform(0.5,1.0)*intensity*0.8
         pos+=len(chunk)
         if np.random.random()<0.24:pos+=np.random.randint(int(0.01*sr),int(0.08*sr))
     bass_track=np.zeros(total_samples);beat_dur=60.0/bpm
@@ -950,10 +797,6 @@ def generate_breakcore(duration,sr=44100,intensity=1.0):
     if fo<len(mix):mix[-fo:]*=np.linspace(1,0,fo)
     return mix,sr
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def batch_generate():
     import argparse
     parser=argparse.ArgumentParser()
@@ -963,22 +806,20 @@ def batch_generate():
     parser.add_argument("--use-rag",type=str,default="true")
     parser.add_argument("--batch",action="store_true")
     args=parser.parse_args()
-    
     use_rag=args.use_rag.lower()=="true"
     print("="*60)
-    print("🎵 IA MUSIC GENERATOR PRO - INTELIGÊNCIA MÁXIMA")
+    print("🎵 IA MUSIC GENERATOR PRO - macOS 14GB MAX")
     print("="*60)
-    
     prompt=args.prompt if args.prompt else None
     style=args.style if not prompt else None
     audio,sr=generate_with_intelligence(args.duration,prompt=prompt,style=style,use_rag=use_rag)
-    metadata={"prompt":args.prompt,"style":args.style,"duration":args.duration,"use_rag":use_rag}
+    metadata={"prompt":args.prompt,"style":args.style,"duration":args.duration,"use_rag":use_rag,"platform":"macos_14gb"}
     filepath,number=save_song(audio,sr,metadata)
     print(f"\n✅ Música #{number}: {filepath}")
 
 def main():
     while True:
-        print("="*50);print("🎵 IA MUSIC PRO - Inteligência Máxima");print("="*50)
+        print("="*50);print("🎵 IA MUSIC PRO - macOS MAX");print("="*50)
         print("1. Prompt  2. Estilo  3. Breakcore  4. Ver  5. Sair")
         choice=input("> ").strip()
         if choice=='1':
@@ -989,9 +830,9 @@ def main():
             fp,num=save_song(audio,sr,{"prompt":prompt,"duration":int(duration)})
             print(f"✅ #{num}: {fp}")
         elif choice=='2':
-            print("1.Epico 2.Boss 3.Dark 4.Rock 5.Ambient 6.Eletronico 7.Jazz 8.Classico")
+            print("1.Epico 2.Boss 3.Dark 4.Rock 5.Ambient 6.Eletronico 7.Jazz 8.Classico 9.Metal 10.Orchestral 11.Lofi")
             s=input("Estilo: ").strip()
-            styles={"1":"epic","2":"bossfight","3":"dark","4":"rock","5":"ambient","6":"electronic","7":"jazz","8":"classical"}
+            styles={"1":"epic","2":"boss","3":"dark","4":"rock","5":"ambient","6":"electronic","7":"jazz","8":"classical","9":"metal","10":"orchestral","11":"lofi"}
             duration=input("Duração: ").strip()
             if duration not in ["30","45","60","90"]:duration="45"
             audio,sr=generate_with_intelligence(int(duration),style=styles.get(s,"epic"))
