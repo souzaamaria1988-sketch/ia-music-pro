@@ -1,4 +1,4 @@
-name: Gerar Música (Linux)
+name: Gerar Música (LINUX)
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         required: false
         default: "45"
       remix:
-        description: "Número da música para remixar (vazio = gerar nova)"
+        description: "Número da música para remixar"
         required: false
         default: ""
       remix_type:
@@ -33,14 +33,22 @@ jobs:
   generate:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    - uses: actions/setup-python@v5
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
       with:
         python-version: "3.11"
-    - run: pip install numpy scipy soundfile
+
+    - name: Install Dependencies
+      run: pip install numpy scipy soundfile
+
     - name: Generate or Remix
       env:
         PROMPT: ${{ github.event.inputs.prompt }}
@@ -57,11 +65,16 @@ jobs:
         else
           python music_generator.py --style "$STYLE" --duration "$DURATION" --use-rag true --batch
         fi
+
     - name: Commit
       run: |
-        git config user.email "bot@github.com"
-        git config user.name "Music Bot"
+        git config --local user.email "bot@github.com"
+        git config --local user.name "Music Bot"
         git add song_output/
-        git commit -m "🎵 Música: $(date)" || true
-        git pull --rebase origin main || true
-        git push
+        if git diff --staged --quiet; then
+          echo "Nada para commitar"
+        else
+          git commit -m "🎵 Música: $(date '+%Y-%m-%d %H:%M')"
+          git pull --rebase origin main || true
+          git push
+        fi
