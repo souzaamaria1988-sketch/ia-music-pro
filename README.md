@@ -7,9 +7,7 @@
 
 
 
-[![Treinar MoE (macOS MAX - 14GB)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/train_moe.yml/badge.svg?branch=main)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/train_moe.yml)
-
-
+[![Treinar Autoencoder (10.000 épocas - LINUX)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/train_model.yml/badge.svg)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/train_model.yml)
 
 
 # 🎵 IA Music Generator Pro - MoE + RAG
