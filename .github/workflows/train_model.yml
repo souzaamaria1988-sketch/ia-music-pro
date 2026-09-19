@@ -1,0 +1,90 @@
+name: Treinar Modelo (10.000 épocas - LINUX)
+
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "Épocas (padrão 10000)"
+        required: false
+        default: "10000"
+      num_experts:
+        description: "Número de experts (padrão 64)"
+        required: false
+        default: "64"
+
+permissions:
+  contents: write
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Install Dependencies
+      run: |
+        pip install --upgrade pip
+        pip install numpy scipy soundfile
+
+    - name: Check System
+      run: |
+        echo "🐧 Sistema:"
+        uname -a
+        echo "💾 RAM disponível:"
+        free -h
+        echo "💻 CPUs:"
+        nproc
+
+    - name: Train MoE (10.000 épocas)
+      env:
+        EPOCHS: ${{ github.event.inputs.epochs }}
+        NUM_EXPERTS: ${{ github.event.inputs.num_experts }}
+      run: |
+        echo "=========================================="
+        echo "  🐧 TREINAMENTO LINUX"
+        echo "  Épocas: $EPOCHS"
+        echo "  Experts: $NUM_EXPERTS"
+        echo "  Runner: ubuntu-latest"
+        echo "  RAM: ~7 GB"
+        echo "=========================================="
+        python train.py --epochs $EPOCHS --num-experts $NUM_EXPERTS --batch-size 32
+
+    - name: Show Results
+      run: |
+        echo "📁 Modelos salvos:"
+        ls -lh models/ 2>/dev/null || echo "Nenhum modelo"
+        if [ -f models/training_log.json ]; then
+          echo "📊 Log de treino:"
+          cat models/training_log.json
+        fi
+
+    - name: Commit Models
+      run: |
+        git config --local user.email "train-bot@github.com"
+        git config --local user.name "Train Bot"
+        git add models/
+        if git diff --staged --quiet; then
+          echo "Nada para commitar"
+        else
+          git commit -m "🧠 MoE treinado (10.000 épocas Linux): $(date '+%Y-%m-%d %H:%M')"
+          git pull --rebase origin main || true
+          git push
+        fi
+
+    - name: Upload Model Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: moe-model-linux
+        path: models/
+        retention-days: 90
