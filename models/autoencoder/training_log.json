@@ -1,0 +1,16 @@
+{
+  "type": "Autoencoder_Fixed",
+  "epochs": 10000,
+  "input_size": 256,
+  "latent_size": 64,
+  "hidden_sizes": [
+    512,
+    256,
+    128
+  ],
+  "final_loss": 8.699712858059607e-06,
+  "best_loss": 7.69535316964152e-06,
+  "training_time_min": 4.372047289212545,
+  "dataset_size": 192,
+  "total_params": 608320
+}
