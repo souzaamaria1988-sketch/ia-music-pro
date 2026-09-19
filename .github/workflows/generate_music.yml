@@ -1,4 +1,4 @@
-name: Gerar Música (LINUX)
+name: Gerar Música (com Feedback Loop)
 
 on:
   workflow_dispatch:
@@ -8,23 +8,13 @@ on:
         required: false
         default: ""
       style:
-        description: "Estilo (100+ disponíveis)"
+        description: "Estilo musical"
         required: false
-        default: "epic"
+        default: "pop"
       duration:
         description: "Duração"
         required: false
         default: "45"
-      remix:
-        description: "Número da música para remixar"
-        required: false
-        default: ""
-      remix_type:
-        description: "Tipo de remix"
-        required: false
-        default: "variations"
-        type: choice
-        options: [variations, style_change, speed_up, slow_down, acoustic, electronic, heavy, soft]
 
 permissions:
   contents: write
@@ -35,46 +25,44 @@ jobs:
     timeout-minutes: 60
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Setup Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: "3.11"
 
     - name: Install Dependencies
       run: pip install numpy scipy soundfile
 
-    - name: Generate or Remix
+    - name: Generate Music (with Feedback Loop)
       env:
         PROMPT: ${{ github.event.inputs.prompt }}
         STYLE: ${{ github.event.inputs.style }}
         DURATION: ${{ github.event.inputs.duration }}
-        REMIX: ${{ github.event.inputs.remix }}
-        REMIX_TYPE: ${{ github.event.inputs.remix_type }}
       run: |
-        mkdir -p song_output
-        if [ -n "$REMIX" ]; then
-          python music_generator.py --remix "$REMIX" --remix-type "$REMIX_TYPE" --style "$STYLE" --batch
-        elif [ -n "$PROMPT" ]; then
-          python music_generator.py --prompt "$PROMPT" --duration "$DURATION" --use-rag true --batch
-        else
-          python music_generator.py --style "$STYLE" --duration "$DURATION" --use-rag true --batch
-        fi
+        mkdir -p song_output memory
+        python music_generator.py --prompt "$PROMPT" --style "$STYLE" --duration "$DURATION" --batch
 
     - name: Commit
       run: |
         git config --local user.email "bot@github.com"
         git config --local user.name "Music Bot"
-        git add song_output/
+        git add song_output/ memory/
         if git diff --staged --quiet; then
           echo "Nada para commitar"
         else
-          git commit -m "🎵 Música: $(date '+%Y-%m-%d %H:%M')"
+          git commit -m "🎵 Música + Memórias: $(date)"
           git pull --rebase origin main || true
           git push
         fi
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: music-output
+        path: |
+          song_output/
+          memory/
+        retention-days: 30
