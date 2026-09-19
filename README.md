@@ -1,7 +1,6 @@
-![main image](https://i.ibb.co/PGnjSZpM/2afe7a8b-8a3c-44d1-a091-e10e569a0d71.png)
-
-
-
+<p align="center">
+  <img src="https://i.ibb.co/PGnjSZpM/2afe7a8b-8a3c-44d1-a091-e10e569a0d71.png" alt="main image" width="800">
+</p>
 
 
 [![Gerar Música (macOS MAX)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/generate_music.yml/badge.svg?branch=main&event=workflow_run)](https://github.com/souzaamaria1988-sketch/ia-music-pro/actions/workflows/generate_music.yml)
