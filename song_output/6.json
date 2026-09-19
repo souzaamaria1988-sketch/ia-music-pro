@@ -1,0 +1,8 @@
+{
+  "prompt": "Uma música épica de batalha",
+  "style": "epic",
+  "duration": 45,
+  "use_rag": true,
+  "model": "MoE+RAG",
+  "song_number": 6
+}
