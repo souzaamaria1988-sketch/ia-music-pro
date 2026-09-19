@@ -1,7 +1,4 @@
-![main image]([https://myimgs.org/storage/images/41332/1000668836.png] )
-
-<div align="center">
-https://ibb.co/PGnjSZpM
+![main image](https://i.ibb.co/PGnjSZpM/2afe7a8b-8a3c-44d1-a091-e10e569a0d71.png)
 
 
 
