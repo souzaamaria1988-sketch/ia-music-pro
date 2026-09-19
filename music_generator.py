@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-🧠 IA MUSIC GENERATOR PRO - Otimizado para macOS 14GB
-- Cache de samples (economia RAM)
-- Modelo MoE MAX
-- Análise de referência
-- RAG + Prompt Interpreter
+🧠 IA MUSIC GENERATOR - LAYER-WISE INFERENCE
+Inferência otimizada: carrega 1 camada por vez
 """
-import os,sys,json,time
+import os,sys,json,time,gc
 import numpy as np
 from pathlib import Path
 
@@ -19,8 +16,8 @@ except ImportError:
 OUTPUT_DIR="song_output"
 MODEL_DIR="models"
 MUSIC_DIR="music_input"
+LAYERS_DIR=os.path.join(MODEL_DIR,"layers")
 
-# Cache global de samples (economiza RAM)
 SAMPLE_CACHE={}
 
 def get_dynamic_seed():
@@ -54,147 +51,102 @@ def save_song(audio,sr,metadata=None):
     print(f"💾 Salvo: {filepath}")
     return filepath,number
 
-class AudioAnalyzer:
-    def analyze_file(self, filepath, sr=22050):
-        try:
-            import soundfile as sf
-            audio, file_sr = sf.read(filepath, dtype='float32')
-            if len(audio.shape) > 1:
-                audio = np.mean(audio, axis=1)
-            if file_sr != sr:
-                indices = np.round(np.arange(0, len(audio), file_sr/sr)).astype(int)
-                audio = audio[indices[indices < len(audio)]]
-        except Exception as e:
-            return None
-        if len(audio) < sr:
-            return None
-        features = {}
-        features['duration'] = len(audio) / sr
-        features['rms'] = float(np.sqrt(np.mean(audio**2)))
-        fft_result = np.abs(np.fft.rfft(audio))
-        freqs = np.fft.rfftfreq(len(audio), 1/sr)
-        total_energy = np.sum(fft_result) + 1e-10
-        features['spectral_centroid'] = float(np.sum(freqs * fft_result) / total_energy)
-        bands = {'sub_bass': (20, 60), 'bass': (60, 250), 'low_mids': (250, 500),
-                'mids': (500, 2000), 'high_mids': (2000, 6000), 'highs': (6000, 20000)}
-        features['frequency_bands'] = {}
-        for band_name, (low, high) in bands.items():
-            mask = (freqs >= low) & (freqs < high)
-            features['frequency_bands'][band_name] = float(np.sum(fft_result[mask]**2))
-        analysis_audio = audio[:sr*10] if len(audio) > sr*10 else audio
-        autocorr = np.correlate(analysis_audio, analysis_audio, mode='full')
-        autocorr = autocorr[len(autocorr)//2:]
-        peaks = []
-        min_lag = int(sr * 60 / 200)
-        max_lag = int(sr * 60 / 40)
-        for i in range(min_lag, min(max_lag, len(autocorr)-1)):
-            if autocorr[i] > autocorr[i-1] and autocorr[i] > autocorr[i+1]:
-                if autocorr[i] > 0.1 * autocorr[0]:
-                    peaks.append(i)
-                    if len(peaks) >= 5:
-                        break
-        if len(peaks) >= 2:
-            avg_period = np.mean(np.diff(peaks))
-            bpm = 60.0 / (avg_period / sr)
-            features['estimated_bpm'] = float(np.clip(bpm, 40, 200))
-        else:
-            features['estimated_bpm'] = 120.0
-        return features
+def dequantize_int8(quantized,scale):
+    return quantized.astype(np.float32)*scale
+
+class LayerWiseInference:
+    """Inferência camada por camada (economiza RAM)"""
     
-    def analyze_directory(self, music_dir=MUSIC_DIR):
-        music_path = Path(music_dir)
-        if not music_path.exists():
-            return None
-        audio_files = []
-        for ext in ['*.mp3', '*.wav', '*.flac', '*.ogg']:
-            audio_files.extend(list(music_path.glob(ext)))
-        if not audio_files:
-            return None
-        print(f"  🔍 Analisando {min(len(audio_files), 10)} músicas de referência...")
-        all_features = []
-        for filepath in audio_files[:10]:
-            print(f"    🎵 {filepath.name}")
-            features = self.analyze_file(filepath)
-            if features:
-                all_features.append(features)
-        if not all_features:
-            return None
-        aggregated = {
-            'num_files': len(all_features),
-            'avg_bpm': float(np.mean([f['estimated_bpm'] for f in all_features])),
-            'avg_spectral_centroid': float(np.mean([f['spectral_centroid'] for f in all_features])),
-            'avg_rms': float(np.mean([f['rms'] for f in all_features])),
-        }
-        print(f"  ✅ Análise completa: BPM={aggregated['avg_bpm']:.1f}")
-        return aggregated
-
-class MoELoader:
     def __init__(self):
-        self.model_data = None
-        self.is_loaded = False
-    def load_model(self, model_path=None):
-        if model_path is None:
-            model_path = os.path.join(MODEL_DIR, "best_moe_model.npz")
-        if not os.path.exists(model_path):
-            print("  ⚠️ Modelo MoE não encontrado")
+        self.manifest=None
+        self.is_loaded=False
+    
+    def load_manifest(self):
+        manifest_path=os.path.join(MODEL_DIR,"manifest.json")
+        if not os.path.exists(manifest_path):
+            print("  ⚠️ Modelo não treinado ainda")
             return False
-        try:
-            self.model_data = np.load(model_path, allow_pickle=True)
-            self.is_loaded = True
-            num_experts = int(self.model_data['num_experts'].item()) if 'num_experts' in self.model_data else 16
-            input_size = int(self.model_data['input_size'].item()) if 'input_size' in self.model_data else 256
-            print(f"  🧠 Modelo MoE carregado: {num_experts} experts, input={input_size}")
-            return True
-        except Exception as e:
-            print(f"  ❌ Erro ao carregar modelo: {e}")
-            return False
+        
+        with open(manifest_path,'r') as f:
+            self.manifest=json.load(f)
+        
+        self.is_loaded=True
+        print(f"  🧠 Modelo carregado (layer-wise):")
+        print(f"     Experts: {self.manifest['num_experts']}")
+        print(f"     Hidden: {self.manifest['hidden_size']}")
+        print(f"     Total params: {self.manifest['total_params']:,}")
+        print(f"     Camadas em disco: {len(self.manifest.get('layer_files',[]))}")
+        return True
+    
+    def load_layer(self,layer_name):
+        """Carrega UMA camada do disco"""
+        filepath=os.path.join(LAYERS_DIR,f"{layer_name}.npz")
+        if not os.path.exists(filepath):
+            return None,None
+        
+        data=np.load(filepath)
+        weights=dequantize_int8(data['weights'],data['scale'])
+        biases=data['biases'].astype(np.float32)
+        
+        return weights,biases
+    
+    def unload_layer(self,weights,biases):
+        """Descarrega camada da RAM"""
+        if weights is not None:del weights
+        if biases is not None:del biases
+        gc.collect()
+    
+    def forward_layer(self,x,layer_name):
+        """Processa UMA camada"""
+        weights,biases=self.load_layer(layer_name)
+        if weights is None:
+            return x
+        output=x@weights+biases
+        self.unload_layer(weights,biases)
+        return output
+    
+    def forward_expert(self,x,expert_idx):
+        """Processa UM expert camada por camada"""
+        if not self.manifest:return x
+        
+        blocks=self.manifest['blocks_per_expert']
+        
+        h=self.forward_layer(x,f'expert_{expert_idx}_input')
+        h=np.maximum(0,h)
+        
+        for j in range(blocks):
+            z1=self.forward_layer(h,f'expert_{expert_idx}_block_{j}_1')
+            a1=np.maximum(0,z1)
+            z2=self.forward_layer(a1,f'expert_{expert_idx}_block_{j}_2')
+            h=z2+h
+            del z1,a1,z2
+            gc.collect()
+        
+        output=self.forward_layer(h,f'expert_{expert_idx}_output')
+        return output
+    
+    def predict(self,features,top_k=2):
+        """Predição com economia de RAM"""
+        if not self.is_loaded:return None
+        
+        # Gate
+        weights,biases=self.load_layer('gate')
+        if weights is None:return None
+        
+        logits=features@weights+biases
+        self.unload_layer(weights,biases)
+        
+        exp_logits=np.exp(logits-np.max(logits,axis=-1,keepdims=True))
+        probs=exp_logits/np.sum(exp_logits,axis=-1,keepdims=True)
+        
+        top_indices=np.argsort(probs,axis=-1)[-top_k:]
+        expert_names=self.manifest.get('expert_names',[])
+        
+        selected=[expert_names[i] for i in top_indices[0] if i<len(expert_names)]
+        
+        return {'probs':probs,'selected_experts':selected}
 
-class PromptInterpreter:
-    KEYWORDS = {
-        "intenso": {"intensity": 0.95, "bpm_mult": 1.3},
-        "calmo": {"intensity": 0.4, "bpm_mult": 0.6},
-        "épico": {"intensity": 0.9, "bpm_mult": 1.2, "orchestral": 2.0, "style": "cinematic"},
-        "epico": {"intensity": 0.9, "bpm_mult": 1.2, "orchestral": 2.0, "style": "cinematic"},
-        "sombrio": {"intensity": 0.7, "minor": True, "style": "dark"},
-        "dark": {"intensity": 0.7, "minor": True, "style": "dark"},
-        "feliz": {"major": True, "bpm_mult": 1.1},
-        "triste": {"minor": True, "bpm_mult": 0.7},
-        "breakcore": {"breakcore": 3.0, "intensity": 1.0, "bpm_mult": 1.8, "style": "breakcore"},
-        "amen": {"breakcore": 2.5, "style": "breakcore"},
-        "glitch": {"breakcore": 2.0, "style": "breakcore"},
-        "boss": {"intensity": 0.95, "style": "boss"},
-        "rock": {"intensity": 0.95, "style": "rock"},
-        "jazz": {"intensity": 0.7, "style": "jazz"},
-        "ambient": {"intensity": 0.4, "style": "ambient"},
-        "metal": {"intensity": 0.95, "style": "metal"},
-        "orchestral": {"intensity": 0.8, "style": "orchestral"},
-    }
-    def interpret(self, prompt):
-        if not prompt:
-            return self._default_params()
-        prompt_lower = prompt.lower()
-        params = self._default_params()
-        matched = []
-        for keyword, effects in self.KEYWORDS.items():
-            if keyword in prompt_lower:
-                matched.append(keyword)
-                for key, value in effects.items():
-                    if isinstance(value, bool):
-                        params[key] = value
-                    elif isinstance(value, (int, float)):
-                        if key in params and isinstance(params[key], (int, float)):
-                            params[key] = min(params[key] * value, 3.0)
-                        else:
-                            params[key] = value
-                    elif isinstance(value, str):
-                        params[key] = value
-        if matched:
-            print(f"  🧠 Keywords: {matched}")
-        return params
-    def _default_params(self):
-        return {"intensity": 0.7, "bpm_mult": 1.0, "orchestral": 1.0, "guitar": 1.0, "piano": 1.0, "drums": 1.0, "strings": 1.0, "synth": 1.0, "distortion": 1.0, "bass": 1.0, "flute": 1.0, "brass": 1.0, "jazz": 1.0, "minor": False, "major": True, "breakcore": 0.0, "style": None}
-
-# Instrumentos com cache
+# Instrumentos (mesmos de antes)
 def make_kick(sr=44100,velocity=1.0):
     key=('kick',sr,velocity)
     if key in SAMPLE_CACHE:return SAMPLE_CACHE[key].copy()
@@ -426,12 +378,6 @@ class SongStructure:
         'ambient':['intro','section1','section2','section3','section4','outro'],
         'breakcore':['intro','chaos1','break','chaos2','break','chaos3','outro'],
         'classical':['exposition','development','recapitulation','coda'],
-        'dark':['intro','verse','chorus','verse','chorus','bridge','chorus','outro'],
-        'epic':['intro','theme','development','climax','resolution','outro'],
-        'boss':['intro','theme','intensity','climax','break','climax','outro'],
-        'metal':['intro','verse','chorus','verse','chorus','solo','chorus','outro'],
-        'orchestral':['intro','theme','development','climax','resolution','outro'],
-        'lofi':['intro','verse','chorus','verse','chorus','outro'],
     }
     SECTION_ENERGY={
         'intro':0.3,'verse':0.5,'chorus':0.9,'bridge':0.6,'outro':0.4,
@@ -439,7 +385,7 @@ class SongStructure:
         'theme':0.5,'development':0.7,'climax':1.0,'resolution':0.5,
         'exposition':0.5,'recapitulation':0.7,'coda':0.4,
         'chaos1':0.8,'chaos2':0.9,'chaos3':1.0,'break':0.3,
-        'section1':0.4,'section2':0.5,'section3':0.6,'section4':0.5,'intensity':0.8,
+        'section1':0.4,'section2':0.5,'section3':0.6,'section4':0.5,
     }
     def __init__(self,style='pop',duration=45,bpm=120):
         self.style=style;self.duration=duration;self.bpm=bpm
@@ -494,16 +440,12 @@ class MusicRAG:
     def __init__(self):
         self.entries=[
             {"tags":["epic","batalha","heroico"],"scale":"major","dynamics":"loud","style":"cinematic"},
-            {"tags":["dark","sombrio","terror"],"scale":"harmonic_minor","dynamics":"quiet","style":"dark"},
+            {"tags":["dark","sombrio","terror"],"scale":"harmonic_minor","dynamics":"quiet","style":"ambient"},
             {"tags":["breakcore","glitch","amen"],"scale":"minor","dynamics":"extreme","style":"breakcore"},
             {"tags":["ambient","calmo"],"scale":"lydian","dynamics":"very_quiet","style":"ambient"},
             {"tags":["rock","metal","pesado"],"scale":"phrygian","dynamics":"loud","style":"rock"},
             {"tags":["eletrônica","techno","edm"],"scale":"minor","dynamics":"loud","style":"electronic"},
             {"tags":["feliz","alegre","pop"],"scale":"major","dynamics":"medium","style":"pop"},
-            {"tags":["boss","intenso"],"scale":"phrygian","dynamics":"extreme","style":"boss"},
-            {"tags":["jazz","swing"],"scale":"dorian","dynamics":"medium","style":"jazz"},
-            {"tags":["classical","orquestra"],"scale":"major","dynamics":"varied","style":"orchestral"},
-            {"tags":["lofi","relaxante"],"scale":"major","dynamics":"quiet","style":"lofi"},
         ]
     def get_context(self,query,style_hint=None):
         if not query and not style_hint:return self._random_context()
@@ -519,9 +461,9 @@ class MusicRAG:
         if np.random.random()<0.3:scale_name=np.random.choice(SCALE_NAMES)
         scale=ALL_SCALES.get(scale_name,ALL_SCALES['major'])
         dynamics=best.get('dynamics','medium')
-        bpm_map={'very_quiet':(40,70),'quiet':(60,90),'medium':(90,130),'loud':(120,160),'extreme':(160,230),'varied':(70,140)}
+        bpm_map={'very_quiet':(40,70),'quiet':(60,90),'medium':(90,130),'loud':(120,160),'extreme':(160,230)}
         bpm=np.random.randint(*bpm_map.get(dynamics,(90,130)))
-        intensity_map={'very_quiet':0.35,'quiet':0.55,'medium':0.7,'loud':0.85,'extreme':0.95,'varied':0.65}
+        intensity_map={'very_quiet':0.35,'quiet':0.55,'medium':0.7,'loud':0.85,'extreme':0.95}
         intensity=np.clip(intensity_map.get(dynamics,0.7)+np.random.uniform(-0.1,0.1),0.2,0.98)
         style=style_hint or best.get('style','pop')
         print(f"  📚 RAG: estilo={style}, escala={scale_name}, BPM={bpm}")
@@ -532,28 +474,60 @@ class MusicRAG:
         style=np.random.choice(list(SongStructure.STRUCTURES.keys()))
         return {'scale':ALL_SCALES[scale_name],'scale_name':scale_name,'progression':progression,'bpm':np.random.randint(50,200),'intensity':np.random.uniform(0.3,0.95),'style':style,'seed':get_dynamic_seed()}
 
-def generate_with_intelligence(duration, prompt=None, style=None, use_rag=True, sr=44100):
+class PromptInterpreter:
+    KEYWORDS={
+        "intenso":{"intensity":0.95,"bpm_mult":1.3},
+        "calmo":{"intensity":0.4,"bpm_mult":0.6},
+        "épico":{"intensity":0.9,"bpm_mult":1.2,"orchestral":2.0,"style":"cinematic"},
+        "epico":{"intensity":0.9,"bpm_mult":1.2,"orchestral":2.0,"style":"cinematic"},
+        "sombrio":{"intensity":0.7,"minor":True,"style":"ambient"},
+        "breakcore":{"breakcore":3.0,"intensity":1.0,"bpm_mult":1.8,"style":"breakcore"},
+    }
+    def interpret(self,prompt):
+        if not prompt:return self._default_params()
+        prompt_lower=prompt.lower()
+        params=self._default_params()
+        for keyword,effects in self.KEYWORDS.items():
+            if keyword in prompt_lower:
+                for key,value in effects.items():
+                    if isinstance(value,bool):params[key]=value
+                    elif isinstance(value,(int,float)):params[key]=value
+                    elif isinstance(value,str):params[key]=value
+        return params
+    def _default_params(self):
+        return {"intensity":0.7,"bpm_mult":1.0,"orchestral":1.0,"minor":False,"major":True,"breakcore":0.0,"style":None}
+
+def generate_with_intelligence(duration,prompt=None,style=None,use_rag=True,sr=44100):
     print("="*60)
-    print("🧠 INTELIGÊNCIA MÁXIMA (macOS 14GB)")
+    print("🧠 INTELIGÊNCIA MÁXIMA (Layer-wise)")
     print("="*60)
+    
     interpreter=PromptInterpreter()
     prompt_params=interpreter.interpret(prompt)
-    analyzer=AudioAnalyzer()
-    reference_analysis=analyzer.analyze_directory()
-    moe_loader=MoELoader()
-    model_loaded=moe_loader.load_model()
+    
+    # Carregar modelo layer-wise
+    model=LayerWiseInference()
+    model_loaded=model.load_manifest()
+    
+    if model_loaded:
+        # Usar modelo para prever estilo
+        features=np.random.randn(1,256)  # Placeholder
+        prediction=model.predict(features)
+        if prediction and prediction['selected_experts']:
+            print(f"  🎯 Experts selecionados: {prediction['selected_experts']}")
+    
     final_style=style
     if prompt_params.get('style'):final_style=prompt_params['style']
     if not final_style:final_style='pop'
+    
     rag=MusicRAG() if use_rag else None
     if use_rag and rag:rag_context=rag.get_context(prompt,style_hint=final_style)
     else:rag_context=rag._random_context() if rag else {'scale':[0,2,4,5,7,9,11],'scale_name':'major','progression':ALL_PROGRESSIONS[0],'bpm':120,'intensity':0.7,'style':final_style,'seed':get_dynamic_seed()}
-    if reference_analysis:
-        rag_context['bpm']=int(rag_context['bpm']*0.6+reference_analysis['avg_bpm']*0.4)
-        print(f"  🎵 BPM ajustado: {rag_context['bpm']}")
+    
     if prompt_params.get('breakcore',0)>1.5 or final_style=='breakcore':
         print("💥 Modo BREAKCORE")
         return generate_breakcore(duration)
+    
     print(f"\n🎵 Gerando música final...")
     return generate_with_structure(duration,rag_context,sr)
 
@@ -585,7 +559,7 @@ def generate_with_structure(duration,rag_context,sr=44100):
             if beat%4 in [0,2] and pos+len(kick_sample)<=total_samples:drums_track[pos:pos+len(kick_sample)]+=kick_sample*vel*0.8
             if beat%4 in [1,3] and pos+len(snare_sample)<=total_samples:drums_track[pos:pos+len(snare_sample)]+=snare_sample*vel*0.7
             if pos+len(hihat_sample)<=total_samples:drums_track[pos:pos+len(hihat_sample)]+=hihat_sample*vel*0.4
-        elif section_name in ['chorus','drop','climax','chaos1','chaos2','chaos3','intensity']:
+        elif section_name in ['chorus','drop','climax','chaos1','chaos2','chaos3']:
             if beat%2==0 and pos+len(kick_sample)<=total_samples:drums_track[pos:pos+len(kick_sample)]+=kick_sample*vel*0.9
             if beat%4 in [1,3] and pos+len(snare_sample)<=total_samples:drums_track[pos:pos+len(snare_sample)]+=snare_sample*vel*0.8
             for sub in [0,0.5]:
@@ -631,7 +605,7 @@ def generate_with_structure(duration,rag_context,sr=44100):
                 note=karplus_strong(root_freq,beat_duration*1.5,sr,damping=0.997)
                 pos=int(beat*beat_duration*sr)
                 if pos+len(note)<=total_samples:bass_track[pos:pos+len(note)]+=note*vel*0.4
-        elif section['name'] in ['chorus','drop','climax','intensity']:
+        elif section['name'] in ['chorus','drop','climax']:
             freq=root_freq if beat%2==0 else root_freq*2
             note=karplus_strong(freq,beat_duration*0.9,sr)
             pos=int(beat*beat_duration*sr)
@@ -656,7 +630,7 @@ def generate_with_structure(duration,rag_context,sr=44100):
                 freq=note_to_freq(scale[nd%len(scale)],base_freq)
                 note=piano_note(freq,chord_duration*0.9,sr)
                 if pos+len(note)<=total_samples:chords_track[pos:pos+len(note)]+=note*vel*0.2
-        elif section['name'] in ['chorus','drop','climax','intensity']:
+        elif section['name'] in ['chorus','drop','climax']:
             for nd in chord:
                 freq=note_to_freq(scale[nd%len(scale)],base_freq)
                 note_p=piano_note(freq,chord_duration*0.9,sr)
@@ -691,7 +665,7 @@ def generate_with_structure(duration,rag_context,sr=44100):
                 pos=int(time*sr);nlen=int(note_duration*sr*1.5)
                 note=piano_note(freq,nlen/sr,sr)
                 if pos+len(note)<=total_samples:melody_track[pos:pos+len(note)]+=note*energy*0.3
-        elif section_name in ['chorus','drop','climax','intensity']:
+        elif section_name in ['chorus','drop','climax']:
             if np.random.random()<0.85:
                 step=np.random.choice([-3,-2,-1,0,1,2,3],p=[0.05,0.15,0.2,0.2,0.2,0.15,0.05])
                 current_degree=max(0,min(current_degree+step,len(scale)*3-1))
@@ -808,18 +782,18 @@ def batch_generate():
     args=parser.parse_args()
     use_rag=args.use_rag.lower()=="true"
     print("="*60)
-    print("🎵 IA MUSIC GENERATOR PRO - macOS 14GB MAX")
+    print("🎵 IA MUSIC GENERATOR - Layer-wise Processing")
     print("="*60)
     prompt=args.prompt if args.prompt else None
     style=args.style if not prompt else None
     audio,sr=generate_with_intelligence(args.duration,prompt=prompt,style=style,use_rag=use_rag)
-    metadata={"prompt":args.prompt,"style":args.style,"duration":args.duration,"use_rag":use_rag,"platform":"macos_14gb"}
+    metadata={"prompt":args.prompt,"style":args.style,"duration":args.duration,"use_rag":use_rag,"layer_wise":True}
     filepath,number=save_song(audio,sr,metadata)
     print(f"\n✅ Música #{number}: {filepath}")
 
 def main():
     while True:
-        print("="*50);print("🎵 IA MUSIC PRO - macOS MAX");print("="*50)
+        print("="*50);print("🎵 IA MUSIC PRO - Layer-wise");print("="*50)
         print("1. Prompt  2. Estilo  3. Breakcore  4. Ver  5. Sair")
         choice=input("> ").strip()
         if choice=='1':
@@ -830,9 +804,9 @@ def main():
             fp,num=save_song(audio,sr,{"prompt":prompt,"duration":int(duration)})
             print(f"✅ #{num}: {fp}")
         elif choice=='2':
-            print("1.Epico 2.Boss 3.Dark 4.Rock 5.Ambient 6.Eletronico 7.Jazz 8.Classico 9.Metal 10.Orchestral 11.Lofi")
+            print("1.Epico 2.Boss 3.Dark 4.Rock 5.Ambient 6.Eletronico 7.Jazz 8.Classico")
             s=input("Estilo: ").strip()
-            styles={"1":"epic","2":"boss","3":"dark","4":"rock","5":"ambient","6":"electronic","7":"jazz","8":"classical","9":"metal","10":"orchestral","11":"lofi"}
+            styles={"1":"epic","2":"bossfight","3":"dark","4":"rock","5":"ambient","6":"electronic","7":"jazz","8":"classical"}
             duration=input("Duração: ").strip()
             if duration not in ["30","45","60","90"]:duration="45"
             audio,sr=generate_with_intelligence(int(duration),style=styles.get(s,"epic"))
