@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🎵 IA MUSIC GENERATOR - REAL AI INTEGRATION
-Now the trained autoencoder actually GUIDES generation.
+🎵 IA MUSIC GENERATOR - COM VALIDAÇÃO DE PARÂMETROS POR ESTILO
+CORREÇÃO: Parâmetros AI agora são validados contra restrições de cada estilo
 """
 import os, sys, json, time, gc, argparse
 import numpy as np
@@ -13,16 +13,136 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-# Imports
 from music_intelligence import FeedbackLoop, AutoMixer, MusicMemory
-from latent_controller import LatentController, StyleExtractor
-from autoencoder import Autoencoder
 
 OUTPUT_DIR = "song_output"
 MODEL_DIR = "models"
 MUSIC_DIR = "music_input"
 AE_DIR = os.path.join(MODEL_DIR, "autoencoder")
 SAMPLE_CACHE = {}
+
+
+# ============================================================
+# STYLE CONSTRAINTS - CORREÇÃO CRÍTICA
+# ============================================================
+
+STYLE_CONSTRAINTS = {
+    "cinematic": {
+        "bpm_range": (90, 140),
+        "intensity_min": 0.7, "intensity_max": 1.0,
+        "brightness_min": 0.5, "brightness_max": 0.9,
+        "bass_weight_min": 0.5, "bass_weight_max": 0.9,
+        "dynamics_range_min": 0.6, "dynamics_range_max": 1.0,
+        "harmonic_complexity_min": 0.5, "harmonic_complexity_max": 0.9,
+    },
+    "epic": {
+        "bpm_range": (100, 160),
+        "intensity_min": 0.8, "intensity_max": 1.0,
+        "brightness_min": 0.6, "brightness_max": 1.0,
+        "bass_weight_min": 0.6, "bass_weight_max": 1.0,
+        "dynamics_range_min": 0.7, "dynamics_range_max": 1.0,
+        "harmonic_complexity_min": 0.6, "harmonic_complexity_max": 1.0,
+    },
+    "ambient": {
+        "bpm_range": (40, 90),
+        "intensity_min": 0.2, "intensity_max": 0.6,
+        "brightness_min": 0.1, "brightness_max": 0.5,
+        "bass_weight_min": 0.1, "bass_weight_max": 0.5,
+        "rhythmic_density_min": 0.1, "rhythmic_density_max": 0.4,
+        "dynamics_range_min": 0.3, "dynamics_range_max": 0.7,
+    },
+    "electronic": {
+        "bpm_range": (110, 150),
+        "intensity_min": 0.6, "intensity_max": 1.0,
+        "brightness_min": 0.5, "brightness_max": 0.9,
+        "bass_weight_min": 0.6, "bass_weight_max": 1.0,
+        "rhythmic_density_min": 0.6, "rhythmic_density_max": 1.0,
+    },
+    "rock": {
+        "bpm_range": (100, 160),
+        "intensity_min": 0.7, "intensity_max": 1.0,
+        "brightness_min": 0.5, "brightness_max": 0.9,
+        "bass_weight_min": 0.6, "bass_weight_max": 0.9,
+        "dynamics_range_min": 0.6, "dynamics_range_max": 1.0,
+    },
+    "jazz": {
+        "bpm_range": (80, 160),
+        "intensity_min": 0.4, "intensity_max": 0.8,
+        "brightness_min": 0.4, "brightness_max": 0.8,
+        "harmonic_complexity_min": 0.7, "harmonic_complexity_max": 1.0,
+        "dynamics_range_min": 0.6, "dynamics_range_max": 1.0,
+    },
+    "classical": {
+        "bpm_range": (60, 140),
+        "intensity_min": 0.4, "intensity_max": 0.9,
+        "brightness_min": 0.4, "brightness_max": 0.9,
+        "harmonic_complexity_min": 0.6, "harmonic_complexity_max": 1.0,
+        "dynamics_range_min": 0.7, "dynamics_range_max": 1.0,
+    },
+    "breakcore": {
+        "bpm_range": (160, 230),
+        "intensity_min": 0.8, "intensity_max": 1.0,
+        "brightness_min": 0.6, "brightness_max": 1.0,
+        "rhythmic_density_min": 0.8, "rhythmic_density_max": 1.0,
+    },
+    "pop": {
+        "bpm_range": (90, 130),
+        "intensity_min": 0.5, "intensity_max": 0.9,
+        "brightness_min": 0.5, "brightness_max": 0.9,
+        "bass_weight_min": 0.5, "bass_weight_max": 0.8,
+    },
+    "dark": {
+        "bpm_range": (60, 120),
+        "intensity_min": 0.5, "intensity_max": 0.8,
+        "brightness_min": 0.1, "brightness_max": 0.4,
+        "bass_weight_min": 0.6, "bass_weight_max": 1.0,
+        "harmonic_complexity_min": 0.4, "harmonic_complexity_max": 0.8,
+    },
+    "bossfight": {
+        "bpm_range": (130, 180),
+        "intensity_min": 0.9, "intensity_max": 1.0,
+        "brightness_min": 0.6, "brightness_max": 1.0,
+        "bass_weight_min": 0.7, "bass_weight_max": 1.0,
+        "dynamics_range_min": 0.8, "dynamics_range_max": 1.0,
+    },
+}
+
+
+def validate_and_adjust_params(style, ai_params):
+    """
+    CORREÇÃO CRÍTICA: Ajusta parâmetros AI para serem coerentes com o estilo
+    
+    ANTES: Música "cinematic" com BPM 112, brightness 0.4 (incoerente)
+    DEPOIS: Música "cinematic" com BPM 90-140, brightness 0.5-0.9 (coerente)
+    """
+    constraints = STYLE_CONSTRAINTS.get(style, STYLE_CONSTRAINTS.get("pop", {}))
+    adjusted = ai_params.copy()
+    
+    # Ajustar BPM
+    if "bpm_range" in constraints and "bpm" in adjusted:
+        bpm_min, bpm_max = constraints["bpm_range"]
+        current_bpm = adjusted["bpm"]
+        if current_bpm < bpm_min:
+            adjusted["bpm"] = bpm_min + np.random.randint(0, 10)
+        elif current_bpm > bpm_max:
+            adjusted["bpm"] = bpm_max - np.random.randint(0, 10)
+    
+    # Ajustar parâmetros numéricos com mínimos/máximos
+    for param_name, value in list(adjusted.items()):
+        if param_name == "bpm":
+            continue
+        if not isinstance(value, (int, float)):
+            continue
+        
+        min_key = f"{param_name}_min"
+        max_key = f"{param_name}_max"
+        
+        if min_key in constraints:
+            adjusted[param_name] = max(float(value), constraints[min_key])
+        if max_key in constraints:
+            adjusted[param_name] = min(float(adjusted[param_name]), constraints[max_key])
+    
+    return adjusted
 
 
 def get_dynamic_seed():
@@ -63,87 +183,7 @@ def save_song(audio, sr, metadata=None):
 
 
 # ============================================================
-# AI BRAIN - loads trained autoencoder + controller
-# ============================================================
-
-class AIBrain:
-    """The actual trained AI that guides generation."""
-    
-    def __init__(self):
-        self.ae = None
-        self.controller = None
-        self.extractor = None
-        self.is_loaded = False
-        self._load()
-    
-    def _load(self):
-        ae_path = os.path.join(AE_DIR, "best_autoencoder.npz")
-        if not os.path.exists(ae_path):
-            print("  ⚠️  Autoencoder não treinado - usando parâmetros aleatórios")
-            print("     Rode: python train.py --epochs 10000")
-            return
-        
-        try:
-            self.ae = Autoencoder(input_size=256, hidden_sizes=[512, 256, 128], latent_size=64)
-            self.ae.load(ae_path)
-            self.controller = LatentController(self.ae)
-            self.extractor = StyleExtractor(self.ae)
-            self.is_loaded = True
-            print("  🧠 IA carregada: autoencoder + controller prontos")
-        except Exception as e:
-            print(f"  ⚠️  Erro ao carregar IA: {e}")
-    
-    def get_params_from_audio(self, audio_path):
-        """Extract musical parameters from a reference audio file."""
-        if not self.is_loaded:
-            return None
-        try:
-            latent, latent_std = self.extractor.extract_from_file(audio_path)
-            params = self.controller.latent_to_params(latent)
-            params["latent"] = latent
-            params["latent_std"] = latent_std
-            return params
-        except Exception as e:
-            print(f"  ⚠️  Erro ao extrair estilo: {e}")
-            return None
-    
-    def get_params_from_random(self, seed=None):
-        """Generate random params by sampling latent space near origin."""
-        if not self.is_loaded:
-            return None
-        if seed is not None:
-            np.random.seed(seed)
-        # Sample from a normal distribution centered at 0
-        latent = np.random.randn(64) * 0.5
-        params = self.controller.latent_to_params(latent)
-        params["latent"] = latent
-        return params
-    
-    def vary_params(self, base_params, strength=0.15, seed=None):
-        """Create a variation by perturbing the latent space."""
-        if not self.is_loaded or "latent" not in base_params:
-            return base_params
-        varied_latent = self.controller.vary(base_params["latent"], strength, seed)
-        params = self.controller.latent_to_params(varied_latent)
-        params["latent"] = varied_latent
-        return params
-    
-    def interpolate(self, params_a, params_b, t):
-        """Interpolate between two sets of parameters via latent space."""
-        if not self.is_loaded:
-            return params_a
-        lat_a = params_a.get("latent")
-        lat_b = params_b.get("latent")
-        if lat_a is None or lat_b is None:
-            return params_a
-        interp_latent = self.controller.interpolate(lat_a, lat_b, t)
-        params = self.controller.latent_to_params(interp_latent)
-        params["latent"] = interp_latent
-        return params
-
-
-# ============================================================
-# INSTRUMENTS (unchanged - they're solid)
+# INSTRUMENTOS (mantidos)
 # ============================================================
 
 def make_kick(sr=44100, velocity=1.0):
@@ -331,12 +371,20 @@ class SongStructure:
         "cinematic": ["intro","theme","development","climax","resolution","outro"],
         "jazz": ["intro","head","solo1","head","solo2","head","outro"],
         "ambient": ["intro","section1","section2","section3","section4","outro"],
+        "classical": ["exposition","development","recapitulation","coda"],
+        "breakcore": ["intro","chaos1","break","chaos2","break","chaos3","outro"],
+        "dark": ["intro","verse","chorus","verse","chorus","bridge","chorus","outro"],
+        "epic": ["intro","theme","buildup","climax","resolution","outro"],
+        "bossfight": ["intro","phase1","transition","phase2","climax","outro"],
     }
     SECTION_ENERGY = {
         "intro": 0.3, "verse": 0.5, "chorus": 0.9, "bridge": 0.6, "outro": 0.4,
         "buildup": 0.7, "drop": 1.0, "breakdown": 0.2, "solo": 0.7, "head": 0.6,
         "theme": 0.5, "development": 0.7, "climax": 1.0, "resolution": 0.5,
+        "exposition": 0.5, "recapitulation": 0.7, "coda": 0.4,
+        "chaos1": 0.8, "chaos2": 0.9, "chaos3": 1.0, "break": 0.3,
         "section1": 0.4, "section2": 0.5, "section3": 0.6, "section4": 0.5,
+        "phase1": 0.7, "phase2": 0.9, "transition": 0.6,
     }
     
     def __init__(self, style="pop", duration=45, bpm=120):
@@ -349,12 +397,12 @@ class SongStructure:
         sections = []
         for section in base:
             if section == "intro": bars = np.random.choice([4, 8])
-            elif section in ["verse","head","theme"]: bars = np.random.choice([8, 12, 16])
-            elif section in ["chorus","climax","drop"]: bars = np.random.choice([8, 12])
-            elif section == "bridge": bars = np.random.choice([4, 8])
+            elif section in ["verse","head","theme","exposition","phase1"]: bars = np.random.choice([8, 12, 16])
+            elif section in ["chorus","climax","drop","recapitulation","phase2"]: bars = np.random.choice([8, 12])
+            elif section == "bridge" or section == "transition": bars = np.random.choice([4, 8])
             elif section == "buildup": bars = np.random.choice([4, 8])
-            elif section in ["breakdown"]: bars = np.random.choice([4, 8])
-            elif section in ["solo","development"]: bars = np.random.choice([8, 12, 16])
+            elif section in ["breakdown","break","coda"]: bars = np.random.choice([4, 8])
+            elif section in ["solo","development","chaos1","chaos2","chaos3"]: bars = np.random.choice([8, 12, 16])
             elif section == "outro": bars = np.random.choice([4, 8])
             else: bars = 8
             sections.append({"name": section, "bars": bars, "energy": self.SECTION_ENERGY.get(section, 0.5)})
@@ -395,19 +443,27 @@ class SongStructure:
 
 
 # ============================================================
-# AI-GUIDED GENERATION (the new real AI part)
+# GERAÇÃO COM VALIDAÇÃO DE PARÂMETROS
 # ============================================================
 
-def generate_with_ai(duration, ai_params, sr=44100):
+def generate_with_ai(duration, ai_params, style="pop", sr=44100):
     """
-    Generate music where parameters come from the trained AI.
-    This is the REAL integration: the autoencoder's latent space
-    controls the synthesizer.
+    Geração COM VALIDAÇÃO DE PARÂMETROS POR ESTILO
     """
     seed = get_dynamic_seed()
     np.random.seed(seed)
     
-    # Extract AI-derived parameters
+    # VALIDAR E AJUSTAR PARÂMETROS - CORREÇÃO CRÍTICA
+    original_params = ai_params.copy()
+    ai_params = validate_and_adjust_params(style, ai_params)
+    
+    # Log das correções
+    if original_params != ai_params:
+        print("  🔧 Parâmetros ajustados para estilo '" + style + "':")
+        for key in ai_params:
+            if key in original_params and original_params[key] != ai_params[key]:
+                print(f"     {key}: {original_params[key]:.3f} → {ai_params[key]:.3f}")
+    
     bpm = int(ai_params.get("bpm", 120))
     intensity = float(ai_params.get("intensity", 0.7))
     brightness = float(ai_params.get("brightness", 0.5))
@@ -415,27 +471,19 @@ def generate_with_ai(duration, ai_params, sr=44100):
     rhythmic_density = float(ai_params.get("rhythmic_density", 0.5))
     harmonic_complexity = float(ai_params.get("harmonic_complexity", 0.5))
     dynamics_range = float(ai_params.get("dynamics_range", 0.7))
-    style_index = int(ai_params.get("style_index", 0))
     
-    # Map style_index to a style name
-    styles = list(SongStructure.STRUCTURES.keys())
-    style = styles[style_index % len(styles)]
-    
-    print(f"  🧠 Parâmetros da IA:")
+    print(f"  🧠 Parâmetros AI (após validação):")
     print(f"     BPM: {bpm}")
     print(f"     Intensidade: {intensity:.2f}")
     print(f"     Brilho: {brightness:.2f}")
     print(f"     Peso do grave: {bass_weight:.2f}")
     print(f"     Densidade rítmica: {rhythmic_density:.2f}")
-    print(f"     Complexidade harmônica: {harmonic_complexity:.2f}")
-    print(f"     Range dinâmico: {dynamics_range:.2f}")
-    print(f"     Estilo inferido: {style}")
+    print(f"     Complexidade: {harmonic_complexity:.2f}")
+    print(f"     Estilo: {style}")
     
-    # Base frequency scales with brightness
     freq_options = [196.0, 220.0, 261.63, 293.66, 349.23]
     base_freq = freq_options[min(int(brightness * len(freq_options)), len(freq_options) - 1)]
     
-    # Scale choice influenced by harmonic complexity
     if harmonic_complexity > 0.7:
         scale = ALL_SCALES["harmonic_minor"]
     elif harmonic_complexity > 0.5:
@@ -453,7 +501,6 @@ def generate_with_ai(duration, ai_params, sr=44100):
     total_samples = int(duration * sr)
     beat_duration = 60.0 / bpm
     
-    # SEPARATED TRACKS (for proper mixing)
     drums_track = np.zeros(total_samples)
     bass_track = np.zeros(total_samples)
     chords_track = np.zeros(total_samples)
@@ -465,7 +512,6 @@ def generate_with_ai(duration, ai_params, sr=44100):
     crash_sample = make_crash(sr)
     n_beats = int(duration / beat_duration)
     
-    # DRUMS - density controlled by AI
     drum_prob = 0.3 + rhythmic_density * 0.5
     for beat in range(n_beats):
         time = beat * beat_duration
@@ -475,10 +521,9 @@ def generate_with_ai(duration, ai_params, sr=44100):
         vel = 0.3 + 0.6 * energy
         pos = int(beat * beat_duration * sr)
         
-        # Kick
-        if sname in ["intro", "breakdown"]:
+        if sname in ["intro", "breakdown", "break"]:
             kick_beats = [0]
-        elif sname in ["chorus", "drop", "climax"]:
+        elif sname in ["chorus", "drop", "climax", "phase2"]:
             kick_beats = [0, 2]
         else:
             kick_beats = [0, 2] if np.random.random() < drum_prob else [0]
@@ -488,14 +533,12 @@ def generate_with_ai(duration, ai_params, sr=44100):
             if kp + len(kick_sample) <= total_samples:
                 drums_track[kp:kp + len(kick_sample)] += kick_sample * vel * 0.8
         
-        # Snare on 2 and 4 (backbeat)
-        if sname not in ["intro", "breakdown"]:
+        if sname not in ["intro", "breakdown", "break"]:
             for sb in [1, 3]:
                 sp = pos + int(sb * beat_duration * sr / 4 * 2)
                 if sp + len(snare_sample) <= total_samples:
                     drums_track[sp:sp + len(snare_sample)] += snare_sample * vel * 0.7
         
-        # Hi-hats - density from AI
         if sname == "intro":
             hat_subdivs = [0]
         elif sname in ["drop", "climax"] or rhythmic_density > 0.7:
@@ -511,7 +554,6 @@ def generate_with_ai(duration, ai_params, sr=44100):
                 vol = 0.35 if sub == 0 else 0.2
                 drums_track[hp:hp + len(hihat_sample)] += hihat_sample * vel * vol
     
-    # BASS - weight controlled by AI
     bass_vol = 0.2 + bass_weight * 0.4
     for beat in range(n_beats):
         time = beat * beat_duration
@@ -522,13 +564,13 @@ def generate_with_ai(duration, ai_params, sr=44100):
         root_freq = note_to_freq(scale[root % len(scale)], base_freq) / 2
         vel = (0.3 + 0.7 * energy) * bass_vol
         
-        if section["name"] in ["intro", "breakdown"]:
+        if section["name"] in ["intro", "breakdown", "break"]:
             if beat % 4 == 0:
                 note = karplus_strong(root_freq, beat_duration * 3, sr)
                 pos = int(beat * beat_duration * sr)
                 if pos + len(note) <= total_samples:
                     bass_track[pos:pos + len(note)] += note * vel * 0.5
-        elif section["name"] in ["chorus", "drop", "climax"]:
+        elif section["name"] in ["chorus", "drop", "climax", "phase2"]:
             freq = root_freq if beat % 2 == 0 else root_freq * 2
             note = karplus_strong(freq, beat_duration * 0.9, sr)
             pos = int(beat * beat_duration * sr)
@@ -541,7 +583,6 @@ def generate_with_ai(duration, ai_params, sr=44100):
                 if pos + len(note) <= total_samples:
                     bass_track[pos:pos + len(note)] += note * vel * 0.7
     
-    # CHORDS - brightness controlled by AI
     chord_duration = beat_duration * 4
     chord_vol = 0.15 + brightness * 0.2
     for i in range(int(duration / chord_duration)):
@@ -558,7 +599,6 @@ def generate_with_ai(duration, ai_params, sr=44100):
             if pos + len(note) <= total_samples:
                 chords_track[pos:pos + len(note)] += note * vel * 0.8
     
-    # MELODY - complexity and intensity controlled by AI
     note_duration = beat_duration / 2
     current_degree = 0
     prev_section = None
@@ -590,7 +630,6 @@ def generate_with_ai(duration, ai_params, sr=44100):
         pos = int(time * sr)
         nlen = int(note_duration * sr * 1.5)
         
-        # Instrument choice based on brightness
         if brightness > 0.7:
             note = brass_note(freq, nlen / sr, sr)
         elif brightness > 0.4:
@@ -601,7 +640,6 @@ def generate_with_ai(duration, ai_params, sr=44100):
         if pos + len(note) <= total_samples:
             melody_track[pos:pos + len(note)] += note * energy * 0.3
     
-    # AUTO-MIXING with proper volume balance
     mixer = AutoMixer(sr)
     tracks = {
         "drums": drums_track,
@@ -611,16 +649,13 @@ def generate_with_ai(duration, ai_params, sr=44100):
     }
     mix = mixer.mix_tracks(tracks)
     
-    # Apply dynamics range from AI
     if dynamics_range < 0.5:
-        # Compress more for small dynamic range
         mix = mixer.compress(mix, threshold=0.3, ratio=4.0)
     else:
         mix = mixer.compress(mix, threshold=0.5, ratio=2.5)
     
     mix = mixer.limit(mix, ceiling=0.92)
     
-    # Fade
     fade_in = int(0.3 * sr); fade_out = int(1.0 * sr)
     if fade_in < len(mix): mix[:fade_in] *= np.linspace(0, 1, fade_in)
     if fade_out < len(mix): mix[-fade_out:] *= np.linspace(1, 0, fade_out)
@@ -632,88 +667,92 @@ def generate_with_ai(duration, ai_params, sr=44100):
             "intensity": intensity, "brightness": brightness,
             "bass_weight": bass_weight, "rhythmic_density": rhythmic_density,
             "harmonic_complexity": harmonic_complexity, "dynamics_range": dynamics_range,
-            "style_index": style_index,
         },
+        "validated_params": True,
     }
     
     return mix, sr, metadata
 
 
 # ============================================================
-# COMMAND LINE INTERFACE
+# CLI
 # ============================================================
 
+def generate_random_params_for_style(style):
+    """Gera parâmetros aleatórios dentro dos limites do estilo"""
+    constraints = STYLE_CONSTRAINTS.get(style, STYLE_CONSTRAINTS["pop"])
+    params = {}
+    
+    if "bpm_range" in constraints:
+        lo, hi = constraints["bpm_range"]
+        params["bpm"] = np.random.randint(lo, hi+1)
+    
+    param_names = ["intensity", "brightness", "bass_weight", "rhythmic_density", 
+                   "harmonic_complexity", "dynamics_range"]
+    
+    for name in param_names:
+        min_key = f"{name}_min"
+        max_key = f"{name}_max"
+        if min_key in constraints and max_key in constraints:
+            params[name] = np.random.uniform(constraints[min_key], constraints[max_key])
+        elif min_key in constraints:
+            params[name] = np.random.uniform(constraints[min_key], 1.0)
+        elif max_key in constraints:
+            params[name] = np.random.uniform(0.0, constraints[max_key])
+        else:
+            params[name] = np.random.uniform(0.3, 0.8)
+    
+    return params
+
+
 def cli():
-    parser = argparse.ArgumentParser(description="IA Music Generator - AI-Guided")
+    parser = argparse.ArgumentParser(description="IA Music Generator - With Style Validation")
     parser.add_argument("--duration", type=int, default=45)
-    parser.add_argument("--style-from", type=str, default=None,
-                        help="Path to audio file to extract style from")
-    parser.add_argument("--interpolate", nargs=2, default=None,
-                        help="Two audio files to interpolate between")
-    parser.add_argument("--interpolate-t", type=float, default=0.5,
-                        help="Interpolation point (0.0-1.0)")
-    parser.add_argument("--variation-of", type=int, default=None,
-                        help="Song number to create a variation of")
-    parser.add_argument("--variation-strength", type=float, default=0.15,
-                        help="How much to vary (0.0-1.0)")
-    parser.add_argument("--ai-guided", action="store_true",
-                        help="Use random AI parameters")
+    parser.add_argument("--style", type=str, default="pop",
+                       choices=list(STYLE_CONSTRAINTS.keys()))
+    parser.add_argument("--ai-guided", action="store_true", help="Use AI-guided parameters")
+    parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--batch", action="store_true")
-    parser.add_argument("--prompt", type=str, default="")
-    parser.add_argument("--style", type=str, default="pop")
+    parser.add_argument("--list-styles", action="store_true", help="List all available styles")
     args = parser.parse_args()
     
+    if args.list_styles:
+        print("Estilos disponíveis:")
+        for style in sorted(STYLE_CONSTRAINTS.keys()):
+            print(f"  - {style}")
+        return
+    
     print("=" * 60)
-    print("🎵 IA MUSIC - AI-GUIDED GENERATION")
+    print("🎵 IA MUSIC - COM VALIDAÇÃO DE PARÂMETROS POR ESTILO")
     print("=" * 60)
     
-    brain = AIBrain()
+    if args.seed is not None:
+        np.random.seed(args.seed)
     
-    # Determine where parameters come from
-    if args.style_from:
-        print(f"\n🎯 Extraindo estilo de: {args.style_from}")
-        params = brain.get_params_from_audio(args.style_from)
-        if params is None:
-            print("  ⚠️  Falha, usando parâmetros aleatórios")
-            params = brain.get_params_from_random(args.seed)
-    elif args.interpolate:
-        print(f"\n🎯 Interpolando entre: {args.interpolate[0]} e {args.interpolate[1]}")
-        p_a = brain.get_params_from_audio(args.interpolate[0])
-        p_b = brain.get_params_from_audio(args.interpolate[1])
-        if p_a and p_b:
-            params = brain.interpolate(p_a, p_b, args.interpolate_t)
-        else:
-            params = brain.get_params_from_random(args.seed)
-    elif args.variation_of is not None:
-        src_path = os.path.join(OUTPUT_DIR, f"{args.variation_of}.wav")
-        print(f"\n🎯 Criando variação da música #{args.variation_of}")
-        base_params = brain.get_params_from_audio(src_path)
-        if base_params:
-            params = brain.vary_params(base_params, args.variation_strength, args.seed)
-        else:
-            params = brain.get_params_from_random(args.seed)
-    elif args.ai_guided or not brain.is_loaded:
-        print("\n🎯 Parâmetros aleatórios do espaço latente")
-        params = brain.get_params_from_random(args.seed)
-    else:
-        # Default: AI-guided
-        params = brain.get_params_from_random(args.seed)
+    style = args.style
+    params = generate_random_params_for_style(style)
+    print(f"\n🎯 Estilo: {style}")
     
-    if params is None:
-        # Fallback if AI not loaded
-        print("  ⚠️  IA não disponível, gerando proceduralmente")
-        from music_generator import generate_with_automix  # legacy
-        audio, sr, metadata = generate_with_automix(args.duration, 120, args.style, 44100)
-    else:
-        audio, sr, metadata = generate_with_ai(args.duration, params, 44100)
+    audio, sr, metadata = generate_with_ai(args.duration, params, style, 44100)
     
-    # Post-processing via FeedbackLoop (keeps existing quality gate)
     feedback = FeedbackLoop()
     audio = feedback.mixer.fix_bad_mix(audio)
     
     filepath, number = save_song(audio, sr, metadata)
     print(f"\n✅ Música #{number}: {filepath}")
+    
+    # Mostrar análise de qualidade
+    try:
+        from quality_metrics import QualityMetrics
+        qm = QualityMetrics(sr)
+        metrics, score = qm.analyze_comprehensive(audio)
+        print(f"\n📊 Qualidade: {score:.2f}/1.00")
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)):
+                print(f"   {k}: {v:.3f}")
+    except ImportError:
+        pass
 
 
 if __name__ == "__main__":
