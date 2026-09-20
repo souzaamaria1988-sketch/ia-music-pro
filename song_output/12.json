@@ -1,0 +1,17 @@
+{
+  "bpm": 112,
+  "style": "cinematic",
+  "duration": 30,
+  "seed": 3602272410,
+  "ai_guided": true,
+  "ai_params": {
+    "intensity": 0.6729448876673066,
+    "brightness": 0.399986195106803,
+    "bass_weight": 0.5350347656917334,
+    "rhythmic_density": 0.5339555144290042,
+    "harmonic_complexity": 0.7070643758544792,
+    "dynamics_range": 0.6898752530973907,
+    "style_index": 3
+  },
+  "song_number": 12
+}
