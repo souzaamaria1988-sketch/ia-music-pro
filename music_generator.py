@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-🎵 IA MUSIC GENERATOR - COM +100 INSTRUMENTOS
-Integração completa com a biblioteca de instrumentos
+🎵 IA MUSIC GENERATOR - COM +100 INSTRUMENTOS + PROMPT INTERPRETER
 """
-import os, sys, json, time, gc, argparse
+import os, sys, json, time, gc, argparse, re
 import numpy as np
 from pathlib import Path
 
@@ -13,14 +12,183 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-# Importar biblioteca de instrumentos
 from instruments import INSTRUMENTS, get_instrument, list_instruments, get_instruments_by_family
 from music_intelligence import FeedbackLoop, AutoMixer, MusicMemory
 
 OUTPUT_DIR = "song_output"
 MODEL_DIR = "models"
-MUSIC_DIR = "music_input"
 SAMPLE_CACHE = {}
+
+
+# ============================================================
+# PROMPT INTERPRETER (PT-BR)
+# ============================================================
+
+PROMPT_KEYWORDS = {
+    # Estilos
+    "épica": {"style": "epic", "intensity": 0.95, "bpm": 140},
+    "epica": {"style": "epic", "intensity": 0.95, "bpm": 140},
+    "cinemática": {"style": "cinematic", "intensity": 0.8, "bpm": 120},
+    "cinematica": {"style": "cinematic", "intensity": 0.8, "bpm": 120},
+    "cinema": {"style": "cinematic", "intensity": 0.8, "bpm": 120},
+    "ambient": {"style": "ambient", "intensity": 0.4, "bpm": 70},
+    "eletrônica": {"style": "electronic", "intensity": 0.85, "bpm": 128},
+    "eletronica": {"style": "electronic", "intensity": 0.85, "bpm": 128},
+    "edm": {"style": "electronic", "intensity": 0.9, "bpm": 130},
+    "techno": {"style": "electronic", "intensity": 0.85, "bpm": 135},
+    "rock": {"style": "rock", "intensity": 0.9, "bpm": 130},
+    "metal": {"style": "rock", "intensity": 0.95, "bpm": 150},
+    "jazz": {"style": "jazz", "intensity": 0.7, "bpm": 110},
+    "blues": {"style": "jazz", "intensity": 0.7, "bpm": 90},
+    "clássica": {"style": "classical", "intensity": 0.7, "bpm": 100},
+    "classica": {"style": "classical", "intensity": 0.7, "bpm": 100},
+    "samba": {"style": "samba", "intensity": 0.8, "bpm": 110},
+    "bossa": {"style": "bossa", "intensity": 0.5, "bpm": 80},
+    "forró": {"style": "forro", "intensity": 0.8, "bpm": 120},
+    "forro": {"style": "forro", "intensity": 0.8, "bpm": 120},
+    "breakcore": {"style": "breakcore", "intensity": 1.0, "bpm": 190},
+    "pop": {"style": "pop", "intensity": 0.7, "bpm": 115},
+    "sombrio": {"style": "dark", "intensity": 0.7, "bpm": 80},
+    "dark": {"style": "dark", "intensity": 0.7, "bpm": 80},
+    "indiano": {"style": "indian", "intensity": 0.6, "bpm": 90},
+    "india": {"style": "indian", "intensity": 0.6, "bpm": 90},
+    "africano": {"style": "african", "intensity": 0.8, "bpm": 110},
+    "africa": {"style": "african", "intensity": 0.8, "bpm": 110},
+    
+    # Emoções/contextos
+    "batalha": {"style": "epic", "intensity": 1.0, "bpm": 150},
+    "guerra": {"style": "epic", "intensity": 1.0, "bpm": 150},
+    "boss": {"style": "epic", "intensity": 1.0, "bpm": 140},
+    "triste": {"style": "dark", "intensity": 0.5, "bpm": 70},
+    "melancólico": {"style": "dark", "intensity": 0.5, "bpm": 70},
+    "alegre": {"style": "pop", "intensity": 0.8, "bpm": 120},
+    "feliz": {"style": "pop", "intensity": 0.8, "bpm": 120},
+    "romântico": {"style": "cinematic", "intensity": 0.5, "bpm": 75},
+    "romantico": {"style": "cinematic", "intensity": 0.5, "bpm": 75},
+    "tenso": {"style": "dark", "intensity": 0.9, "bpm": 100},
+    "tensão": {"style": "dark", "intensity": 0.9, "bpm": 100},
+    "relaxante": {"style": "ambient", "intensity": 0.3, "bpm": 60},
+    "meditação": {"style": "ambient", "intensity": 0.2, "bpm": 50},
+    "festa": {"style": "electronic", "intensity": 0.9, "bpm": 128},
+    "dança": {"style": "electronic", "intensity": 0.85, "bpm": 125},
+    
+    # Instrumentos específicos
+    "piano": {"instruments": ["piano", "synth_pad", "synth_bass", "kick", "snare"]},
+    "violino": {"instruments": ["violin", "synth_strings", "cello", "piano", "timpani"]},
+    "guitarra": {"instruments": ["electric_guitar", "electric_bass", "kick", "snare", "hihat_closed"]},
+    "violão": {"instruments": ["acoustic_guitar", "piano", "synth_bass", "pandeiro"]},
+    "bateria": {"instruments": ["kick", "snare", "hihat_closed", "crash", "tom", "synth_bass"]},
+    "saxofone": {"instruments": ["tenor_sax", "piano", "electric_bass", "kick", "ride"]},
+    "trompete": {"instruments": ["trumpet", "synth_strings", "piano", "kick", "snare"]},
+    "flauta": {"instruments": ["flute", "synth_pad", "harp", "acoustic_guitar"]},
+    "órgão": {"instruments": ["organ", "electric_bass", "kick", "snare"]},
+    "sintetizador": {"instruments": ["synth_lead", "synth_pad", "synth_bass", "kick", "snare", "hihat_closed"]},
+    "acordeão": {"instruments": ["accordion", "triangle", "chocalho", "surdo"]},
+    "sanfona": {"instruments": ["accordion", "triangle", "chocalho", "surdo"]},
+    "cavaquinho": {"instruments": ["cavaquinho", "acoustic_guitar", "pandeiro", "surdo", "agogo"]},
+    "pandeiro": {"instruments": ["pandeiro", "cavaquinho", "acoustic_guitar", "surdo"]},
+    "sitar": {"instruments": ["sitar", "tabla", "synth_pad", "harp"]},
+    "kalimba": {"instruments": ["kalimba", "mbira", "synth_pad", "djembe"]},
+}
+
+
+def interpret_prompt(prompt):
+    """
+    Analisa prompt em português e extrai parâmetros musicais
+    
+    Returns: dict com style, intensity, bpm, instruments
+    """
+    if not prompt:
+        return {"style": "pop", "intensity": 0.7, "bpm": 120, "instruments": None}
+    
+    prompt_lower = prompt.lower()
+    
+    # Parâmetros detectados
+    detected = {
+        "styles": [],
+        "intensities": [],
+        "bpms": [],
+        "instruments": [],
+        "keywords_found": []
+    }
+    
+    # Buscar keywords no prompt
+    for keyword, params in PROMPT_KEYWORDS.items():
+        if keyword in prompt_lower:
+            detected["keywords_found"].append(keyword)
+            if "style" in params:
+                detected["styles"].append(params["style"])
+            if "intensity" in params:
+                detected["intensities"].append(params["intensity"])
+            if "bpm" in params:
+                detected["bpms"].append(params["bpm"])
+            if "instruments" in params:
+                detected["instruments"].extend(params["instruments"])
+    
+    # Extrair número de BPM explícito (ex: "120 bpm")
+    bpm_match = re.search(r'(\d{2,3})\s*(bpm|batidas|beats)', prompt_lower)
+    if bpm_match:
+        detected["bpms"].append(int(bpm_match.group(1)))
+    
+    # Extrair duração (ex: "30 segundos")
+    duration_match = re.search(r'(\d{1,3})\s*(segundos?|seconds?|s\b|minutos?|minutes?)', prompt_lower)
+    detected_duration = None
+    if duration_match:
+        value = int(duration_match.group(1))
+        unit = duration_match.group(2)
+        if unit.startswith('min'):
+            detected_duration = value * 60
+        else:
+            detected_duration = value
+    
+    # Escolher valores finais
+    result = {}
+    
+    # Estilo: mais frequente ou padrão
+    if detected["styles"]:
+        # Conta frequência
+        from collections import Counter
+        style_counts = Counter(detected["styles"])
+        result["style"] = style_counts.most_common(1)[0][0]
+    else:
+        result["style"] = "pop"
+    
+    # Intensidade: média
+    if detected["intensities"]:
+        result["intensity"] = np.mean(detected["intensities"])
+    else:
+        result["intensity"] = 0.7
+    
+    # BPM: média ou padrão do estilo
+    if detected["bpms"]:
+        result["bpm"] = int(np.mean(detected["bpms"]))
+    else:
+        # BPM padrão por estilo
+        style_bpms = {
+            "epic": 140, "cinematic": 110, "ambient": 70,
+            "electronic": 128, "rock": 130, "jazz": 110,
+            "classical": 100, "samba": 110, "bossa": 80,
+            "forro": 120, "breakcore": 190, "pop": 115,
+            "dark": 80, "indian": 90, "african": 110
+        }
+        result["bpm"] = style_bpms.get(result["style"], 120)
+    
+    # Instrumentos: remover duplicatas mantendo ordem
+    if detected["instruments"]:
+        seen = set()
+        unique_insts = []
+        for inst in detected["instruments"]:
+            if inst not in seen:
+                seen.add(inst)
+                unique_insts.append(inst)
+        result["instruments"] = unique_insts
+    else:
+        result["instruments"] = None
+    
+    result["duration"] = detected_duration
+    result["keywords"] = detected["keywords_found"]
+    
+    return result
 
 
 # ============================================================
@@ -80,7 +248,7 @@ STYLE_INSTRUMENTS = {
         "melody": ["acoustic_guitar", "piano"],
         "chords": ["acoustic_guitar", "piano"],
         "bass": ["electric_bass"],
-        "percussion": ["pandeiro", "shaker"],
+        "percussion": ["pandeiro"],
     },
     "forro": {
         "melody": ["accordion", "triangle"],
@@ -107,37 +275,33 @@ STYLE_INSTRUMENTS = {
         "percussion": ["kick", "tom", "timpani"],
     },
     "indian": {
-        "melody": ["sitar", "erhu", "shakuhachi"],
+        "melody": ["sitar", "shakuhachi"],
         "chords": ["synth_pad", "harp"],
         "bass": ["sub_bass"],
-        "percussion": ["tabla", "djembe", "tamborim"],
+        "percussion": ["tabla", "djembe"],
     },
     "african": {
-        "melody": ["kalimba", "mbira", "balafon"],
+        "melody": ["kalimba", "mbira"],
         "chords": ["synth_pad"],
-        "bass": ["djembe", "sub_bass"],
+        "bass": ["sub_bass"],
         "percussion": ["djembe", "conga", "bongo_high", "bongo_low", "maracas", "claves"],
     },
 }
 
 
 def get_style_instruments(style):
-    """Retorna instrumentos padrão para um estilo"""
     return STYLE_INSTRUMENTS.get(style, STYLE_INSTRUMENTS["pop"])
 
 
 def get_instrument_func(name, sr=44100):
-    """Retorna função de instrumento com sr fixo"""
     func = get_instrument(name)
     if func is None:
         return None
     
-    # Verificar assinatura da função
     import inspect
     sig = inspect.signature(func)
     params = list(sig.parameters.keys())
     
-    # Retornar wrapper com sr fixo
     if 'sr' in params:
         return lambda freq=None, duration=1.0, **kwargs: func(freq or 440, duration, sr=sr, **kwargs) if freq else func(sr=sr, **kwargs)
     else:
@@ -145,7 +309,7 @@ def get_instrument_func(name, sr=44100):
 
 
 # ============================================================
-# FUNÇÕES DE GERAÇÃO (mantidas do original)
+# FUNÇÕES DE GERAÇÃO
 # ============================================================
 
 def get_dynamic_seed():
@@ -226,6 +390,7 @@ class SongStructure:
         "dark": ["intro","verse","chorus","verse","chorus","bridge","chorus","outro"],
         "indian": ["alap","jor","jhala","outro"],
         "african": ["intro","theme","variation","theme","outro"],
+        "epic": ["intro","theme","buildup","climax","resolution","outro"],
     }
     SECTION_ENERGY = {
         "intro": 0.3, "verse": 0.5, "chorus": 0.9, "bridge": 0.6, "outro": 0.4,
@@ -292,36 +457,32 @@ class SongStructure:
 
 
 # ============================================================
-# GERAÇÃO COM +100 INSTRUMENTOS
+# GERAÇÃO COM PROMPT
 # ============================================================
 
-def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments=None, sr=44100):
-    """
-    Gera música usando a biblioteca de 100+ instrumentos
-    
-    Args:
-        duration: duração em segundos
-        style: estilo musical
-        bpm: batidas por minuto
-        custom_instruments: dict com listas de instrumentos personalizados
-                           {"melody": [...], "chords": [...], "bass": [...], "percussion": [...]}
-        sr: sample rate
-    """
+def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments=None, sr=44100, intensity=0.7):
     seed = get_dynamic_seed()
     np.random.seed(seed)
     
-    # Obter instrumentos do estilo ou personalizados
     if custom_instruments:
-        style_insts = custom_instruments
+        # Converter lista de instrumentos em estrutura por papel
+        if isinstance(custom_instruments, list):
+            style_insts = {
+                "melody": custom_instruments[:2] if len(custom_instruments) > 1 else custom_instruments[:1],
+                "chords": custom_instruments[:1],
+                "bass": custom_instruments[-1:] if custom_instruments else ["synth_bass"],
+                "percussion": ["kick", "snare", "hihat_closed"],
+            }
+        else:
+            style_insts = custom_instruments
     else:
         style_insts = get_style_instruments(style)
     
-    print(f"  🎸 Instrumentos usados:")
+    print(f"  🎸 Instrumentos:")
     for role, instruments in style_insts.items():
         if instruments:
             print(f"     {role}: {', '.join(instruments)}")
     
-    # Configuração
     base_freq = np.random.choice([196.0, 220.0, 261.63, 293.66, 349.23])
     scale = ALL_SCALES[np.random.choice(list(ALL_SCALES.keys()))]
     progression = ALL_PROGRESSIONS[np.random.randint(0, len(ALL_PROGRESSIONS))]
@@ -332,7 +493,6 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
     total_samples = int(duration * sr)
     beat_duration = 60.0 / bpm
     
-    # Tracks separadas
     melody_track = np.zeros(total_samples)
     chords_track = np.zeros(total_samples)
     bass_track = np.zeros(total_samples)
@@ -349,8 +509,7 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
         
         for i in range(int(duration / note_duration)):
             time = i * note_duration
-            section = structure.get_section_at_time(time)
-            energy = structure.get_energy_at_time(time)
+            energy = structure.get_energy_at_time(time) * intensity
             
             if np.random.random() > 0.6:
                 continue
@@ -366,7 +525,6 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
             pos = int(time * sr)
             nlen = note_duration * 1.5
             
-            # Escolher instrumento aleatório da lista
             inst_name = np.random.choice(melody_instruments)
             inst_func = get_instrument_func(inst_name, sr)
             
@@ -376,7 +534,7 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
                     if pos + len(note) <= total_samples:
                         melody_track[pos:pos + len(note)] += note * energy * 0.3
                 except Exception as e:
-                    print(f"     ⚠️ Erro em {inst_name}: {e}")
+                    pass
     
     # === ACORDES ===
     chord_instruments = style_insts.get("chords", ["synth_pad"])
@@ -386,8 +544,7 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
         
         for i in range(int(duration / chord_duration)):
             time = i * chord_duration
-            section = structure.get_section_at_time(time)
-            energy = structure.get_energy_at_time(time)
+            energy = structure.get_energy_at_time(time) * intensity
             chord = progression[i % len(progression)]
             pos = int(i * chord_duration * sr)
             
@@ -402,7 +559,7 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
                         if pos + len(note) <= total_samples:
                             chords_track[pos:pos + len(note)] += note * energy * 0.2
                 except Exception as e:
-                    print(f"     ⚠️ Erro em {inst_name}: {e}")
+                    pass
     
     # === BAIXO ===
     bass_instruments = style_insts.get("bass", ["synth_bass"])
@@ -410,8 +567,7 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
         print("  🎸 Gerando baixo...")
         for beat in range(n_beats):
             time = beat * beat_duration
-            section = structure.get_section_at_time(time)
-            energy = structure.get_energy_at_time(time)
+            energy = structure.get_energy_at_time(time) * intensity
             chord_idx = (beat // 4) % len(progression)
             root = progression[chord_idx][0]
             root_freq = note_to_freq(scale[root % len(scale)], base_freq) / 2
@@ -427,7 +583,7 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
                         if pos + len(note) <= total_samples:
                             bass_track[pos:pos + len(note)] += note * energy * 0.4
                     except Exception as e:
-                        print(f"     ⚠️ Erro em {inst_name}: {e}")
+                        pass
     
     # === PERCUSSÃO ===
     perc_instruments = style_insts.get("percussion", ["kick", "snare", "hihat_closed"])
@@ -437,23 +593,22 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
             time = beat * beat_duration
             section = structure.get_section_at_time(time)
             sname = section["name"]
-            energy = structure.get_energy_at_time(time)
+            energy = structure.get_energy_at_time(time) * intensity
             pos = int(beat * beat_duration * sr)
             
-            # Kick em beats 0 e 2
             if sname not in ["intro", "breakdown"] and beat % 2 == 0:
-                if "kick" in perc_instruments or "surdo" in perc_instruments:
-                    inst_name = "kick" if "kick" in perc_instruments else "surdo"
+                kick_insts = [i for i in perc_instruments if i in ["kick", "surdo"]]
+                if kick_insts:
+                    inst_name = kick_insts[0]
                     inst_func = get_instrument_func(inst_name, sr)
                     if inst_func:
                         try:
                             hit = inst_func()
                             if pos + len(hit) <= total_samples:
                                 percussion_track[pos:pos + len(hit)] += hit * energy * 0.8
-                        except Exception as e:
-                            print(f"     ⚠️ Erro em {inst_name}: {e}")
+                        except:
+                            pass
             
-            # Snare/caixa em beats 1 e 3
             if sname not in ["intro", "breakdown"] and beat % 4 in [1, 3]:
                 snare_insts = [i for i in perc_instruments if i in ["snare", "pandeiro", "tamborim", "djembe", "conga"]]
                 if snare_insts:
@@ -464,11 +619,10 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
                             hit = inst_func()
                             if pos + len(hit) <= total_samples:
                                 percussion_track[pos:pos + len(hit)] += hit * energy * 0.7
-                        except Exception as e:
-                            print(f"     ⚠️ Erro em {inst_name}: {e}")
+                        except:
+                            pass
             
-            # Hi-hat/chocalho em subdivisões
-            hihat_insts = [i for i in perc_instruments if i in ["hihat_closed", "hihat_open", "chocalho", "maracas", "shaker"]]
+            hihat_insts = [i for i in perc_instruments if i in ["hihat_closed", "hihat_open", "chocalho", "maracas"]]
             if hihat_insts and sname != "intro":
                 inst_name = np.random.choice(hihat_insts)
                 inst_func = get_instrument_func(inst_name, sr)
@@ -480,21 +634,8 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
                             if hp + len(hit) <= total_samples:
                                 vol = 0.35 if sub == 0 else 0.2
                                 percussion_track[hp:hp + len(hit)] += hit * energy * vol
-                        except Exception as e:
-                            print(f"     ⚠️ Erro em {inst_name}: {e}")
-            
-            # Percussão extra (agogo, triangle, etc)
-            extra_insts = [i for i in perc_instruments if i in ["agogo", "triangle", "claves", "cowbell", "guiro", "woodblock"]]
-            if extra_insts and np.random.random() < 0.3:
-                inst_name = np.random.choice(extra_insts)
-                inst_func = get_instrument_func(inst_name, sr)
-                if inst_func:
-                    try:
-                        hit = inst_func()
-                        if pos + len(hit) <= total_samples:
-                            percussion_track[pos:pos + len(hit)] += hit * energy * 0.3
-                    except Exception as e:
-                        print(f"     ⚠️ Erro em {inst_name}: {e}")
+                        except:
+                            pass
     
     # === MIXAGEM ===
     print("  🎛️ Mixando...")
@@ -506,7 +647,6 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
         "percussion": percussion_track,
     }
     
-    # Volumes por papel
     volumes = {
         "melody": 0.30,
         "chords": 0.20,
@@ -518,15 +658,14 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
     mix = mixer.compress(mix, threshold=0.4, ratio=3.0)
     mix = mixer.limit(mix, ceiling=0.92)
     
-    # Fade in/out
     fade_in = int(0.3 * sr); fade_out = int(1.0 * sr)
     if fade_in < len(mix): mix[:fade_in] *= np.linspace(0, 1, fade_in)
     if fade_out < len(mix): mix[-fade_out:] *= np.linspace(1, 0, fade_out)
     
     metadata = {
         "bpm": bpm, "style": style, "duration": duration, "seed": seed,
+        "intensity": intensity,
         "instruments_used": style_insts,
-        "total_instruments_available": len(INSTRUMENTS),
     }
     
     return mix, sr, metadata
@@ -537,14 +676,16 @@ def generate_with_instruments(duration, style="pop", bpm=120, custom_instruments
 # ============================================================
 
 def cli():
-    parser = argparse.ArgumentParser(description="IA Music Generator - 100+ Instruments")
+    parser = argparse.ArgumentParser(description="IA Music Generator - 100+ Instruments + Prompt")
+    parser.add_argument("--prompt", type=str, default="",
+                       help="Prompt em português (ex: 'música épica de batalha')")
     parser.add_argument("--duration", type=int, default=45)
     parser.add_argument("--style", type=str, default="pop")
     parser.add_argument("--bpm", type=int, default=120)
     parser.add_argument("--instruments", type=str, default=None,
-                       help="Lista de instrumentos separados por vírgula (ex: 'piano,violin,cello')")
-    parser.add_argument("--list-instruments", action="store_true", help="Lista todos os instrumentos")
-    parser.add_argument("--list-families", action="store_true", help="Lista famílias de instrumentos")
+                       help="Lista de instrumentos separados por vírgula")
+    parser.add_argument("--list-instruments", action="store_true")
+    parser.add_argument("--list-families", action="store_true")
     parser.add_argument("--batch", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
@@ -557,7 +698,7 @@ def cli():
         return
     
     if args.list_families:
-        print("🎸 Famílias de instrumentos:")
+        print("🎸 Famílias:")
         for family in ["strings", "keys", "winds", "percussion", "electronic", "ethnic"]:
             instruments = get_instruments_by_family(family)
             print(f"\n{family} ({len(instruments)}):")
@@ -566,35 +707,70 @@ def cli():
         return
     
     print("=" * 60)
-    print("🎵 IA MUSIC - COM +100 INSTRUMENTOS")
+    print("🎵 IA MUSIC - +100 INSTRUMENTOS + PROMPT")
     print("=" * 60)
     
     if args.seed is not None:
         np.random.seed(args.seed)
     
-    # Parse instrumentos personalizados
+    # Interpretar prompt se fornecido
+    style = args.style
+    bpm = args.bpm
+    duration = args.duration
+    intensity = 0.7
     custom_instruments = None
-    if args.instruments:
+    prompt_interpreted = False
+    
+    if args.prompt:
+        print(f"\n📝 Prompt: '{args.prompt}'")
+        interpreted = interpret_prompt(args.prompt)
+        
+        print(f"\n🧠 Interpretação do prompt:")
+        if interpreted["keywords"]:
+            print(f"   Palavras-chave: {interpreted['keywords']}")
+        print(f"   Estilo detectado: {interpreted['style']}")
+        print(f"   BPM sugerido: {interpreted['bpm']}")
+        print(f"   Intensidade: {interpreted['intensity']:.2f}")
+        
+        style = interpreted["style"]
+        bpm = interpreted["bpm"]
+        intensity = interpreted["intensity"]
+        
+        if interpreted["duration"]:
+            duration = interpreted["duration"]
+            print(f"   Duração detectada: {duration}s")
+        
+        if interpreted["instruments"]:
+            custom_instruments = interpreted["instruments"]
+            print(f"   Instrumentos: {custom_instruments}")
+        
+        prompt_interpreted = True
+    
+    # Parse instrumentos customizados se não vieram do prompt
+    if args.instruments and not custom_instruments:
         inst_list = [i.strip() for i in args.instruments.split(",")]
-        custom_instruments = {
-            "melody": inst_list[:2],
-            "chords": inst_list[2:4] if len(inst_list) > 2 else inst_list[:1],
-            "bass": inst_list[4:5] if len(inst_list) > 4 else ["synth_bass"],
-            "percussion": inst_list[5:] if len(inst_list) > 5 else ["kick", "snare"],
-        }
-        print(f"\n🎸 Instrumentos personalizados: {inst_list}")
+        custom_instruments = inst_list
+        print(f"\n🎸 Instrumentos: {inst_list}")
     
     audio, sr, metadata = generate_with_instruments(
-        duration=args.duration,
-        style=args.style,
-        bpm=args.bpm,
+        duration=duration,
+        style=style,
+        bpm=bpm,
         custom_instruments=custom_instruments,
-        sr=44100
+        sr=44100,
+        intensity=intensity
     )
     
+    if prompt_interpreted:
+        metadata["prompt"] = args.prompt
+        metadata["prompt_interpreted"] = True
+    
     # Feedback loop
-    feedback = FeedbackLoop()
-    audio = feedback.mixer.fix_bad_mix(audio)
+    try:
+        feedback = FeedbackLoop()
+        audio = feedback.mixer.fix_bad_mix(audio)
+    except Exception as e:
+        print(f"  ⚠️ Feedback loop erro: {e}")
     
     filepath, number = save_song(audio, sr, metadata)
     print(f"\n✅ Música #{number}: {filepath}")
