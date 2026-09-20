@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-🧠 TREINAMENTO COM EARLY STOPPING + VALIDATION SPLIT
-CORREÇÕES:
-- Early stopping (para quando validation loss estagnar)
-- Validation split (80/20)
-- Dropout (0.2) para prevenir overfitting
-- Batch size reduzido (32)
-- Data augmentation básica
+🧠 TREINAMENTO COMPLETO - 10.000 ÉPOCAS GARANTIDAS
+CORREÇÃO: Early stopping desativado por padrão
 """
 import os,sys,json,time,gc
 import numpy as np
@@ -42,7 +37,6 @@ class DenseLayer:
         else: 
             self.output = self.z
         
-        # Dropout (apenas em training)
         if training and self.dropout > 0:
             self.dropout_mask = (np.random.rand(*self.output.shape) > self.dropout) / (1 - self.dropout)
             self.output = self.output * self.dropout_mask
@@ -54,7 +48,6 @@ class DenseLayer:
     def backward(self, grad_output, lr, t, beta1=0.9, beta2=0.999, eps=1e-8):
         batch_size = grad_output.shape[0]
         
-        # Aplicar máscara de dropout ao gradiente
         if self.dropout_mask is not None:
             grad_output = grad_output * self.dropout_mask
         
@@ -148,7 +141,6 @@ class Autoencoder:
         return loss
     
     def eval_step(self, x):
-        """Forward sem dropout para validação"""
         output, _ = self.forward(x, training=False)
         return self.compute_loss(x, output)
     
@@ -313,7 +305,6 @@ def generate_synthetic_data(n_samples=2000, n_features=256):
 
 
 def prepare_data_with_validation(n_features=256, train_ratio=0.8):
-    """Prepara dados com split treino/validação - CORREÇÃO CRÍTICA"""
     print("📊 Preparando dados COM VALIDAÇÃO...")
     all_features = []
     
@@ -328,27 +319,24 @@ def prepare_data_with_validation(n_features=256, train_ratio=0.8):
             if feats:
                 all_features.extend(feats)
     
-    # Gerar dados sintéticos se necessário (expandir para 2000+)
     target_size = 2000
     if len(all_features) < target_size:
         needed = target_size - len(all_features)
-        print(f"  Gerando {needed} amostras sintéticas para completar...")
+        print(f"  Gerando {needed} amostras sintéticas...")
         synthetic = generate_synthetic_data(needed, n_features)
         all_features.extend(synthetic.tolist())
     
     X = np.array(all_features)
     print(f"  Dataset total: {X.shape[0]} x {X.shape[1]}")
     
-    # Normalizar
     X_mean = np.mean(X, axis=0)
     X_std = np.std(X, axis=0) + 1e-8
     X_norm = (X - X_mean) / X_std
     
-    # Data augmentation: adicionar pequeno ruído
+    # Data augmentation
     noise = np.random.randn(*X_norm.shape) * 0.05
     X_norm = X_norm + noise
     
-    # Split treino/validação
     np.random.shuffle(X_norm)
     split_idx = int(len(X_norm) * train_ratio)
     X_train = X_norm[:split_idx]
@@ -360,7 +348,6 @@ def prepare_data_with_validation(n_features=256, train_ratio=0.8):
 
 
 def train_epoch(ae, X, batch_size, lr):
-    """Treina uma época completa"""
     indices = np.random.permutation(len(X))
     epoch_loss = 0
     n_batches = 0
@@ -376,7 +363,6 @@ def train_epoch(ae, X, batch_size, lr):
 
 
 def validate_epoch(ae, X, batch_size):
-    """Valida o modelo (sem dropout)"""
     epoch_loss = 0
     n_batches = 0
     
@@ -389,22 +375,21 @@ def validate_epoch(ae, X, batch_size):
     return epoch_loss / max(n_batches, 1)
 
 
-def train_autoencoder(epochs=800, batch_size=32, n_features=256, latent_size=64, 
-                     lr_init=0.001, early_stopping_patience=50, dropout=0.2):
+def train_autoencoder(epochs=10000, batch_size=32, n_features=256, latent_size=64, 
+                     lr_init=0.001, dropout=0.2, early_stopping=False, patience=50):
     """
-    TREINAMENTO COM EARLY STOPPING - CORREÇÃO DO OVERFITTING
-    - Validação separada
-    - Para quando validation loss não melhora por patience épocas
-    - Dropout para regularização
-    - Batch size reduzido
+    TREINAMENTO COMPLETO - CORREÇÃO DO EARLY STOPPING
+    
+    Por padrão: roda TODAS as épocas (early_stopping=False)
+    Opcional: --early-stopping para ativar
     """
-    print("=" * 60)
-    print("🧠 TREINAMENTO AUTOENCODER (CORRIGIDO - EARLY STOPPING)")
-    print(f"   Épocas máximas: {epochs}")
-    print(f"   Early stopping patience: {early_stopping_patience}")
+    print("=" * 70)
+    print("🧠 TREINAMENTO AUTOENCODER - COMPLETO")
+    print(f"   Épocas: {epochs} (GARANTIDAS)")
+    print(f"   Early stopping: {'ATIVADO' if early_stopping else 'DESATIVADO'}")
     print(f"   Batch size: {batch_size}")
     print(f"   Dropout: {dropout}")
-    print("=" * 60)
+    print("=" * 70)
     
     os.makedirs(AE_DIR, exist_ok=True)
     
@@ -420,15 +405,22 @@ def train_autoencoder(epochs=800, batch_size=32, n_features=256, latent_size=64,
     print(f"\n📊 Parâmetros: {ae.count_params():,}")
     print(f"📊 Amostra/Parâmetro ratio: {len(X_train)/ae.count_params()*1000:.2f} por mil")
     
-    print("\n🚀 TREINANDO COM EARLY STOPPING...")
+    print("\n🚀 TREINANDO...")
     history = {"train": [], "val": []}
     best_loss = float("inf")
     best_epoch = 0
     patience_counter = 0
     start = time.time()
     
+    # Estimativa de tempo
+    epoch_times = []
+    
     for epoch in range(1, epochs + 1):
-        lr = lr_init * (0.95 ** (epoch // 100))
+        epoch_start = time.time()
+        
+        # Learning rate decay mais suave (0.9995 em vez de 0.95)
+        lr = lr_init * (0.9995 ** epoch)
+        lr = max(lr, 0.00001)  # Mínimo
         
         train_loss = train_epoch(ae, X_train, batch_size, lr)
         history["train"].append(float(train_loss))
@@ -436,88 +428,131 @@ def train_autoencoder(epochs=800, batch_size=32, n_features=256, latent_size=64,
         val_loss = validate_epoch(ae, X_val, batch_size)
         history["val"].append(float(val_loss))
         
+        # Track best
         if val_loss < best_loss:
             best_loss = val_loss
             best_epoch = epoch
-            patience_counter = 0
             ae.save(os.path.join(AE_DIR, "best_autoencoder.npz"))
             marker = "⭐"
         else:
-            patience_counter += 1
             marker = ""
         
+        # Early stopping (APENAS se ativado)
+        if early_stopping:
+            if val_loss < best_loss:
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= patience:
+                print(f"\n⏹️  EARLY STOPPING em epoch {epoch}")
+                break
+        
+        # Log a cada 10 épocas
+        epoch_time = time.time() - epoch_start
+        epoch_times.append(epoch_time)
+        
         if epoch % 10 == 0 or epoch == 1:
+            avg_epoch_time = np.mean(epoch_times[-10:])
+            remaining_epochs = epochs - epoch
+            eta_seconds = avg_epoch_time * remaining_epochs
+            eta_minutes = eta_seconds / 60
+            eta_hours = eta_minutes / 60
+            
             elapsed = time.time() - start
-            eta = (elapsed / epoch) * (epochs - epoch) if epoch < epochs else 0
-            print(f"  Epoch {epoch:4d}/{epochs} | "
+            elapsed_min = elapsed / 60
+            
+            print(f"  Epoch {epoch:5d}/{epochs} | "
                   f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
                   f"Best: {best_loss:.6f} (ep {best_epoch}) | "
-                  f"Patience: {patience_counter}/{early_stopping_patience} {marker}")
+                  f"LR: {lr:.6f} | "
+                  f"ETA: {eta_hours:.1f}h {marker}")
         
-        if patience_counter >= early_stopping_patience:
-            print(f"\n⏹️  EARLY STOPPING em epoch {epoch}")
-            print(f"   Melhor validação: {best_loss:.6f} em epoch {best_epoch}")
-            break
+        # Checkpoint a cada 500 épocas
+        if epoch % 500 == 0:
+            ae.save(os.path.join(AE_DIR, f"checkpoint_{epoch}.npz"))
+            print(f"  💾 Checkpoint salvo: epoch {epoch}")
         
-        if epoch % 50 == 0:
+        # GC periódico
+        if epoch % 100 == 0:
             gc.collect()
     
+    # Salvar modelo final
     ae.save(os.path.join(AE_DIR, "final_autoencoder.npz"))
     np.savez(os.path.join(AE_DIR, "normalization.npz"), mean=X_mean, std=X_std)
     
     total = time.time() - start
+    total_hours = total / 3600
+    
     metadata = {
-        "type": "Autoencoder_Corrected",
-        "epochs_run": epoch,
-        "best_epoch": best_epoch,
+        "type": "Autoencoder_Complete",
+        "epochs_requested": epochs,
+        "epochs_completed": epoch,
+        "early_stopping_enabled": early_stopping,
+        "early_stopping_triggered": early_stopping and epoch < epochs,
         "input_size": n_features,
         "latent_size": latent_size,
         "hidden_sizes": [512, 256, 128],
         "dropout": dropout,
-        "early_stopping": True,
-        "patience": early_stopping_patience,
+        "batch_size": batch_size,
         "final_train_loss": float(history["train"][-1]),
         "final_val_loss": float(history["val"][-1]),
         "best_val_loss": float(best_loss),
-        "training_time_min": float(total / 60),
+        "best_epoch": best_epoch,
+        "training_time_seconds": float(total),
+        "training_time_minutes": float(total / 60),
+        "training_time_hours": float(total_hours),
+        "avg_epoch_time_seconds": float(np.mean(epoch_times)),
         "dataset_size": int(len(X_train) + len(X_val)),
         "train_size": int(len(X_train)),
         "val_size": int(len(X_val)),
         "total_params": ae.count_params(),
-        "history_sample_train": history["train"][::max(1,len(history["train"])//50)],
-        "history_sample_val": history["val"][::max(1,len(history["val"])//50)],
+        "history_sample_train": history["train"][::max(1,len(history["train"])//100)],
+        "history_sample_val": history["val"][::max(1,len(history["val"])//100)],
     }
     with open(os.path.join(AE_DIR, "training_log.json"), "w") as f:
         json.dump(metadata, f, indent=2)
     
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("✅ TREINAMENTO CONCLUÍDO!")
-    print(f"   Épocas executadas: {epoch}/{epochs}")
+    print(f"   Épocas completadas: {epoch}/{epochs}")
     print(f"   Melhor validação: {best_loss:.6f} (epoch {best_epoch})")
-    print(f"   Tempo total: {total/60:.1f} min")
+    print(f"   Tempo total: {total_hours:.2f} horas ({total/60:.1f} min)")
+    print(f"   Média por época: {np.mean(epoch_times):.2f}s")
     print(f"   Overfitting check: train={history['train'][-1]:.6f} vs val={history['val'][-1]:.6f}")
     if history["val"][-1] > history["train"][-1] * 2:
-        print("   ⚠️  Possível overfitting ainda presente!")
+        print("   ⚠️  Possível overfitting (val >> train)")
     else:
-        print("   ✅ Modelo generaliza bem (train ≈ val)")
-    print("=" * 60)
+        print("   ✅ Modelo generaliza bem")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=800)
+    parser.add_argument("--epochs", type=int, default=10000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--features", type=int, default=256)
     parser.add_argument("--latent", type=int, default=64)
-    parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--early-stopping", action="store_true",
+                       help="Ativa early stopping (desativado por padrão)")
+    parser.add_argument("--patience", type=int, default=50,
+                       help="Paciência para early stopping (só se --early-stopping)")
     args = parser.parse_args()
+    
+    print("🔧 MODO: TREINAMENTO COMPLETO")
+    if args.early_stopping:
+        print("   ⚠️  Early stopping ATIVADO")
+    else:
+        print("   ✅ Early stopping DESATIVADO - todas as épocas serão executadas")
+    
     train_autoencoder(
         epochs=args.epochs,
         batch_size=args.batch_size,
         n_features=args.features,
         latent_size=args.latent,
-        early_stopping_patience=args.patience,
-        dropout=args.dropout
+        dropout=args.dropout,
+        early_stopping=args.early_stopping,
+        patience=args.patience
     )
