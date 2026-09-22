@@ -1,13 +1,4 @@
 {
   "results": [],
-  "sources": [
-    {
-      "name": "Exemplo: SoundFont CC0",
-      "url": "https://exemplo.com/soundfont",
-      "license": "CC0",
-      "commercial_use": true,
-      "format": "sf2",
-      "notes": "Substitua por fontes reais verificadas"
-    }
-  ]
+  "sources": []
 }
