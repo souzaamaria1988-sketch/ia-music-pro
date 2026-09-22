@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+venv/
+env/
+.venv/
+
+# SoundFonts e áudio grandes
+soundfonts/*.sf2
+soundfonts/*.sf3
+samples/*.wav
+samples/*.mp3
+uploads/*
+!uploads/.gitkeep
+
+# Saídas geradas
+song_output/*.wav
+song_output/*.mp3
+memory/*.json
+
+# Modelos treinados
+models/*.h5
+models/*.pt
+models/*.pth
+
+# Sensíveis
+.env
+*.local
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
