@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "default_soundfont": "soundfonts/default.sf2",
+  "default_soundfont": "soundfonts/UK.Fatonic05.SF2",
   "renderer": "fluidsynth",
   "sample_rate": 44100,
   "channels": 1,
@@ -11,6 +11,6 @@
     "name": null,
     "url": null,
     "commercial_use_allowed": false,
-    "notes": "Nenhuma licença declarada. Não distribua nem use comercialmente até verificar a licença do SoundFont."
+    "notes": "Nenhuma licença declarada. Não distribua nem use comercialmente até verificar a licença."
   }
 }
