@@ -6,13 +6,6 @@
     "rhythm": "syncopated",
     "energy": 0.8
   },
-  "forro": {
-    "bpm_range": [100, 140],
-    "scales": ["major", "minor"],
-    "instruments": ["accordion", "surdo"],
-    "rhythm": "baiao",
-    "energy": 0.7
-  },
   "rock": {
     "bpm_range": [110, 160],
     "scales": ["minor", "pentatonic"],
@@ -20,39 +13,11 @@
     "rhythm": "straight",
     "energy": 0.9
   },
-  "jazz": {
-    "bpm_range": [80, 140],
-    "scales": ["dorian", "major"],
-    "instruments": ["piano", "double_bass", "trumpet", "ride"],
-    "rhythm": "swing",
-    "energy": 0.5
-  },
   "cinematic": {
     "bpm_range": [60, 100],
     "scales": ["minor", "major"],
     "instruments": ["violin", "cello", "piano", "timpani", "french_horn"],
     "rhythm": "sustained",
     "energy": 0.6
-  },
-  "electronic": {
-    "bpm_range": [120, 140],
-    "scales": ["minor", "pentatonic"],
-    "instruments": ["synth_lead", "synth_bass", "kick", "hihat_closed"],
-    "rhythm": "four_on_floor",
-    "energy": 0.9
-  },
-  "ambient": {
-    "bpm_range": [50, 80],
-    "scales": ["major", "minor"],
-    "instruments": ["synth_pad", "piano", "flute"],
-    "rhythm": "sparse",
-    "energy": 0.2
-  },
-  "classical": {
-    "bpm_range": [60, 120],
-    "scales": ["major", "minor"],
-    "instruments": ["violin", "viola", "cello", "piano", "flute"],
-    "rhythm": "varied",
-    "energy": 0.5
   }
 }
