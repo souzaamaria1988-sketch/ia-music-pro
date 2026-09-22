@@ -1,14 +1,16 @@
 {
   "enabled": true,
   "default_soundfont": "soundfonts/default.sf2",
+  "renderer": "fluidsynth",
   "sample_rate": 44100,
   "channels": 1,
   "gain": 0.8,
   "fallback_to_synthesis": true,
+  "install_fluidsynth_automatically": false,
   "license": {
-    "name": "A SER PREENCHIDO PELO USUÁRIO",
-    "url": "A SER PREENCHIDO PELO USUÁRIO",
+    "name": null,
+    "url": null,
     "commercial_use_allowed": false,
-    "notes": "Você deve registrar aqui a licença do SoundFont que instalar."
+    "notes": "Nenhuma licença declarada. Não distribua nem use comercialmente até verificar a licença do SoundFont."
   }
 }
