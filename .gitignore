@@ -11,8 +11,10 @@ env/
 .venv/
 
 # SoundFonts e áudio grandes
-soundfonts/*.sf2
-soundfonts/*.sf3
+soundfonts/*
+!soundfonts/.gitkeep
+*.sf2
+*.sf3
 samples/*.wav
 samples/*.mp3
 uploads/*
