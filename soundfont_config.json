@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "default_soundfont": "soundfonts/default.sf2",
+  "sample_rate": 44100,
+  "channels": 1,
+  "gain": 0.8,
+  "fallback_to_synthesis": true,
+  "license": {
+    "name": "A SER PREENCHIDO PELO USUÁRIO",
+    "url": "A SER PREENCHIDO PELO USUÁRIO",
+    "commercial_use_allowed": false,
+    "notes": "Você deve registrar aqui a licença do SoundFont que instalar."
+  }
+}
