@@ -1,68 +1,67 @@
-name: Gerar Música (com Feedback Loop)
+name: Gerar Música
 
 on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: "Prompt em português"
-        required: false
-        default: ""
+        description: 'Prompt em português'
+        required: true
+        default: 'música cinematográfica com piano e violino'
       style:
-        description: "Estilo musical"
+        description: 'Estilo musical'
         required: false
-        default: "pop"
+        default: 'cinematic'
       duration:
-        description: "Duração"
+        description: 'Duração em segundos'
         required: false
-        default: "45"
-
-permissions:
-  contents: write
+        default: '30'
+      use_soundfont:
+        description: 'Usar SoundFont'
+        required: false
+        default: 'false'
 
 jobs:
   generate:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
     - uses: actions/checkout@v4
+    - name: Configurar Python
+      uses: actions/setup-python@v5
       with:
-        fetch-depth: 0
-
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.11"
-
-    - name: Install Dependencies
-      run: pip install numpy scipy soundfile
-
-    - name: Generate Music (with Feedback Loop)
-      env:
-        PROMPT: ${{ github.event.inputs.prompt }}
-        STYLE: ${{ github.event.inputs.style }}
-        DURATION: ${{ github.event.inputs.duration }}
+        python-version: '3.11'
+    - name: Instalar dependências
       run: |
-        mkdir -p song_output memory
-        python music_generator.py --prompt "$PROMPT" --style "$STYLE" --duration "$DURATION" --batch
-
-    - name: Commit
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    - name: Instalar FluidSynth
+      run: sudo apt-get update && sudo apt-get install -y fluidsynth || true
+    - name: Verificar SoundFont
+      id: soundfont
       run: |
-        git config --local user.email "bot@github.com"
-        git config --local user.name "Music Bot"
-        git add song_output/ memory/
-        if git diff --staged --quiet; then
-          echo "Nada para commitar"
+        if [ -f "soundfonts/default.sf2" ]; then
+          echo "exists=true" >> $GITHUB_OUTPUT
         else
-          git commit -m "🎵 Música + Memórias: $(date)"
-          git pull --rebase origin main || true
-          git push
+          echo "exists=false" >> $GITHUB_OUTPUT
         fi
-
-    - name: Upload Artifact
+    - name: Gerar música
+      run: |
+        SOUND_FLAG=""
+        if [ "${{ github.event.inputs.use_soundfont }}" == "true" ] && [ "${{ steps.soundfont.outputs.exists }}" == "true" ]; then
+          SOUND_FLAG="--soundfont soundfonts/default.sf2"
+        else
+          SOUND_FLAG="--no-soundfont"
+        fi
+        python music_generator.py \
+          --prompt "${{ github.event.inputs.prompt }}" \
+          --style "${{ github.event.inputs.style }}" \
+          --duration ${{ github.event.inputs.duration }} \
+          $SOUND_FLAG
+    - name: Publicar artefatos
       uses: actions/upload-artifact@v4
       with:
-        name: music-output
+        name: generated-music
         path: |
-          song_output/
-          memory/
-        retention-days: 30
+          song_output/*.wav
+          song_output/*.mid
+          song_output/*.json
+        if-no-files-found: warn
