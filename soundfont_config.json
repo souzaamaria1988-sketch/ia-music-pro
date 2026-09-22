@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "default_soundfont": "soundfonts/Drum Set JD Rockset 5.sf2",
+  "default_soundfont": "soundfonts/GiantSoundfontDrumkit2.1.sf2",
   "renderer": "fluidsynth",
   "sample_rate": 44100,
   "channels": 1,
