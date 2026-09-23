@@ -1,0 +1,4 @@
+# Mantém a pasta datasets no Git.
+# O dataset real (~4GB) NÃO deve ser commitado.
+# Execute: python download_dataset.py para baixar.
+# O cache do GitHub Actions evita re-download a cada workflow.
