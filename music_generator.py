@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-music_generator.py — Gerador principal do IA Music Pro (v3).
+music_generator.py — Gerador principal do IA Music Pro (v4).
 
 Integrado à API REAL do projeto:
     * midi_composer.MidiComposer:
         - MidiComposer(title, bpm, key="C", scale="major", style)
         - add_track(instrument_id) -> int          (ValueError se desconhecido)
         - add_note(idx, *, start, duration, pitch, velocity)  [SEGUNDOS]
-        - save_midi(path) -> bool  (False se mido faltar)
+        - save_midi(path) -> bool  (False se mido faltar — CHECAR o retorno!)
         - save_json(path)
     * real_instruments.INSTRUMENTS (campos: display_name, channel,
       midi_program, is_percussion, aliases)
 
+v4 — correções desta versão:
+    1. CATÁLOGO ESSENCIAL GARANTIDO: o catálogo real tinha só 12 instrumentos,
+       SEM drums/bass/strings — por isso "kit=None | baixo=None" e toda a
+       música saía só piano. _ESSENTIAL_INSTRUMENTS + setdefault() garante os
+       instrumentos mínimos SEMPRE presentes (não sobrescreve o catálogo real,
+       que continua sendo a fonte da verdade).
+    2. CLAMP DE PITCH em note(): ValueError: pitch inválido nunca mais derruba
+       o pipeline; valor suspeito é corrigido e LOGADO para diagnóstico.
+    3. CANAIS ÚNICOS por instrumento melódico (o MidiComposer lê o canal do
+       catálogo no save; alocamos antes da geração para evitar colisões).
+
 Correções históricas mantidas:
     * Bateria: engine própria (pitches GM escritos direto) + auditoria
-      pós-geração que verifica notas por track e canal 9.
-    * "Só piano": parsing tolerante a acentos/sinônimos PT-BR; sem
-      instrumentos detectados usa instrumentação PADRÃO DO ESTILO.
-    * "Sempre a mesma música": seed aleatório por padrão (--seed N
-      reproduz), progressões/forma/BPM/motivo sorteados.
+      pós-geração (notas por track, percussão no canal 9).
+    * Parsing tolerante a acentos/sinônimos PT-BR; sem instrumentos no prompt
+      usa instrumentação PADRÃO DO ESTILO.
+    * Seed aleatório por padrão (--seed N reproduz); progressões, forma,
+      BPM, motivo e humanização sorteados.
 
 Uso:
     python music_generator.py --prompt "samba com cavaquinho, pandeiro e surdo" --style samba
@@ -49,31 +60,73 @@ try:
 except ImportError as _exc:  # catálogo de emergência (só para --list-instruments)
     _RI_ERR = str(_exc)
     INSTRUMENTS = {
-        "piano":           {"display_name": "Piano", "channel": 0,  "midi_program": 0,  "is_percussion": False},
-        "acoustic_guitar": {"display_name": "Violão", "channel": 1,  "midi_program": 24, "is_percussion": False},
-        "electric_guitar": {"display_name": "Guitarra", "channel": 2, "midi_program": 29, "is_percussion": False},
-        "bass":            {"display_name": "Baixo", "channel": 3,   "midi_program": 33, "is_percussion": False},
-        "organ":           {"display_name": "Órgão", "channel": 4,   "midi_program": 16, "is_percussion": False},
-        "accordion":       {"display_name": "Sanfona", "channel": 5, "midi_program": 21, "is_percussion": False},
-        "strings":         {"display_name": "Cordas", "channel": 6,  "midi_program": 48, "is_percussion": False},
-        "violin":          {"display_name": "Violino", "channel": 7, "midi_program": 40, "is_percussion": False},
-        "flute":           {"display_name": "Flauta", "channel": 8,  "midi_program": 73, "is_percussion": False},
-        "trumpet":         {"display_name": "Trompete", "channel": 10, "midi_program": 56, "is_percussion": False},
-        "saxophone":       {"display_name": "Saxofone", "channel": 11, "midi_program": 65, "is_percussion": False},
-        "synth_pad":       {"display_name": "Pad", "channel": 12,    "midi_program": 89, "is_percussion": False},
-        "synth_lead":      {"display_name": "Synth Lead", "channel": 13, "midi_program": 81, "is_percussion": False},
-        "drums":           {"display_name": "Bateria", "channel": 9, "is_percussion": True},
-        "pandeiro":        {"display_name": "Pandeiro", "channel": 9, "is_percussion": True},
-        "surdo":           {"display_name": "Surdo", "channel": 9,   "is_percussion": True},
-        "tamborim":        {"display_name": "Tamborim", "channel": 9, "is_percussion": True},
-        "agogo":           {"display_name": "Agogô", "channel": 9,   "is_percussion": True},
-        "cuica":           {"display_name": "Cuíca", "channel": 9,  "is_percussion": True},
-        "reco_reco":       {"display_name": "Reco-reco", "channel": 9, "is_percussion": True},
-        "chocalho":        {"display_name": "Chocalho", "channel": 9, "is_percussion": True},
-        "berimbau":        {"display_name": "Berimbau", "channel": 9, "is_percussion": True},
-        "conga":           {"display_name": "Conga", "channel": 9,   "is_percussion": True},
-        "shaker":          {"display_name": "Shaker", "channel": 9,  "is_percussion": True},
+        "piano":    {"display_name": "Piano", "channel": 0, "midi_program": 0,
+                     "is_percussion": False},
+        "violin":   {"display_name": "Violino", "channel": 7, "midi_program": 40,
+                     "is_percussion": False},
+        "cello":    {"display_name": "Violoncelo", "channel": 8, "midi_program": 42,
+                     "is_percussion": False},
     }
+
+# =============================================================================
+# INSTRUMENTOS ESSENCIAIS (garantia mínima) — v4, CORREÇÃO 1
+# =============================================================================
+# O catálogo real tinha apenas 12 instrumentos, SEM drums/bass/strings — por
+# isso o estilo cinematic resolvia só 'piano' (log: "kit=None | baixo=None") e
+# todo o engine de bateria/baixo/percussão nunca era acionado.
+# setdefault() NÃO sobrescreve entradas existentes: o real_instruments.py
+# continua sendo a fonte da verdade; isto é uma rede de segurança.
+# DEVE ficar antes de _build_catalog_index() (executado no import).
+_ESSENTIAL_INSTRUMENTS: Dict[str, Dict[str, Any]] = {
+    # melódicos
+    "bass":            {"display_name": "Baixo", "channel": 3, "midi_program": 33,
+                        "is_percussion": False, "aliases": ["baixo", "contrabaixo"]},
+    "acoustic_guitar": {"display_name": "Violão", "channel": 1, "midi_program": 24,
+                        "is_percussion": False, "aliases": ["violao"]},
+    "electric_guitar": {"display_name": "Guitarra", "channel": 2, "midi_program": 29,
+                        "is_percussion": False, "aliases": ["guitarra"]},
+    "electric_piano":  {"display_name": "Piano Elétrico", "channel": 5, "midi_program": 4,
+                        "is_percussion": False, "aliases": ["rhodes"]},
+    "organ":           {"display_name": "Órgão", "channel": 4, "midi_program": 16,
+                        "is_percussion": False, "aliases": ["orgao"]},
+    "strings":         {"display_name": "Cordas", "channel": 6, "midi_program": 48,
+                        "is_percussion": False, "aliases": ["cordas"]},
+    "accordion":       {"display_name": "Sanfona", "channel": 7, "midi_program": 21,
+                        "is_percussion": False, "aliases": ["acordeon", "acordeao"]},
+    "cavaquinho":      {"display_name": "Cavaquinho", "channel": 8, "midi_program": 105,
+                        "is_percussion": False, "aliases": ["cavaco"]},
+    "banjo":           {"display_name": "Banjo", "channel": 14, "midi_program": 105,
+                        "is_percussion": False},
+    "synth_pad":       {"display_name": "Synth Pad", "channel": 12, "midi_program": 89,
+                        "is_percussion": False, "aliases": ["pad"]},
+    "synth_lead":      {"display_name": "Synth Lead", "channel": 13, "midi_program": 81,
+                        "is_percussion": False, "aliases": ["sintetizador"]},
+    "flute":           {"display_name": "Flauta", "channel": 10, "midi_program": 73,
+                        "is_percussion": False, "aliases": ["flauta"]},
+    "trumpet":         {"display_name": "Trompete", "channel": 11, "midi_program": 56,
+                        "is_percussion": False, "aliases": ["trompete"]},
+    "saxophone":        {"display_name": "Saxofone", "channel": 15, "midi_program": 65,
+                        "is_percussion": False, "aliases": ["sax", "saxofone"]},
+    # percussão — canal 9 (GM)
+    "drums":     {"display_name": "Bateria", "channel": 9, "is_percussion": True,
+                  "aliases": ["bateria", "tambor"]},
+    "pandeiro":  {"display_name": "Pandeiro", "channel": 9, "is_percussion": True},
+    "surdo":     {"display_name": "Surdo", "channel": 9, "is_percussion": True,
+                  "aliases": ["zabumba"]},
+    "tamborim":  {"display_name": "Tamborim", "channel": 9, "is_percussion": True},
+    "agogo":     {"display_name": "Agogô", "channel": 9, "is_percussion": True},
+    "cuica":     {"display_name": "Cuíca", "channel": 9, "is_percussion": True},
+    "reco_reco": {"display_name": "Reco-reco", "channel": 9, "is_percussion": True,
+                  "aliases": ["reco"]},
+    "chocalho":  {"display_name": "Chocalho", "channel": 9, "is_percussion": True,
+                  "aliases": ["ganza", "maracas"]},
+    "berimbau":  {"display_name": "Berimbau", "channel": 9, "is_percussion": True},
+    "conga":     {"display_name": "Conga", "channel": 9, "is_percussion": True,
+                  "aliases": ["congas"]},
+    "shaker":    {"display_name": "Shaker", "channel": 9, "is_percussion": True},
+}
+for _id, _entry in _ESSENTIAL_INSTRUMENTS.items():
+    INSTRUMENTS.setdefault(_id, _entry)
 
 # --- compositor --------------------------------------------------------------
 try:
@@ -327,7 +380,8 @@ STYLES: Dict[str, Dict[str, Any]] = {
 }
 NO_DRUMS_STYLES = {"ambient", "classical"}
 AUTO_BASS_STYLES = {"pop", "rock", "funk", "reggae", "trap", "electronic",
-                    "hiphop", "jazz", "bossa", "latin", "forro", "samba"}
+                    "hiphop", "jazz", "bossa", "latin", "forro", "samba",
+                    "cinematic"}
 CRASH_STYLES = {"rock", "pop", "electronic", "funk", "trap", "cinematic", "latin"}
 
 # Progressões por GRAU da escala (0 = tônica)
@@ -410,6 +464,8 @@ SONG_FORMS: Dict[str, List[Tuple[str, int]]] = {
                    ("refrao", 4), ("outro", 2)],
     "bossa":      [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4), ("refrao", 4)],
     "jazz":       [("intro", 1), ("verso", 4), ("solo", 4), ("verso", 4), ("outro", 1)],
+    "cinematic":  [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
+                   ("refrao", 4), ("ponte", 2), ("refrao", 4), ("outro", 2)],
     "ambient":    [("verso", 4), ("verso", 4), ("verso", 4)],
 }
 _DEFAULT_FORM = [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4), ("refrao", 4)]
@@ -586,7 +642,7 @@ def _voice_chord(prev: Optional[List[int]], offsets: List[int],
         while pitch > target + 6:
             pitch -= 12
         voiced.append(pitch)
-    return sorted(set(voiced))
+    return sorted(set(min(127, max(0, p)) for p in voiced))   # defesa extra
 
 
 def _scale_pitch(root_midi: int, scale: List[int], idx: int) -> int:
@@ -943,15 +999,34 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                 inst_ids.append(rid)
                 break
 
-    # lead monofônico (sax/flauta/etc.) toca melodia; o resto faz acordes
+    # lead monofônico (sax/flauta/etc.) toca melodia; senão o 1º harmônico
+    # vira lead DEDICADO (removido dos acordes) se houver outro para compor
     mono_lead = next((i for i in comp_ids if _monophonic(i)), None)
     if mono_lead:
         lead_id = mono_lead
         comp_ids = [i for i in comp_ids if i != mono_lead]
     else:
         lead_id = comp_ids[0] if comp_ids else None
+        if len(comp_ids) > 1:
+            comp_ids = comp_ids[1:]
     log.info("Instrumentos: lead=%s | acordes=%s | baixo=%s | kit=%s | percussão=%s",
              lead_id, comp_ids or "-", bass_id, kit_id, perc_ids or "-")
+
+    # --- v4, CORREÇÃO 3: canais únicos por instrumento melódico -----------------
+    # O MidiComposer lê o canal do catálogo NO MOMENTO do save_midi(); então
+    # realocamos aqui para evitar que dois melódicos partilhem canal (o
+    # program_change de um sobrescreveria o timbre do outro).
+    used_ch = {9}  # 9 = percussão GM
+    for inst in dict.fromkeys(inst_ids):
+        entry = INSTRUMENTS.get(inst)
+        if not entry or entry.get("is_percussion"):
+            continue
+        if entry.get("channel") in used_ch:
+            for ch in range(16):
+                if ch not in used_ch:
+                    entry["channel"] = ch
+                    break
+        used_ch.add(entry["channel"])
 
     # --- composer e tracks ---------------------------------------------------
     composer = _make_composer(params, log)
@@ -971,6 +1046,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
 
     def note(track: int, bar: int, pos: float, dur_beats: float,
              pitch: int, vel: int, swing: bool = False) -> None:
+        """Escreve UMA nota. v4: clamp de pitch — nunca mais ValueError."""
         p = bar * beats_per_bar + pos
         if swing and abs((p % 1.0) - 0.5) < 1e-6:
             p += style_cfg["swing"]
@@ -979,8 +1055,12 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         dur = max(0.03, dur_beats * beat_sec * 0.96)
         strong = (pos == int(pos)) and (int(pos) % 2 == 0)
         v = int(min(127, max(20, vel + rng.randint(-6, 6) + (6 if strong else 0))))
-        composer.add_note(track, start=start, duration=dur,
-                          pitch=int(pitch), velocity=v)
+        pit = int(round(pitch))
+        if not (0 <= pit <= 127):
+            log.warning("Pitch fora de 0..127 (%r) em bar=%d pos=%.2f — corrigido "
+                        "(investigue a origem se isto repetir)", pitch, bar, pos)
+            pit = min(127, max(21, pit))
+        composer.add_note(track, start=start, duration=dur, pitch=pit, velocity=v)
 
     # --- plano da música -------------------------------------------------------
     bars = max(4, int(round(params.duration / (beat_sec * beats_per_bar))))
@@ -1115,7 +1195,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         "progression_a": prog_a,
         "progression_b": prog_b,
         "files": {"midi": str(midi_path), "wav": str(wav_path) if wav_path else None},
-        "generator": "music_generator.py v3 (MidiComposer)",
+        "generator": "music_generator.py v4 (MidiComposer)",
     }
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1175,8 +1255,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     log = _setup_logging(args.verbose)
     if _RI_ERR:
         log.warning("real_instruments.py não importado (%s) — usando catálogo "
-                    "de emergência. A geração via MidiComposer NÃO vai funcionar "
-                    "nesse estado.", _RI_ERR)
+                    "de emergência + essenciais.", _RI_ERR)
     if args.list_instruments:
         list_instruments()
         return 0
