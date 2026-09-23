@@ -7,6 +7,10 @@ on:
         description: 'Máximo de músicas para treinar (0 = todas)'
         required: false
         default: '100'
+      dataset_mode:
+        description: 'Modo do dataset (suno, synthetic, mixed)'
+        required: false
+        default: 'mixed'
       force_redownload:
         description: 'Forçar novo download do dataset'
         required: false
@@ -85,7 +89,8 @@ jobs:
     - name: Treinar modelo
       run: |
         python train.py \
-          --dataset datasets/suno-ai-music-dataset/metadata.json \
+          --dataset ${{ github.event.inputs.dataset_mode }} \
+          --max-songs ${{ github.event.inputs.max_songs }} \
           --epochs 20 \
           --batch-size 8
 
