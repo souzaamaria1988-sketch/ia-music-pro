@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-music_generator.py — Gerador principal do IA Music Pro (v6).
+music_generator.py — Gerador principal do IA Music Pro (v6.1).
+
+Integrado à API REAL do projeto:
+    * midi_composer.MidiComposer:
+        - MidiComposer(title, bpm, key="C", scale="major", style)
+        - add_track(instrument_id) -> int          (ValueError se desconhecido)
+        - add_note(idx, *, start, duration, pitch, velocity)  [SEGUNDOS]
+        - save_midi(path) -> bool  (False se mido faltar — CHECAR o retorno!)
+        - save_json(path)
+    * real_instruments.INSTRUMENTS (campos: display_name, channel,
+      midi_program, is_percussion, aliases)
+
+v6.1 — correção da AUDITORIA:
+    O save_midi() do MidiComposer grava uma track de TEMPO no índice 0 do
+    arquivo; os instrumentos começam no índice 1. A auditoria antiga assumia
+    índice == índice do composer e rotulava tudo com +1 de deslocamento
+    ("strings → 0 NOTAS", "drums no canal 0" — falsos alarmes; a bateria
+    estava SEMPRE no canal 9). Agora o offset é detectado e o log termina
+    com "BATERIA CONFIRMADA no MIDI" quando há notas no canal 9.
 
 v6 — ANTI-REPETIÇÃO + BATERIA AUDÍVEL:
-    1. Melodia em FRASES de 4 compassos: pergunta (2) + resposta (2), com
-       compasso de respiro (silêncio) — cada bloco de 4 compassos recebe
-       frase nova ou variação. Fim do "mesmo compasso repetido 40x".
-    2. Ritmo dos acordes varia POR COMPASSO (25%); verso 1 e verso 2 usam
-       PROGRESSÕES DIFERENTES; turnaround (V) a cada 8 compassos; refrões
-       repetidos ganham +3 de intensidade; ponte a cada 3 ciclos da forma.
-    3. Baixo: fill walk-up (root-3ª-5ª-aproximação) no fim de cada grupo de 4.
-    4. Bateria: ghost notes e chimbal aberto ocasionais, por compasso.
-    5. RENDERIZADOR WAV EMBUTIDO (numpy + soundfile): percussão GM do canal 9
-       sintetizada de verdade (kick, caixa, chimbais, pratos, tons, agogô,
-       cuíca, triângulo...). Garante WAV com bateria AUDÍVEL mesmo sem
-       FluidSynth/soundfont_renderer. --no-soundfont força o embutido.
-    6. Bateria adicionada a choro (vassourinha) e capoeira (atabaque).
+    * Melodia em FRASES de 4 compassos (pergunta + resposta + respiro).
+    * Ritmo dos acordes varia por compasso; verso 1 e verso 2 com
+      progressões diferentes; turnaround a cada 8 compassos; fill de baixo
+      walk-up a cada 4; ghost notes e chimbal aberto ocasionais; refrões
+      repetidos mais intensos; ponte a cada 3 ciclos.
+    * RENDERIZADOR WAV EMBUTIDO (numpy + soundfile): percussão GM do canal 9
+      sintetizada de verdade (kick, caixa, chimbais, pratos, tons, agogô,
+      cuíca, triângulo...). WAV com bateria AUDÍVEL mesmo sem FluidSynth.
+    * Bateria adicionada a choro (vassourinha) e capoeira (atabaque).
 
 v5: 28 estilos (bossfight, chiptune, dungeon, breakcore, dnb, synthwave,
      disco, blues 12 compassos, metal double-kick, choro, capoeira...).
@@ -394,11 +408,11 @@ STYLES: Dict[str, Dict[str, Any]] = {
                                     ("bass", "baixo"), ("drums",)]),
     "choro":      dict(bpm=(110, 150), scale="major", swing=0.0, sevenths=True,
                        instruments=[("cavaquinho", "cavaco"), ("flute", "flauta"),
-                                    ("pandeiro",), ("drums",)]),   # v6: + bateria (vassourinha)
+                                    ("pandeiro",), ("drums",)]),   # vassourinha
     "capoeira":   dict(bpm=(122, 138), scale="mixolydian", swing=0.0,
                        instruments=[("acoustic_guitar", "violao"), ("berimbau",),
                                     ("conga", "congas"), ("agogo",), ("pandeiro",),
-                                    ("drums",)]),                   # v6: + atabaque
+                                    ("drums",)]),                   # atabaque
 }
 NO_DRUMS_STYLES = {"ambient", "classical", "dungeon"}
 AUTO_BASS_STYLES = {"pop", "rock", "funk", "reggae", "trap", "electronic",
@@ -622,10 +636,10 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
         p = [(1.0, "tambourine", 62), (3.0, "tambourine", 60)]
         if rng.random() < 0.3:
             p.append((0.0, "kick", 58))
-    elif style == "choro":  # v6: vassourinha — levada leve de rim
+    elif style == "choro":  # vassourinha — levada leve de rim
         p = [(0.0, "kick", 60), (2.0, "kick", 54)]
         p += [(i * 0.5, "rim", 48 if i % 2 == 0 else 38) for i in range(8)]
-    elif style == "capoeira":  # v6: atabaque
+    elif style == "capoeira":  # atabaque
         p = [(0.0, "conga_low", 88), (1.0, "conga_low", 66), (1.5, "conga_open", 74),
              (2.0, "conga_low", 88), (3.0, "conga_low", 66), (3.5, "conga_open", 74)]
     elif style == "bossfight":
@@ -820,7 +834,7 @@ def _monophonic(inst_id: str) -> bool:
 
 
 # =============================================================================
-# MOTIVOS E FRASES (v6: melodia em frases de 4 compassos)
+# MOTIVOS E FRASES (melodia em frases de 4 compassos)
 # =============================================================================
 
 def _new_motif(rng: random.Random, dense: bool):
@@ -857,7 +871,7 @@ def _new_phrase(rng: random.Random, dense: bool) -> Dict[int, list]:
     if rng.random() < 0.35:  # repete com contorno invertido
         rep = [((p, d), max(-3, min(9, 4 - s))) for (p, d), s in rep]
     answer = _new_motif(rng, dense)
-    if rng.random() < 0.5:  # resposta mais grave (pergunta-aguda, resposta-grave)
+    if rng.random() < 0.5:  # resposta mais grave
         answer = [((p, d), max(-3, min(9, s - 2))) for (p, d), s in answer]
     phrase: Dict[int, list] = {0: a, 1: rep, 2: answer}
     phrase[3] = None if rng.random() < 0.55 else _vary_motif(answer, rng)
@@ -1006,7 +1020,7 @@ def _export_midi(composer, path: Path, log: logging.Logger) -> bool:
 
 
 # =============================================================================
-# v6: RENDERIZADOR WAV EMBUTIDO (numpy + soundfile) — bateria AUDÍVEL garantida
+# RENDERIZADOR WAV EMBUTIDO (numpy + soundfile) — bateria AUDÍVEL garantida
 # =============================================================================
 # Lê o .mid gerado e sintetiza o WAV nós mesmos:
 #   * canal 9  → percussão GM sintetizada (kick, caixa, chimbais, pratos com
@@ -1240,31 +1254,60 @@ def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
 
 
 def audit_midi(path: Path, inst_by_track: Dict[int, str], log: logging.Logger) -> bool:
-    """Auditoria pós-geração: torna 'bateria não toca' VISÍVEL no log."""
+    """Auditoria pós-geração: torna 'bateria não toca' VISÍVEL no log.
+
+    v6.1: o save_midi() do MidiComposer grava uma track de TEMPO no índice 0
+    do arquivo — os índices dos instrumentos no .mid ficam +1 em relação aos
+    índices do composer. Detectamos o deslocamento em vez de assumir.
+    (O bug fazia a auditoria rotular a track de tempo como 'strings → 0 NOTAS'
+    e acusar a bateria no canal errado — falsos alarmes; a bateria estava
+    sempre no canal 9, correta.)
+    """
     try:
         import mido
     except ImportError:
         log.warning("mido não instalado — auditoria de MIDI pulada.")
         return True
     mid = mido.MidiFile(str(path))
+
+    # Detecta track de tempo/meta no início (sem notas, com set_tempo)
+    offset = 0
+    if mid.tracks:
+        first = mid.tracks[0]
+        if (not any(m.type == "note_on" and m.velocity > 0 for m in first)
+                and any(m.type in ("set_tempo", "time_signature") for m in first)):
+            offset = 1
+
     ok = True
-    log.info("Auditoria do MIDI (%d tracks):", len(mid.tracks))
+    drums_found = False
+    log.info("Auditoria do MIDI (%d tracks no arquivo, %d de instrumento):",
+             len(mid.tracks), len(mid.tracks) - offset)
     for i, track in enumerate(mid.tracks):
+        if i < offset:
+            log.info("  [track %d] (tempo/meta — sem notas, normal)", i)
+            continue
         notes = [m for m in track if m.type == "note_on" and m.velocity > 0]
         chans = sorted({m.channel for m in notes})
         progs = [m.program for m in track if m.type == "program_change"]
-        inst = inst_by_track.get(i, "?")
+        inst = inst_by_track.get(i - offset, "?")   # índice do composer
         if not notes:
             log.warning("  [track %d] %-16s → 0 NOTAS (algo não foi gerado!)", i, inst)
             ok = False
             continue
         log.info("  [track %d] %-16s → %d notas | canais %s | programa %s",
                  i, inst, len(notes), chans, progs[:1] or "-")
+        if 9 in chans:
+            drums_found = True
         if _is_perc(inst) and chans and 9 not in chans:
             log.warning("  [track %d] %s é percussão mas está no canal %s — GM exige "
                         "canal 9. Corrija o 'channel' no real_instruments.py.",
                         i, inst, chans)
             ok = False
+    if drums_found:
+        log.info("BATERIA CONFIRMADA no MIDI: notas no canal 9 (percussão GM).")
+    else:
+        log.warning("Nenhuma nota no canal 9 — bateria ausente neste MIDI.")
+        ok = False
     return ok
 
 
@@ -1288,7 +1331,7 @@ class SongParams:
 
 
 def _fit_form(bars: int, style: str) -> List[Tuple[str, int]]:
-    """Forma da música. v6: insere PONTE a cada 3 ciclos em músicas longas."""
+    """Forma da música. Insere PONTE a cada 3 ciclos em músicas longas."""
     form = list(SONG_FORMS.get(style, _DEFAULT_FORM))
     out: List[Tuple[str, int]] = []
     remaining = bars
@@ -1435,7 +1478,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     opts = PROGRESSIONS.get(style, PROGRESSIONS["pop"])
     prog_a = list(rng.choice(opts))                     # verso 1
     rest_opts = [o for o in opts if o != prog_a]
-    prog_a2 = list(rng.choice(rest_opts)) if rest_opts else prog_a   # v6: verso 2
+    prog_a2 = list(rng.choice(rest_opts)) if rest_opts else prog_a   # verso 2
     rest2 = [o for o in rest_opts if o != prog_a2] or rest_opts or opts
     prog_b = list(rng.choice(rest2))                     # refrão
     add7 = bool(style_cfg.get("sevenths")) or rng.random() < 0.25
@@ -1443,7 +1486,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
              "%d BPM | seed=%d", prog_a, prog_a2, prog_b,
              PC_TO_NAME[params.key_root], params.scale, params.bpm, params.seed)
 
-    # --- composição (v6: variação por compasso) ---------------------------------
+    # --- composição ------------------------------------------------------------
     prev_voicing: Optional[List[int]] = None
     phrase: Optional[Dict[int, list]] = None
     verse_idx = 0
@@ -1452,7 +1495,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     n = len(scale)
     for sec_i, (sec_name, sec_bars) in enumerate(sections):
         profile = dict(SECTION_PROFILES.get(sec_name, SECTION_PROFILES["verso"]))
-        if sec_name == "refrao":  # v6: cada refrão repetido ganha intensidade
+        if sec_name == "refrao":  # cada refrão repetido ganha intensidade
             chorus_count += 1
             profile["vel"] = min(110, profile["vel"] + 3 * (chorus_count - 1))
         comp_rhythms = COMP_RHYTHMS.get(style, [[0.0, 2.0]])
@@ -1460,7 +1503,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         if sec_name in ("refrao", "solo"):
             prog = prog_b
         elif sec_name == "verso":
-            prog = prog_a if verse_idx % 2 == 0 else prog_a2  # v6: versos alternam
+            prog = prog_a if verse_idx % 2 == 0 else prog_a2  # versos alternam
             verse_idx += 1
         elif sec_name == "ponte":
             prog = prog_a2 if prog_a2 != prog_a else prog_b
@@ -1469,7 +1512,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         if profile["melody"] and lead_id and lead_id in track_of:
             phrase = _new_phrase(rng, profile["dense"])
         for b in range(sec_bars):
-            # v6: compasso novo → às vezes muda o ritmo do comp (25%)
+            # compasso novo → às vezes muda o ritmo do comp (25%)
             if b > 0 and len(comp_rhythms) > 1 and rng.random() < 0.25:
                 comp_rhythm = rng.choice(
                     [r for r in comp_rhythms if r != comp_rhythm] or comp_rhythms)
@@ -1477,7 +1520,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             degree = prog[b % len(prog)]
             next_degree = prog[(b + 1) % len(prog)]
             is_last = (b == sec_bars - 1)
-            # v6: turnaround — compasso 8 de cada grupo de 8 vira V (puxa de volta)
+            # turnaround — compasso 8 de cada grupo de 8 vira V (puxa de volta)
             if (len(prog) == 4 and len(scale) == 7 and style != "blues"
                     and abs_bar % 8 == 7 and not is_last):
                 degree = 4
@@ -1499,7 +1542,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                             note(track_of[inst], abs_bar, hpos + off, dur,
                                  pit, profile["vel"] - 3 * j, swing=swing_on)
 
-            # ---- baixo (v6: com fills) ----
+            # ---- baixo (com fills) ----
             if profile["bass"] and bass_id and bass_id in track_of:
                 use_fill = ((b % 4 == 3 or is_last) and rng.random() < 0.40
                             and style not in ("ambient", "dungeon", "cinematic", "classical"))
@@ -1515,7 +1558,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[bass_id], abs_bar, pos, dur, pitch,
                          profile["vel"] - 8, swing=swing_on)
 
-            # ---- bateria (kit, v6: vida por compasso) ----
+            # ---- bateria (kit) ----
             if kit_id and kit_id in track_of and profile["drums"]:
                 pattern = _kit_pattern(style, abs_bar, rng)
                 if is_last and sec_i < len(sections) - 1:
@@ -1551,7 +1594,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[pid], abs_bar, i * 0.25, dur / beat_sec,
                          pitch, int(v * (profile["vel"] / 76.0)))
 
-            # ---- melodia (v6: FRASES de 4 compassos, com respiro) ----
+            # ---- melodia (frases de 4 compassos, com respiro) ----
             if profile["melody"] and lead_id and lead_id in track_of:
                 if b % 4 == 0 and b > 0:
                     r = rng.random()
@@ -1602,7 +1645,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         "progression_a2": prog_a2,
         "progression_b": prog_b,
         "files": {"midi": str(midi_path), "wav": str(wav_path) if wav_path else None},
-        "generator": "music_generator.py v6",
+        "generator": "music_generator.py v6.1",
     }
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
