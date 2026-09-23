@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-music_generator.py — Gerador principal do IA Music Pro (v4).
+music_generator.py — Gerador principal do IA Music Pro (v5).
 
 Integrado à API REAL do projeto:
     * midi_composer.MidiComposer:
@@ -13,28 +13,24 @@ Integrado à API REAL do projeto:
     * real_instruments.INSTRUMENTS (campos: display_name, channel,
       midi_program, is_percussion, aliases)
 
-v4 — correções desta versão:
-    1. CATÁLOGO ESSENCIAL GARANTIDO: o catálogo real tinha só 12 instrumentos,
-       SEM drums/bass/strings — por isso "kit=None | baixo=None" e toda a
-       música saía só piano. _ESSENTIAL_INSTRUMENTS + setdefault() garante os
-       instrumentos mínimos SEMPRE presentes (não sobrescreve o catálogo real,
-       que continua sendo a fonte da verdade).
-    2. CLAMP DE PITCH em note(): ValueError: pitch inválido nunca mais derruba
-       o pipeline; valor suspeito é corrigido e LOGADO para diagnóstico.
-    3. CANAIS ÚNICOS por instrumento melódico (o MidiComposer lê o canal do
-       catálogo no save; alocamos antes da geração para evitar colisões).
+v5 — 12 TEMAS NOVOS (28 estilos no total):
+    * games:     bossfight, chiptune, dungeon
+    * eletrônicos: breakcore, dnb, synthwave, disco
+    * raízes:    blues (12 compassos + shuffle), metal (double kick),
+                 choro, capoeira
+    * + instrumentos GM: square_lead (80), synth_bass (38)
+    * 'batalha', 'luta', 'guerra', 'chefe final' etc. agora detectam bossfight
 
-Correções históricas mantidas:
-    * Bateria: engine própria (pitches GM escritos direto) + auditoria
-      pós-geração (notas por track, percussão no canal 9).
-    * Parsing tolerante a acentos/sinônimos PT-BR; sem instrumentos no prompt
-      usa instrumentação PADRÃO DO ESTILO.
-    * Seed aleatório por padrão (--seed N reproduz); progressões, forma,
-      BPM, motivo e humanização sorteados.
+v4 — correções mantidas:
+    1. CATÁLOGO ESSENCIAL GARANTIDO (fim do "só piano / bateria não usa").
+    2. CLAMP DE PITCH em note() — ValueError nunca mais derruba o pipeline.
+    3. CANAIS ÚNICOS por instrumento melódico.
+    * Bateria: engine própria (pitches GM) + auditoria pós-geração.
+    * Seed aleatório por padrão (--seed N reproduz); parsing PT-BR tolerante.
 
 Uso:
-    python music_generator.py --prompt "samba com cavaquinho, pandeiro e surdo" --style samba
-    python music_generator.py --prompt "rock com bateria" --duration 20 --seed 42
+    python music_generator.py --prompt "música de bossfight épica" --duration 30
+    python music_generator.py --prompt "breakcore caótico" --duration 15
     python music_generator.py --list-instruments
 """
 
@@ -71,9 +67,6 @@ except ImportError as _exc:  # catálogo de emergência (só para --list-instrum
 # =============================================================================
 # INSTRUMENTOS ESSENCIAIS (garantia mínima) — v4, CORREÇÃO 1
 # =============================================================================
-# O catálogo real tinha apenas 12 instrumentos, SEM drums/bass/strings — por
-# isso o estilo cinematic resolvia só 'piano' (log: "kit=None | baixo=None") e
-# todo o engine de bateria/baixo/percussão nunca era acionado.
 # setdefault() NÃO sobrescreve entradas existentes: o real_instruments.py
 # continua sendo a fonte da verdade; isto é uma rede de segurança.
 # DEVE ficar antes de _build_catalog_index() (executado no import).
@@ -127,6 +120,14 @@ _ESSENTIAL_INSTRUMENTS: Dict[str, Dict[str, Any]] = {
 }
 for _id, _entry in _ESSENTIAL_INSTRUMENTS.items():
     INSTRUMENTS.setdefault(_id, _entry)
+
+# v5: instrumentos dos novos temas
+INSTRUMENTS.setdefault("square_lead",
+    {"display_name": "Square Lead", "channel": 0, "midi_program": 80,
+     "is_percussion": False, "aliases": ["chiptune lead", "8bit lead"]})
+INSTRUMENTS.setdefault("synth_bass",
+    {"display_name": "Synth Bass", "channel": 3, "midi_program": 38,
+     "is_percussion": False, "aliases": ["reese", "808 bass"]})
 
 # --- compositor --------------------------------------------------------------
 try:
@@ -328,6 +329,7 @@ NOTE_NAMES_EN = {"c": 0, "d": 2, "e": 4, "f": 5, "g": 7, "a": 9, "b": 11}
 PC_TO_NAME = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 STYLES: Dict[str, Dict[str, Any]] = {
+    # --- base -----------------------------------------------------------------
     "rock":       dict(bpm=(100, 150), scale="minor", swing=0.0,
                        instruments=[("electric_guitar", "guitarra eletrica", "guitarra"),
                                     ("bass", "baixo"), ("drums",)]),
@@ -377,12 +379,54 @@ STYLES: Dict[str, Dict[str, Any]] = {
     "forro":      dict(bpm=(125, 150), scale="mixolydian", swing=0.0,
                        instruments=[("accordion", "sanfona", "acordeon", "acordeao"),
                                     ("bass", "baixo"), ("drums",)]),
+    # --- v5: games ---------------------------------------------------------------
+    "bossfight":  dict(bpm=(142, 165), scale="harmonic_minor", swing=0.0,
+                       instruments=[("strings", "cordas"), ("trumpet", "trompete"),
+                                    ("piano",), ("drums",)]),
+    "chiptune":   dict(bpm=(130, 165), scale="major", swing=0.0,
+                       instruments=[("square_lead", "chiptune lead"),
+                                    ("synth_bass", "synth bass"), ("drums",)]),
+    "dungeon":    dict(bpm=(50, 70), scale="harmonic_minor", swing=0.0,
+                       instruments=[("strings", "cordas"), ("piano",)]),
+    # --- v5: eletrônicos -----------------------------------------------------------
+    "breakcore":  dict(bpm=(170, 200), scale="minor", swing=0.0,
+                       instruments=[("synth_lead", "sintetizador"), ("synth_pad", "pad"),
+                                    ("bass", "baixo"), ("drums",)]),
+    "dnb":        dict(bpm=(168, 178), scale="minor", swing=0.0,
+                       instruments=[("synth_lead", "sintetizador", "electric_piano", "piano"),
+                                    ("synth_pad", "pad", "strings", "cordas"),
+                                    ("bass", "baixo"), ("drums",)]),
+    "synthwave":  dict(bpm=(100, 116), scale="minor", swing=0.0,
+                       instruments=[("synth_lead", "sintetizador"), ("synth_pad", "pad"),
+                                    ("bass", "baixo"), ("drums",)]),
+    "disco":      dict(bpm=(112, 126), scale="major", swing=0.0,
+                       instruments=[("electric_piano", "piano"),
+                                    ("synth_pad", "pad", "strings", "cordas"),
+                                    ("bass", "baixo"), ("drums",)]),
+    # --- v5: raízes ---------------------------------------------------------------
+    "blues":      dict(bpm=(72, 100), scale="blues", swing=0.12, sevenths=True,
+                       instruments=[("electric_guitar", "guitarra", "acoustic_guitar", "violao"),
+                                    ("organ", "orgao"), ("bass", "baixo"), ("drums",)]),
+    "metal":      dict(bpm=(140, 180), scale="harmonic_minor", swing=0.0,
+                       instruments=[("electric_guitar", "guitarra", "guitarra eletrica"),
+                                    ("bass", "baixo"), ("drums",)]),
+    "choro":      dict(bpm=(110, 150), scale="major", swing=0.0, sevenths=True,
+                       instruments=[("cavaquinho", "cavaco"), ("flute", "flauta"),
+                                    ("pandeiro",)]),
+    "capoeira":   dict(bpm=(122, 138), scale="mixolydian", swing=0.0,
+                       instruments=[("acoustic_guitar", "violao"), ("berimbau",),
+                                    ("conga", "congas"), ("agogo",), ("pandeiro",)]),
 }
-NO_DRUMS_STYLES = {"ambient", "classical"}
+NO_DRUMS_STYLES = {"ambient", "classical", "dungeon"}
 AUTO_BASS_STYLES = {"pop", "rock", "funk", "reggae", "trap", "electronic",
                     "hiphop", "jazz", "bossa", "latin", "forro", "samba",
-                    "cinematic"}
-CRASH_STYLES = {"rock", "pop", "electronic", "funk", "trap", "cinematic", "latin"}
+                    "cinematic",
+                    # v5
+                    "bossfight", "chiptune", "breakcore", "dnb", "synthwave",
+                    "disco", "blues", "metal", "choro", "dungeon"}
+CRASH_STYLES = {"rock", "pop", "electronic", "funk", "trap", "cinematic", "latin",
+                # v5
+                "bossfight", "metal", "breakcore", "disco"}
 
 # Progressões por GRAU da escala (0 = tônica)
 PROGRESSIONS: Dict[str, List[List[int]]] = {
@@ -402,6 +446,18 @@ PROGRESSIONS: Dict[str, List[List[int]]] = {
     "folk":       [[0, 3, 4, 3], [0, 4, 5, 3], [0, 3, 0, 4]],
     "latin":      [[0, 3, 4, 3], [0, 4, 3, 4], [1, 4, 0, 0]],
     "forro":      [[0, 3, 0, 4], [0, 4, 3, 4], [0, 3, 4, 0]],
+    # v5
+    "bossfight":  [[0, 5, 3, 4], [0, 1, 4, 0], [0, 3, 0, 4]],   # grau bII = ameaça épica
+    "chiptune":   [[0, 4, 5, 3], [0, 3, 4, 4], [0, 5, 3, 4], [5, 3, 0, 4]],
+    "dungeon":    [[0, 3, 5, 4], [0, 5, 3, 0], [0, 1, 0, 4]],
+    "breakcore":  [[0, 5, 3, 4], [0, 3, 4, 3], [5, 3, 0, 4]],
+    "dnb":        [[0, 5, 3, 4], [0, 3, 0, 4], [5, 3, 0, 4]],
+    "synthwave":  [[0, 5, 3, 4], [5, 3, 0, 4], [0, 3, 5, 4]],
+    "disco":      [[0, 5, 3, 4], [0, 3, 4, 3], [0, 4, 5, 3]],
+    "blues":      [[0, 0, 0, 0, 3, 3, 0, 0, 4, 3, 0, 4]],  # 12 compassos: I-I-I-I / IV-IV-I-I / V-IV-I-V
+    "metal":      [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 5, 4]],
+    "choro":      [[1, 4, 0, 0], [2, 5, 1, 4], [0, 4, 1, 4]],
+    "capoeira":   [[0, 3, 0, 4], [0, 4, 3, 4], [0, 0, 3, 4]],
 }
 
 # (posição em tempos, tipo de nota, duração em tempos)
@@ -423,6 +479,19 @@ BASS_PATTERNS: Dict[str, List[Tuple[float, str, float]]] = {
     "folk":       [(0.0, "root", 1.9), (2.0, "fifth", 1.9)],
     "latin":      [(0.0, "root", 0.9), (1.5, "root", 0.4), (2.5, "root", 0.9), (3.5, "fifth", 0.4)],
     "forro":      [(0.0, "root", 0.7), (1.75, "root", 0.3), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
+    # v5
+    "bossfight":  [(i * 0.5, "root" if i not in (3, 7) else "fifth", 0.45) for i in range(8)],
+    "chiptune":   [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.4) for i in range(8)],
+    "dungeon":    [(0.0, "root", 3.8)],                                  # drone grave
+    "breakcore":  [(0.0, "root", 0.2), (0.75, "root", 0.2), (1.5, "octave", 0.2),
+                   (2.25, "root", 0.2), (3.0, "fifth", 0.2), (3.5, "octave", 0.2)],
+    "dnb":        [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.45) for i in range(8)],  # rolling
+    "synthwave":  [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.42) for i in range(8)],
+    "disco":      [(i * 0.25, "root" if i % 2 == 0 else "octave", 0.22) for i in range(16)],  # oitavas 16avos
+    "blues":      [(0.0, "root", 0.9), (1.0, "fifth", 0.9), (2.0, "root", 0.9), (3.0, "approach", 0.9)],
+    "metal":      [(i * 0.5, "root", 0.45) for i in range(8)],
+    "choro":      [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
+    "capoeira":   [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "fifth", 0.7), (3.5, "root", 0.35)],
 }
 
 COMP_RHYTHMS: Dict[str, List[List[float]]] = {
@@ -442,6 +511,18 @@ COMP_RHYTHMS: Dict[str, List[List[float]]] = {
     "folk":       [[0.0, 2.0], [0.0, 1.0, 2.0, 3.0]],
     "latin":      [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
     "forro":      [[0.0, 0.75, 2.0, 2.75], [0.0, 1.5, 2.0, 3.5]],
+    # v5
+    "bossfight":  [[0.0, 1.5, 2.0, 3.5], [0.0, 0.75, 2.0, 2.75]],           # stabs marciais
+    "chiptune":   [[i * 0.25 for i in range(16)]],                          # arpejo em 16avos
+    "dungeon":    [[0.0]],
+    "breakcore":  [[0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
+    "dnb":        [[0.0, 2.5], [0.0, 1.75, 3.25]],
+    "synthwave":  [[0.0, 1.5, 2.5], [0.0, 0.75, 2.0, 2.75]],
+    "disco":      [[0.5, 1.5, 2.5, 3.5], [0.5, 1.5, 2.0, 3.5]],             # stabs no contratempo
+    "blues":      [[0.0, 1.0, 2.0, 3.0]],                                   # shuffle via swing
+    "metal":      [[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]],               # power chords 8avos
+    "choro":      [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.75, 1.5, 2.25, 3.0, 3.75]],  # paradigma
+    "capoeira":   [[0.0, 0.75, 1.5, 2.25, 3.0], [0.0, 1.5, 2.0, 3.5]],
 }
 
 STRUM_FAMILIES = ("guitar", "viola", "cavaquinho", "banjo", "ukulele", "cavaco")
@@ -467,6 +548,13 @@ SONG_FORMS: Dict[str, List[Tuple[str, int]]] = {
     "cinematic":  [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
                    ("refrao", 4), ("ponte", 2), ("refrao", 4), ("outro", 2)],
     "ambient":    [("verso", 4), ("verso", 4), ("verso", 4)],
+    # v5
+    "bossfight":  [("intro", 2), ("verso", 4), ("refrao", 4), ("ponte", 2),
+                   ("solo", 4), ("refrao", 4)],
+    "chiptune":   [("intro", 2), ("refrao", 4), ("verso", 4), ("refrao", 4),
+                   ("ponte", 2), ("refrao", 4)],
+    "breakcore":  [("intro", 2), ("verso", 4), ("refrao", 4), ("ponte", 2),
+                   ("refrao", 4), ("refrao", 4)],
 }
 _DEFAULT_FORM = [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4), ("refrao", 4)]
 
@@ -560,6 +648,55 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
         p = [(1.0, "tambourine", 62), (3.0, "tambourine", 60)]
         if rng.random() < 0.3:
             p.append((0.0, "kick", 58))
+    # --- v5: novos temas -------------------------------------------------------
+    elif style == "bossfight":  # marcha épica + rolo de caixa crescente
+        p = [(b, "kick", 104) for b in range(4)]
+        p += [(1.0, "snare", 98), (3.0, "snare", 100)]
+        p += [(0.5, "snare", 56), (1.5, "snare", 60), (2.5, "snare", 64),
+              (3.25, "snare", 70), (3.5, "snare", 78), (3.75, "snare", 86)]
+        p += [(0.0, "timpani", 96), (2.0, "timpani", 90)]
+        if bar % 4 == 0:
+            p.append((0.0, "crash", 94))
+    elif style == "chiptune":  # bateria 8-bit minimalista
+        p = [(0.0, "kick", 88), (2.0, "kick", 84), (1.0, "snare", 86), (3.0, "snare", 88)]
+        p += [(i * 0.5, "hh_closed", [72, 38, 54, 38][i % 4]) for i in range(8)]
+    elif style == "breakcore":  # amen break picotado
+        p = [(0.0, "kick", 104), (1.0, "snare", 100), (2.0, "snare", 98),
+             (2.5, "kick", 96), (3.0, "snare", 100)]
+        if bar % 2 == 1:  # chop no compasso ímpar
+            p += [(0.75, "snare", 84), (1.5, "kick", 88), (1.75, "snare", 80),
+                  (3.25, "snare", 90), (3.5, "snare", 96), (3.75, "snare", 102)]
+        p += [(i * 0.25, "hh_closed", [72, 40, 58, 40][i % 4]) for i in range(16)]
+        if bar % 4 == 3:
+            p += [(3.0 + i * 0.125, "snare", 50 + 6 * i) for i in range(8)]
+    elif style == "dnb":  # two-step clássico
+        p = [(0.0, "kick", 104), (2.5, "kick", 96), (2.0, "snare", 102),
+             (3.75, "snare", 66)]
+        p += [(i * 0.5, "hh_closed", 68 if i % 2 == 0 else 50) for i in range(8)]
+        p.append((1.5, "hh_open", 58))
+    elif style == "synthwave":  # gated snare + open hats no contratempo
+        p = [(0.0, "kick", 98), (1.0, "snare", 94), (2.0, "kick", 94), (3.0, "snare", 96)]
+        p += [(b + 0.5, "hh_open", 62) for b in range(4)]
+        if bar % 4 == 3:
+            p.append((3.5, "tom_high", 70))
+    elif style == "disco":  # four-on-the-floor + open hat no contratempo
+        p = [(b, "kick", 100) for b in range(4)]
+        p += [(1.0, "snare", 90), (3.0, "snare", 92)]
+        p += [(b + 0.5, "hh_open", 74) for b in range(4)]
+    elif style == "blues":  # shuffle (o swing do estilo balança os 8avos)
+        p = [(0.0, "kick", 96), (2.0, "kick", 90), (1.0, "snare", 88), (3.0, "snare", 90)]
+        p += [(i * 0.5, "ride", 66 if i % 2 == 0 else 52) for i in range(8)]
+    elif style == "metal":  # double kick alternando com 8avos
+        kick_pos = [i * 0.5 for i in range(8)]
+        if bar % 2 == 1:
+            kick_pos = [i * 0.25 for i in range(16)]  # double kick em 16avos
+        p = [(k, "kick", 92) for k in kick_pos]
+        p += [(1.0, "snare", 102), (3.0, "snare", 104)]
+        p += [(i * 0.5, "ride", 70 if i % 2 == 0 else 56) for i in range(8)]
+        if bar % 4 == 0:
+            p.append((0.0, "crash", 100))
+    elif style == "dungeon":
+        p = []  # silêncio e tensão
     elif style in ("ambient", "classical"):
         p = []
     else:
@@ -568,6 +705,24 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
 
 
 def _fill(style: str, rng: random.Random) -> List[Tuple[float, str, int]]:
+    # v5
+    if style == "bossfight":
+        return [(2.0, "snare", 60), (2.25, "snare", 68), (2.5, "snare", 76),
+                (2.75, "snare", 84), (3.0, "snare", 92), (3.25, "snare", 98),
+                (3.5, "timpani", 100), (3.75, "timpani", 104)]
+    if style in ("breakcore", "dnb"):
+        return [(2.0 + i * 0.125, "snare", 44 + 6 * i) for i in range(16)]
+    if style == "metal":
+        return [(2.0 + 0.25 * i, "tom_high" if i % 2 == 0 else "tom_mid", 84 + 3 * i)
+                for i in range(8)]
+    if style == "blues":
+        return [(2.5, "snare", 70), (3.0, "tom_mid", 78), (3.5, "snare", 84)]
+    if style in ("synthwave", "disco"):
+        return [(3.0, "hh_open", 76), (3.5, "snare", 82)]
+    if style == "chiptune":
+        return [(2.5 + i * 0.125, "tom_high" if i % 2 == 0 else "snare", 60 + 4 * i)
+                for i in range(12)]
+    # base
     if style in ("rock", "pop", "electronic", "folk"):
         seq = ["snare", "snare", "tom_high", "tom_high",
                "tom_mid", "tom_mid", "tom_low", "tom_low"]
@@ -684,8 +839,10 @@ def _bass_pitch(kind: str, root_abs: int, next_root_abs: int,
 
 
 def _monophonic(inst_id: str) -> bool:
+    # v5: "square_lead" incluído — chiptune: arpejo e melodia NÃO colidem
     return any(m in inst_id for m in
-               ("sax", "trumpet", "flute", "clarinet", "violin", "trombone", "synth_lead"))
+               ("sax", "trumpet", "flute", "clarinet", "violin", "trombone",
+                "synth_lead", "square_lead"))
 
 
 # =============================================================================
@@ -719,9 +876,27 @@ def _vary_motif(motif, rng: random.Random):
 # =============================================================================
 
 _STYLE_MAP: List[Tuple[Tuple[str, ...], str]] = [
+    # v5 — novos temas (detect_style() ordena por tamanho: nomes compostos e
+    # aliases longos ganham de palavras curtas; "bossa" vence "boss", etc.)
+    (("boss fight", "bossfight", "chefe final", "batalha de chefe", "batalha",
+      "luta", "guerra", "battle", "boss"), "bossfight"),
+    (("chiptune", "chip tune", "8bit", "8 bits", "8 bit", "video game",
+      "videogame", "jogo", "nes", "retro"), "chiptune"),
+    (("dungeon", "masmorra", "terror", "horror", "sombrio", "assustador",
+      "medo", "suspense", "dark"), "dungeon"),
+    (("breakcore",), "breakcore"),
+    (("drum and bass", "drum n bass", "dnb", "jungle", "liquid"), "dnb"),
+    (("synthwave", "synth wave", "retrowave", "vaporwave", "anos 80",
+      "oitenta"), "synthwave"),
+    (("disco", "boogie", "discoteca"), "disco"),
+    (("blues",), "blues"),
+    (("metal", "heavy metal", "thrash", "death metal", "doom"), "metal"),
+    (("choro", "chorinho"), "choro"),
+    (("capoeira",), "capoeira"),
+    # base
     (("samba", "sambinha", "pagode", "batucada"), "samba"),
     (("bossa nova", "bossa", "mpb"), "bossa"),
-    (("rock and roll", "rock", "metal", "punk"), "rock"),
+    (("rock and roll", "rock", "punk"), "rock"),
     (("pop",), "pop"),
     (("funk carioca", "baile funk", "tamborzao", "funk"), "funk"),
     (("reggae", "raggae"), "reggae"),
@@ -999,8 +1174,8 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                 inst_ids.append(rid)
                 break
 
-    # lead monofônico (sax/flauta/etc.) toca melodia; senão o 1º harmônico
-    # vira lead DEDICADO (removido dos acordes) se houver outro para compor
+    # lead monofônico toca melodia; senão o 1º harmônico vira lead DEDICADO
+    # (se houver outro para compor os acordes)
     mono_lead = next((i for i in comp_ids if _monophonic(i)), None)
     if mono_lead:
         lead_id = mono_lead
@@ -1195,7 +1370,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         "progression_a": prog_a,
         "progression_b": prog_b,
         "files": {"midi": str(midi_path), "wav": str(wav_path) if wav_path else None},
-        "generator": "music_generator.py v4 (MidiComposer)",
+        "generator": "music_generator.py v5 (MidiComposer)",
     }
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1229,8 +1404,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--prompt", default="", help="prompt em português")
     p.add_argument("--style", default=None,
-                   help="rock, pop, samba, bossa, funk, reggae, trap, electronic, "
-                        "hiphop, jazz, ambient, cinematic, classical, folk, latin, forro")
+                   help="base: rock, pop, samba, bossa, funk, reggae, trap, electronic, "
+                        "hiphop, jazz, ambient, cinematic, classical, folk, latin, forro | "
+                        "v5: bossfight, chiptune, dungeon, breakcore, dnb, synthwave, "
+                        "disco, blues, metal, choro, capoeira")
     p.add_argument("--instruments", default=None,
                    help='lista separada por vírgula (ex.: "bateria,piano")')
     p.add_argument("--duration", type=float, default=30.0, help="duração em segundos")
