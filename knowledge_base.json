@@ -1,23 +1,155 @@
 {
   "samba": {
-    "bpm_range": [90, 130],
-    "scales": ["major", "minor"],
-    "instruments": ["cavaquinho", "pandeiro", "surdo", "agogo"],
+    "bpm_range": [
+      90,
+      130
+    ],
+    "scales": [
+      "major",
+      "minor"
+    ],
+    "instruments": [
+      "cavaquinho",
+      "pandeiro",
+      "surdo",
+      "agogo"
+    ],
     "rhythm": "syncopated",
     "energy": 0.8
   },
   "rock": {
-    "bpm_range": [110, 160],
-    "scales": ["minor", "pentatonic"],
-    "instruments": ["electric_guitar", "electric_bass", "kick", "snare"],
+    "bpm_range": [
+      110,
+      160
+    ],
+    "scales": [
+      "minor",
+      "pentatonic"
+    ],
+    "instruments": [
+      "electric_guitar",
+      "electric_bass",
+      "kick",
+      "snare"
+    ],
     "rhythm": "straight",
     "energy": 0.9
   },
   "cinematic": {
-    "bpm_range": [60, 100],
-    "scales": ["minor", "major"],
-    "instruments": ["violin", "cello", "piano", "timpani", "french_horn"],
+    "bpm_range": [
+      60,
+      100
+    ],
+    "scales": [
+      "minor",
+      "major"
+    ],
+    "instruments": [
+      "violin",
+      "cello",
+      "piano",
+      "timpani",
+      "french_horn"
+    ],
     "rhythm": "sustained",
     "energy": 0.6
+  },
+  "generic": {
+    "bpm_range": [
+      100,
+      130
+    ],
+    "scales": [
+      "major",
+      "minor"
+    ],
+    "instruments": [
+      "bass",
+      "pad",
+      "kick",
+      "piano",
+      "drums",
+      "synth"
+    ],
+    "rhythm": "varied",
+    "energy": 1.0,
+    "source": "suno-ai-music-dataset",
+    "sample_count": 50
+  },
+  "ambient": {
+    "bpm_range": [
+      100,
+      130
+    ],
+    "scales": [
+      "major",
+      "minor"
+    ],
+    "instruments": [
+      "bass",
+      "pad",
+      "kick",
+      "synth"
+    ],
+    "rhythm": "varied",
+    "energy": 1.0,
+    "source": "suno-ai-music-dataset",
+    "sample_count": 8
+  },
+  "jazz": {
+    "bpm_range": [
+      100,
+      130
+    ],
+    "scales": [
+      "major",
+      "minor"
+    ],
+    "instruments": [
+      "bass",
+      "drums",
+      "sax",
+      "piano",
+      "snare",
+      "trumpet"
+    ],
+    "rhythm": "varied",
+    "energy": 1.0,
+    "source": "suno-ai-music-dataset",
+    "sample_count": 36
+  },
+  "hiphop": {
+    "bpm_range": [
+      100,
+      130
+    ],
+    "scales": [
+      "major",
+      "minor"
+    ],
+    "instruments": [
+      "drums"
+    ],
+    "rhythm": "varied",
+    "energy": 1.0,
+    "source": "suno-ai-music-dataset",
+    "sample_count": 4
+  },
+  "pop": {
+    "bpm_range": [
+      100,
+      130
+    ],
+    "scales": [
+      "major",
+      "minor"
+    ],
+    "instruments": [
+      "drums"
+    ],
+    "rhythm": "varied",
+    "energy": 1.0,
+    "source": "suno-ai-music-dataset",
+    "sample_count": 2
   }
 }
