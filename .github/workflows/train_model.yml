@@ -11,20 +11,29 @@ on:
         description: 'Modo do dataset (suno, synthetic, mixed)'
         required: false
         default: 'mixed'
+      epochs:
+        description: 'Número de épocas'
+        required: false
+        default: '1000'
+      patience:
+        description: 'Épocas sem melhora antes do early stopping'
+        required: false
+        default: '50'
       force_redownload:
         description: 'Forçar novo download do dataset'
         required: false
         default: 'false'
 
+permissions:
+  contents: write   # ← ESSENCIAL: corrige o 403 no push
+
 jobs:
   train:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v4   # persiste o GITHUB_TOKEN no git por padrão
 
-    - name: Configurar Python
-      uses: actions/setup-python@v5
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
@@ -33,82 +42,61 @@ jobs:
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
 
     - name: Cache do dataset Hugging Face
+      id: dataset_cache        # ← id necessário para outputs.cache-hit existir
       uses: actions/cache@v4
       with:
         path: |
           datasets/hf_cache
           datasets/suno-ai-music-dataset
-        key: ${{ runner.os }}-suno-dataset-v1
-        restore-keys: |
-          ${{ runner.os }}-suno-dataset-
+        # Chave por volume de dados; se force_redownload, chave única por run
+        # (garante que o refresh também seja salvo no cache no fim do job)
+        key: ${{ runner.os }}-suno-${{ github.event.inputs.max_songs || '100' }}-${{ github.event.inputs.force_redownload == 'true' && github.run_id || 'v1' }}
 
-    - name: Cache de modelos treinados
+    - name: Cache de modelos treinados e memória
       uses: actions/cache@v4
       with:
         path: |
           models
           memory
-        key: ${{ runner.os }}-models-v1
+        # Chave ÚNICA por run (o cache só salva em key miss — com chave
+        # estática 'models-v1' o novo modelo nunca era salvo) + bump v2
+        # porque o schema de features mudou (10 → 17 dimensões)
+        key: ${{ runner.os }}-models-v2-${{ github.run_id }}
         restore-keys: |
-          ${{ runner.os }}-models-
+          ${{ runner.os }}-models-v2
 
     - name: Instalar dependências
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Verificar cache do dataset
-      id: dataset_check
-      run: |
-        if [ -f "datasets/suno-ai-music-dataset/metadata.json" ] && [ "${{ github.event.inputs.force_redownload }}" != "true" ]; then
-          echo "cached=true" >> $GITHUB_OUTPUT
-          echo "✓ Dataset encontrado no cache"
-        else
-          echo "cached=false" >> $GITHUB_OUTPUT
-          echo "Dataset não encontrado - será baixado"
-        fi
-
     - name: Baixar dataset (se não estiver em cache)
-      if: steps.dataset_check.outputs.cached == 'false'
+      if: steps.dataset_cache.outputs.cache-hit != 'true' || github.event.inputs.force_redownload == 'true'
       run: |
-        python download_dataset.py \
-          --max-songs ${{ github.event.inputs.max_songs }}
-
-    - name: Mostrar estatísticas do dataset
-      run: |
-        python download_dataset.py --stats-only
-
-    - name: Atualizar knowledge_base.json
-      run: |
-        python download_dataset.py --update-knowledge
+        python download_dataset.py --max-songs ${{ github.event.inputs.max_songs }}
 
     - name: Treinar modelo
       run: |
         python train.py \
           --dataset ${{ github.event.inputs.dataset_mode }} \
           --max-songs ${{ github.event.inputs.max_songs }} \
-          --epochs 20 \
+          --epochs ${{ github.event.inputs.epochs }} \
+          --patience ${{ github.event.inputs.patience }} \
           --batch-size 8
 
-    - name: Salvar artefatos de treinamento
-      uses: actions/upload-artifact@v4
-      with:
-        name: trained-model
-        path: |
-          models/
-          memory/
-          knowledge_base.json
-        if-no-files-found: warn
-
-    - name: Commit knowledge_base atualizado
+    - name: Commit e push dos resultados
       run: |
         git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
         git add knowledge_base.json
-        git diff --quiet && git diff --staged --quiet || \
-          git commit -m "chore: atualiza knowledge_base com dataset Suno" && \
+        # Se quiser o relatório de treino versionado (memory/ é gitignored):
+        # git add -f memory/training_report.json memory/training_history.json
+        if git diff --cached --quiet; then
+          echo "Nenhuma mudança para commitar."
+        else
+          git commit -m "chore: atualiza knowledge_base e modelo após treino"
+          git pull --rebase origin main
           git push
+        fi
