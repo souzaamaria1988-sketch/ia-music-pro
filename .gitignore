@@ -1,40 +1,192 @@
+# ============================================================================
 # Python
+# ============================================================================
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
 .Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
 *.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Ambientes virtuais
 venv/
 env/
-.venv/
+ENV/
+.venv
+env.bak/
+venv.bak/
 
+# Testes
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ============================================================================
+# Dataset Suno AI Music (muito grande para o GitHub)
+# ============================================================================
+datasets/
+!datasets/.gitkeep
+
+# Cache do Hugging Face (pode ser enorme)
+hf_cache/
+.cache/
+huggingface_cache/
+
+# ============================================================================
 # SoundFonts e áudio grandes
+# ============================================================================
 soundfonts/*
 !soundfonts/.gitkeep
 *.sf2
 *.sf3
+*.sfz
 samples/*.wav
 samples/*.mp3
+samples/*.flac
+samples/*.ogg
 uploads/*
 !uploads/.gitkeep
 
+# ============================================================================
 # Saídas geradas
-song_output/*.wav
-song_output/*.mp3
-memory/*.json
+# ============================================================================
+song_output/
+!song_output/.gitkeep
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.mid
+*.midi
 
-# Modelos treinados
-models/*.h5
-models/*.pt
-models/*.pth
+# ============================================================================
+# Memória e logs
+# ============================================================================
+memory/
+!memory/.gitkeep
+*.log
+logs/
 
-# Sensíveis
+# ============================================================================
+# Modelos treinados (grandes demais para o GitHub)
+# ============================================================================
+models/
+!models/.gitkeep
+*.h5
+*.pt
+*.pth
+*.onnx
+*.pb
+*.tflite
+checkpoints/
+*.ckpt
+
+# ============================================================================
+# Arquivos sensíveis
+# ============================================================================
 .env
+.env.local
+.env.*.local
 *.local
+config.local.py
+secrets.json
+credentials.json
+*.pem
+*.key
 
-# IDE
+# ============================================================================
+# Tokens e credenciais (NUNCA COMMITAR)
+# ============================================================================
+*_token*
+*_secret*
+*_password*
+*_api_key*
+github_token.txt
+gh_token.txt
+
+# ============================================================================
+# IDE e editores
+# ============================================================================
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+*.sublime-project
+*.sublime-workspace
+
+# ============================================================================
+# Sistema operacional
+# ============================================================================
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ============================================================================
+# Arquivos temporários
+# ============================================================================
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.old
+
+# ============================================================================
+# Node.js (se usar frontend)
+# ============================================================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# ============================================================================
+# GitHub Actions - artefatos locais
+# ============================================================================
+artifacts/
+*.artifact
+
+# ============================================================================
+# Ignorar tudo em pastas específicas, exceto .gitkeep
+# ============================================================================
+!*/.gitkeep
