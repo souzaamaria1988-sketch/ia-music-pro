@@ -5,63 +5,82 @@ on:
     inputs:
       prompt:
         description: 'Prompt em português'
-        required: true
-        default: 'música cinematográfica com piano e violino'
-      style:
-        description: 'Estilo musical'
         required: false
-        default: 'cinematic'
+        default: 'samba com cavaquinho, pandeiro e surdo'
+      style:
+        description: 'Estilo (vazio = detectar do prompt)'
+        required: false
+        default: ''
       duration:
         description: 'Duração em segundos'
         required: false
         default: '30'
-      use_soundfont:
-        description: 'Usar SoundFont'
+      seed:
+        description: 'Seed (vazio = aleatório)'
         required: false
-        default: 'false'
+        default: ''
+
+permissions:
+  contents: read
 
 jobs:
   generate:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Configurar Python
-      uses: actions/setup-python@v5
+
+    - uses: actions/setup-python@v5
       with:
         python-version: '3.11'
+
+    - name: Cache de dependências Python
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: ${{ runner.os }}-pip-
+
     - name: Instalar dependências
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-    - name: Instalar FluidSynth
-      run: sudo apt-get update && sudo apt-get install -y fluidsynth || true
-    - name: Verificar SoundFont
-      id: soundfont
+
+    - name: Instalar FluidSynth + SoundFont (para WAV de qualidade)
+      continue-on-error: true   # sem isso, o gerador usa fallback procedural
       run: |
-        if [ -f "soundfonts/default.sf2" ]; then
-          echo "exists=true" >> $GITHUB_OUTPUT
-        else
-          echo "exists=false" >> $GITHUB_OUTPUT
-        fi
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq fluidsynth fluid-soundfont-gm
+
+    - name: Sanidade da integração
+      run: |
+        python -c "from midi_composer import MidiComposer; print('MidiComposer OK')"
+        python -c "import real_instruments as ri; print(len(ri.INSTRUMENTS), 'instrumentos')"
+
     - name: Gerar música
+      env:
+        PROMPT: ${{ github.event.inputs.prompt }}
+        STYLE: ${{ github.event.inputs.style }}
+        DURATION: ${{ github.event.inputs.duration }}
+        SEED: ${{ github.event.inputs.seed }}
       run: |
-        SOUND_FLAG=""
-        if [ "${{ github.event.inputs.use_soundfont }}" == "true" ] && [ "${{ steps.soundfont.outputs.exists }}" == "true" ]; then
-          SOUND_FLAG="--soundfont soundfonts/default.sf2"
-        else
-          SOUND_FLAG="--no-soundfont"
-        fi
-        python music_generator.py \
-          --prompt "${{ github.event.inputs.prompt }}" \
-          --style "${{ github.event.inputs.style }}" \
-          --duration ${{ github.event.inputs.duration }} \
-          $SOUND_FLAG
-    - name: Publicar artefatos
+        ARGS=(--duration "${DURATION:-30}")
+        [ -n "$PROMPT" ] && ARGS+=(--prompt "$PROMPT")
+        [ -n "$STYLE" ] && ARGS+=(--style "$STYLE")
+        [ -n "$SEED" ]  && ARGS+=(--seed "$SEED")
+        python music_generator.py "${ARGS[@]}"
+
+    - name: Listar arquivos gerados (debug)
+      if: always()
+      run: find song_output -type f | sort
+
+    - name: Upload dos arquivos gerados
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: generated-music
+        name: musica-run-${{ github.run_number }}
         path: |
-          song_output/*.wav
-          song_output/*.mid
-          song_output/*.json
-        if-no-files-found: warn
+          song_output/**/*.mid
+          song_output/**/*.wav
+          song_output/**/*.json
+        if-no-files-found: error
+        retention-days: 30
