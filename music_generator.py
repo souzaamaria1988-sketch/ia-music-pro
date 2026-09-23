@@ -1,37 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-music_generator.py — Gerador principal do IA Music Pro (v5).
+music_generator.py — Gerador principal do IA Music Pro (v6).
 
-Integrado à API REAL do projeto:
-    * midi_composer.MidiComposer:
-        - MidiComposer(title, bpm, key="C", scale="major", style)
-        - add_track(instrument_id) -> int          (ValueError se desconhecido)
-        - add_note(idx, *, start, duration, pitch, velocity)  [SEGUNDOS]
-        - save_midi(path) -> bool  (False se mido faltar — CHECAR o retorno!)
-        - save_json(path)
-    * real_instruments.INSTRUMENTS (campos: display_name, channel,
-      midi_program, is_percussion, aliases)
+v6 — ANTI-REPETIÇÃO + BATERIA AUDÍVEL:
+    1. Melodia em FRASES de 4 compassos: pergunta (2) + resposta (2), com
+       compasso de respiro (silêncio) — cada bloco de 4 compassos recebe
+       frase nova ou variação. Fim do "mesmo compasso repetido 40x".
+    2. Ritmo dos acordes varia POR COMPASSO (25%); verso 1 e verso 2 usam
+       PROGRESSÕES DIFERENTES; turnaround (V) a cada 8 compassos; refrões
+       repetidos ganham +3 de intensidade; ponte a cada 3 ciclos da forma.
+    3. Baixo: fill walk-up (root-3ª-5ª-aproximação) no fim de cada grupo de 4.
+    4. Bateria: ghost notes e chimbal aberto ocasionais, por compasso.
+    5. RENDERIZADOR WAV EMBUTIDO (numpy + soundfile): percussão GM do canal 9
+       sintetizada de verdade (kick, caixa, chimbais, pratos, tons, agogô,
+       cuíca, triângulo...). Garante WAV com bateria AUDÍVEL mesmo sem
+       FluidSynth/soundfont_renderer. --no-soundfont força o embutido.
+    6. Bateria adicionada a choro (vassourinha) e capoeira (atabaque).
 
-v5 — 12 TEMAS NOVOS (28 estilos no total):
-    * games:     bossfight, chiptune, dungeon
-    * eletrônicos: breakcore, dnb, synthwave, disco
-    * raízes:    blues (12 compassos + shuffle), metal (double kick),
-                 choro, capoeira
-    * + instrumentos GM: square_lead (80), synth_bass (38)
-    * 'batalha', 'luta', 'guerra', 'chefe final' etc. agora detectam bossfight
-
-v4 — correções mantidas:
-    1. CATÁLOGO ESSENCIAL GARANTIDO (fim do "só piano / bateria não usa").
-    2. CLAMP DE PITCH em note() — ValueError nunca mais derruba o pipeline.
-    3. CANAIS ÚNICOS por instrumento melódico.
-    * Bateria: engine própria (pitches GM) + auditoria pós-geração.
-    * Seed aleatório por padrão (--seed N reproduz); parsing PT-BR tolerante.
-
-Uso:
-    python music_generator.py --prompt "música de bossfight épica" --duration 30
-    python music_generator.py --prompt "breakcore caótico" --duration 15
-    python music_generator.py --list-instruments
+v5: 28 estilos (bossfight, chiptune, dungeon, breakcore, dnb, synthwave,
+     disco, blues 12 compassos, metal double-kick, choro, capoeira...).
+v4: catálogo essencial garantido, clamp de pitch, canais únicos.
 """
 
 from __future__ import annotations
@@ -49,29 +38,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+try:
+    import numpy as _np  # usado apenas pelo renderizador WAV embutido
+except ImportError:
+    _np = None
+
 # --- catálogo de instrumentos ------------------------------------------------
 try:
     from real_instruments import INSTRUMENTS
     _RI_ERR: Optional[str] = None
-except ImportError as _exc:  # catálogo de emergência (só para --list-instruments)
+except ImportError as _exc:
     _RI_ERR = str(_exc)
     INSTRUMENTS = {
-        "piano":    {"display_name": "Piano", "channel": 0, "midi_program": 0,
-                     "is_percussion": False},
-        "violin":   {"display_name": "Violino", "channel": 7, "midi_program": 40,
-                     "is_percussion": False},
-        "cello":    {"display_name": "Violoncelo", "channel": 8, "midi_program": 42,
-                     "is_percussion": False},
+        "piano":  {"display_name": "Piano", "channel": 0, "midi_program": 0,
+                   "is_percussion": False},
+        "violin": {"display_name": "Violino", "channel": 7, "midi_program": 40,
+                   "is_percussion": False},
+        "cello":  {"display_name": "Violoncelo", "channel": 8, "midi_program": 42,
+                   "is_percussion": False},
     }
 
-# =============================================================================
-# INSTRUMENTOS ESSENCIAIS (garantia mínima) — v4, CORREÇÃO 1
-# =============================================================================
-# setdefault() NÃO sobrescreve entradas existentes: o real_instruments.py
-# continua sendo a fonte da verdade; isto é uma rede de segurança.
-# DEVE ficar antes de _build_catalog_index() (executado no import).
+# --- instrumentos essenciais (rede de segurança; não sobrescreve o catálogo) --
 _ESSENTIAL_INSTRUMENTS: Dict[str, Dict[str, Any]] = {
-    # melódicos
     "bass":            {"display_name": "Baixo", "channel": 3, "midi_program": 33,
                         "is_percussion": False, "aliases": ["baixo", "contrabaixo"]},
     "acoustic_guitar": {"display_name": "Violão", "channel": 1, "midi_program": 24,
@@ -98,7 +86,7 @@ _ESSENTIAL_INSTRUMENTS: Dict[str, Dict[str, Any]] = {
                         "is_percussion": False, "aliases": ["flauta"]},
     "trumpet":         {"display_name": "Trompete", "channel": 11, "midi_program": 56,
                         "is_percussion": False, "aliases": ["trompete"]},
-    "saxophone":        {"display_name": "Saxofone", "channel": 15, "midi_program": 65,
+    "saxophone":       {"display_name": "Saxofone", "channel": 15, "midi_program": 65,
                         "is_percussion": False, "aliases": ["sax", "saxofone"]},
     # percussão — canal 9 (GM)
     "drums":     {"display_name": "Bateria", "channel": 9, "is_percussion": True,
@@ -121,7 +109,6 @@ _ESSENTIAL_INSTRUMENTS: Dict[str, Dict[str, Any]] = {
 for _id, _entry in _ESSENTIAL_INSTRUMENTS.items():
     INSTRUMENTS.setdefault(_id, _entry)
 
-# v5: instrumentos dos novos temas
 INSTRUMENTS.setdefault("square_lead",
     {"display_name": "Square Lead", "channel": 0, "midi_program": 80,
      "is_percussion": False, "aliases": ["chiptune lead", "8bit lead"]})
@@ -136,7 +123,7 @@ except ImportError as _exc2:
     MidiComposer = None
     _MIDI_COMPOSER_ERR = str(_exc2)
 
-# --- renderizador de áudio (API ainda não confirmada → probe por nome) -------
+# --- renderizador externo (opcional; embutido é o fallback garantido) -------
 _RENDERER = None
 try:
     import soundfont_renderer as _sr
@@ -173,11 +160,10 @@ GM: Dict[str, int] = {
     "agogo_hi": 67, "agogo_lo": 68, "cabasa": 69, "shaker": 70, "maracas": 70,
     "guiro": 74, "claves": 75, "wood_hi": 76, "wood_lo": 77, "cuica": 78,
     "triangle": 80, "timpani": 41, "whistle": 72,
-    # aproximações GM para percussão brasileira
     "surdo": 36, "tamborim": 76, "pandeiro": 54, "reco": 74, "reco_reco": 74,
     "chocalho": 70, "berimbau": 47, "agogo": 67, "conga": 63,
 }
-DRUM_DUR: Dict[str, float] = {  # segundos (pratos precisam de cauda!)
+DRUM_DUR: Dict[str, float] = {
     "crash": 0.9, "ride": 0.7, "hh_open": 0.3, "timpani": 0.55,
     "guiro": 0.2, "reco": 0.2, "cuica": 0.25, "triangle": 0.2,
     "agogo_hi": 0.15, "agogo_lo": 0.15,
@@ -195,12 +181,10 @@ def _strip_accents(text: str) -> str:
 
 
 def _norm(text: str) -> str:
-    """minúsculas, sem acentos, só letras/números/espaços."""
     return re.sub(r"[^a-z0-9 ]", " ", _strip_accents(str(text).lower())).strip()
 
 
 def _build_catalog_index() -> Dict[str, str]:
-    """Índice nome-normalizado -> id, usando id + display_name + aliases."""
     index: Dict[str, str] = {}
     for key, entry in INSTRUMENTS.items():
         names = [key, str(entry.get("display_name") or entry.get("name") or "")]
@@ -213,7 +197,6 @@ def _build_catalog_index() -> Dict[str, str]:
 
 _CAT_INDEX = _build_catalog_index()
 
-# (palavras PT/EN normalizadas, ids candidatos em ordem de preferência)
 _CONCEPTS: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = [
     (("bateria", "tambor", "drums", "drum", "kit", "baterista", "percussao"), ("drums",)),
     (("violao", "nylon guitar", "acoustic guitar", "guitarra acustica"),
@@ -254,7 +237,6 @@ _CONCEPTS: List[Tuple[Tuple[str, ...], Tuple[str, ...]]] = [
 
 
 def _resolve_id(candidates: Sequence[str]) -> Optional[str]:
-    """Tenta id direto, depois nome de exibição/alias no catálogo."""
     for c in candidates:
         if c in INSTRUMENTS:
             return c
@@ -303,7 +285,7 @@ def parse_instruments_from_text(text: str) -> List[str]:
     tokens = _norm(text).split()
     bigrams = [" ".join(tokens[i:i + 2]) for i in range(len(tokens) - 1)]
     found: List[str] = []
-    for phrase in bigrams + tokens:  # bigramas primeiro ("reco reco")
+    for phrase in bigrams + tokens:
         rid = find_instrument(phrase)
         if rid and rid not in found:
             found.append(rid)
@@ -379,7 +361,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
     "forro":      dict(bpm=(125, 150), scale="mixolydian", swing=0.0,
                        instruments=[("accordion", "sanfona", "acordeon", "acordeao"),
                                     ("bass", "baixo"), ("drums",)]),
-    # --- v5: games ---------------------------------------------------------------
+    # --- games -------------------------------------------------------------------
     "bossfight":  dict(bpm=(142, 165), scale="harmonic_minor", swing=0.0,
                        instruments=[("strings", "cordas"), ("trumpet", "trompete"),
                                     ("piano",), ("drums",)]),
@@ -388,7 +370,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
                                     ("synth_bass", "synth bass"), ("drums",)]),
     "dungeon":    dict(bpm=(50, 70), scale="harmonic_minor", swing=0.0,
                        instruments=[("strings", "cordas"), ("piano",)]),
-    # --- v5: eletrônicos -----------------------------------------------------------
+    # --- eletrônicos ----------------------------------------------------------------
     "breakcore":  dict(bpm=(170, 200), scale="minor", swing=0.0,
                        instruments=[("synth_lead", "sintetizador"), ("synth_pad", "pad"),
                                     ("bass", "baixo"), ("drums",)]),
@@ -403,7 +385,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
                        instruments=[("electric_piano", "piano"),
                                     ("synth_pad", "pad", "strings", "cordas"),
                                     ("bass", "baixo"), ("drums",)]),
-    # --- v5: raízes ---------------------------------------------------------------
+    # --- raízes -------------------------------------------------------------------
     "blues":      dict(bpm=(72, 100), scale="blues", swing=0.12, sevenths=True,
                        instruments=[("electric_guitar", "guitarra", "acoustic_guitar", "violao"),
                                     ("organ", "orgao"), ("bass", "baixo"), ("drums",)]),
@@ -412,23 +394,20 @@ STYLES: Dict[str, Dict[str, Any]] = {
                                     ("bass", "baixo"), ("drums",)]),
     "choro":      dict(bpm=(110, 150), scale="major", swing=0.0, sevenths=True,
                        instruments=[("cavaquinho", "cavaco"), ("flute", "flauta"),
-                                    ("pandeiro",)]),
+                                    ("pandeiro",), ("drums",)]),   # v6: + bateria (vassourinha)
     "capoeira":   dict(bpm=(122, 138), scale="mixolydian", swing=0.0,
                        instruments=[("acoustic_guitar", "violao"), ("berimbau",),
-                                    ("conga", "congas"), ("agogo",), ("pandeiro",)]),
+                                    ("conga", "congas"), ("agogo",), ("pandeiro",),
+                                    ("drums",)]),                   # v6: + atabaque
 }
 NO_DRUMS_STYLES = {"ambient", "classical", "dungeon"}
 AUTO_BASS_STYLES = {"pop", "rock", "funk", "reggae", "trap", "electronic",
                     "hiphop", "jazz", "bossa", "latin", "forro", "samba",
-                    "cinematic",
-                    # v5
-                    "bossfight", "chiptune", "breakcore", "dnb", "synthwave",
-                    "disco", "blues", "metal", "choro", "dungeon"}
+                    "cinematic", "bossfight", "chiptune", "breakcore", "dnb",
+                    "synthwave", "disco", "blues", "metal", "choro", "dungeon"}
 CRASH_STYLES = {"rock", "pop", "electronic", "funk", "trap", "cinematic", "latin",
-                # v5
                 "bossfight", "metal", "breakcore", "disco"}
 
-# Progressões por GRAU da escala (0 = tônica)
 PROGRESSIONS: Dict[str, List[List[int]]] = {
     "pop":        [[0, 4, 5, 3], [0, 5, 3, 4], [5, 3, 0, 4], [0, 4, 5, 4]],
     "rock":       [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 3, 4], [5, 3, 0, 4]],
@@ -439,28 +418,26 @@ PROGRESSIONS: Dict[str, List[List[int]]] = {
     "trap":       [[0, 5, 3, 4], [5, 3, 0, 4], [0, 5, 0, 4]],
     "electronic": [[0, 5, 3, 4], [5, 3, 0, 4], [0, 3, 5, 4]],
     "hiphop":     [[0, 3, 4, 3], [0, 5, 1, 4], [1, 4, 0, 0]],
-    "jazz":       [[1, 4, 0, 0], [1, 4, 0, 3], [0, 3, 6, 2]],   # ii-V-I
+    "jazz":       [[1, 4, 0, 0], [1, 4, 0, 3], [0, 3, 6, 2]],
     "ambient":    [[0, 3, 0, 4], [0, 4, 3, 0], [0, 3, 5, 4]],
     "cinematic":  [[0, 5, 3, 4], [0, 3, 5, 4], [0, 5, 1, 4]],
     "classical":  [[0, 4, 5, 3], [0, 3, 4, 0], [0, 4, 0, 4]],
     "folk":       [[0, 3, 4, 3], [0, 4, 5, 3], [0, 3, 0, 4]],
     "latin":      [[0, 3, 4, 3], [0, 4, 3, 4], [1, 4, 0, 0]],
     "forro":      [[0, 3, 0, 4], [0, 4, 3, 4], [0, 3, 4, 0]],
-    # v5
-    "bossfight":  [[0, 5, 3, 4], [0, 1, 4, 0], [0, 3, 0, 4]],   # grau bII = ameaça épica
+    "bossfight":  [[0, 5, 3, 4], [0, 1, 4, 0], [0, 3, 0, 4]],
     "chiptune":   [[0, 4, 5, 3], [0, 3, 4, 4], [0, 5, 3, 4], [5, 3, 0, 4]],
     "dungeon":    [[0, 3, 5, 4], [0, 5, 3, 0], [0, 1, 0, 4]],
     "breakcore":  [[0, 5, 3, 4], [0, 3, 4, 3], [5, 3, 0, 4]],
     "dnb":        [[0, 5, 3, 4], [0, 3, 0, 4], [5, 3, 0, 4]],
     "synthwave":  [[0, 5, 3, 4], [5, 3, 0, 4], [0, 3, 5, 4]],
     "disco":      [[0, 5, 3, 4], [0, 3, 4, 3], [0, 4, 5, 3]],
-    "blues":      [[0, 0, 0, 0, 3, 3, 0, 0, 4, 3, 0, 4]],  # 12 compassos: I-I-I-I / IV-IV-I-I / V-IV-I-V
+    "blues":      [[0, 0, 0, 0, 3, 3, 0, 0, 4, 3, 0, 4]],  # 12 compassos
     "metal":      [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 5, 4]],
     "choro":      [[1, 4, 0, 0], [2, 5, 1, 4], [0, 4, 1, 4]],
     "capoeira":   [[0, 3, 0, 4], [0, 4, 3, 4], [0, 0, 3, 4]],
 }
 
-# (posição em tempos, tipo de nota, duração em tempos)
 BASS_PATTERNS: Dict[str, List[Tuple[float, str, float]]] = {
     "rock":       [(i * 0.5, "root" if i != 5 else "fifth", 0.45) for i in range(8)],
     "pop":        [(0.0, "root", 0.9), (1.5, "root", 0.4), (2.0, "fifth", 0.9), (3.5, "root", 0.4)],
@@ -479,15 +456,14 @@ BASS_PATTERNS: Dict[str, List[Tuple[float, str, float]]] = {
     "folk":       [(0.0, "root", 1.9), (2.0, "fifth", 1.9)],
     "latin":      [(0.0, "root", 0.9), (1.5, "root", 0.4), (2.5, "root", 0.9), (3.5, "fifth", 0.4)],
     "forro":      [(0.0, "root", 0.7), (1.75, "root", 0.3), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
-    # v5
     "bossfight":  [(i * 0.5, "root" if i not in (3, 7) else "fifth", 0.45) for i in range(8)],
     "chiptune":   [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.4) for i in range(8)],
-    "dungeon":    [(0.0, "root", 3.8)],                                  # drone grave
+    "dungeon":    [(0.0, "root", 3.8)],
     "breakcore":  [(0.0, "root", 0.2), (0.75, "root", 0.2), (1.5, "octave", 0.2),
                    (2.25, "root", 0.2), (3.0, "fifth", 0.2), (3.5, "octave", 0.2)],
-    "dnb":        [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.45) for i in range(8)],  # rolling
+    "dnb":        [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.45) for i in range(8)],
     "synthwave":  [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.42) for i in range(8)],
-    "disco":      [(i * 0.25, "root" if i % 2 == 0 else "octave", 0.22) for i in range(16)],  # oitavas 16avos
+    "disco":      [(i * 0.25, "root" if i % 2 == 0 else "octave", 0.22) for i in range(16)],
     "blues":      [(0.0, "root", 0.9), (1.0, "fifth", 0.9), (2.0, "root", 0.9), (3.0, "approach", 0.9)],
     "metal":      [(i * 0.5, "root", 0.45) for i in range(8)],
     "choro":      [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
@@ -499,9 +475,9 @@ COMP_RHYTHMS: Dict[str, List[List[float]]] = {
     "rock":       [[0.0, 2.0], [0.0, 2.0, 3.5], [0.0, 1.5, 2.0, 3.0]],
     "samba":      [[0.0, 1.75, 2.5, 3.25], [0.75, 1.5, 2.25, 3.0, 3.75], [0.0, 0.75, 2.0, 2.75]],
     "bossa":      [[0.0, 0.75, 2.0, 2.75], [0.0, 1.5, 2.5], [0.75, 1.5, 2.0, 2.75, 3.5]],
-    "jazz":       [[0.0, 1.5], [1.5], [0.0], [2.5, 3.5]],   # charleston & cia
+    "jazz":       [[0.0, 1.5], [1.5], [0.0], [2.5, 3.5]],
     "funk":       [[0.0, 0.75, 1.5, 2.25, 3.0], [0.0, 1.5, 2.5, 3.25]],
-    "reggae":     [[0.5, 1.5, 2.5, 3.5]],                    # skank no contratempo
+    "reggae":     [[0.5, 1.5, 2.5, 3.5]],
     "trap":       [[0.0], [0.0, 2.5]],
     "electronic": [[0.0], [0.0, 1.5, 3.5]],
     "hiphop":     [[0.0, 2.5], [0.0, 1.75, 3.25]],
@@ -511,17 +487,16 @@ COMP_RHYTHMS: Dict[str, List[List[float]]] = {
     "folk":       [[0.0, 2.0], [0.0, 1.0, 2.0, 3.0]],
     "latin":      [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
     "forro":      [[0.0, 0.75, 2.0, 2.75], [0.0, 1.5, 2.0, 3.5]],
-    # v5
-    "bossfight":  [[0.0, 1.5, 2.0, 3.5], [0.0, 0.75, 2.0, 2.75]],           # stabs marciais
-    "chiptune":   [[i * 0.25 for i in range(16)]],                          # arpejo em 16avos
+    "bossfight":  [[0.0, 1.5, 2.0, 3.5], [0.0, 0.75, 2.0, 2.75]],
+    "chiptune":   [[i * 0.25 for i in range(16)]],
     "dungeon":    [[0.0]],
     "breakcore":  [[0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
     "dnb":        [[0.0, 2.5], [0.0, 1.75, 3.25]],
     "synthwave":  [[0.0, 1.5, 2.5], [0.0, 0.75, 2.0, 2.75]],
-    "disco":      [[0.5, 1.5, 2.5, 3.5], [0.5, 1.5, 2.0, 3.5]],             # stabs no contratempo
-    "blues":      [[0.0, 1.0, 2.0, 3.0]],                                   # shuffle via swing
-    "metal":      [[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]],               # power chords 8avos
-    "choro":      [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.75, 1.5, 2.25, 3.0, 3.75]],  # paradigma
+    "disco":      [[0.5, 1.5, 2.5, 3.5], [0.5, 1.5, 2.0, 3.5]],
+    "blues":      [[0.0, 1.0, 2.0, 3.0]],
+    "metal":      [[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]],
+    "choro":      [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.75, 1.5, 2.25, 3.0, 3.75]],
     "capoeira":   [[0.0, 0.75, 1.5, 2.25, 3.0], [0.0, 1.5, 2.0, 3.5]],
 }
 
@@ -548,7 +523,6 @@ SONG_FORMS: Dict[str, List[Tuple[str, int]]] = {
     "cinematic":  [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
                    ("refrao", 4), ("ponte", 2), ("refrao", 4), ("outro", 2)],
     "ambient":    [("verso", 4), ("verso", 4), ("verso", 4)],
-    # v5
     "bossfight":  [("intro", 2), ("verso", 4), ("refrao", 4), ("ponte", 2),
                    ("solo", 4), ("refrao", 4)],
     "chiptune":   [("intro", 2), ("refrao", 4), ("verso", 4), ("refrao", 4),
@@ -588,48 +562,48 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
         if bar % 2 == 1:
             p.append((3.75, "hh_open", 64))
     elif style == "samba":
-        p = [(1.0, "kick", 102), (3.0, "kick", 96)]                       # surdo: 2 e 4
-        p += [(i * 0.25, "tamborim", [78, 52, 66, 52][i % 4]) for i in range(16)]  # teleco-teco
+        p = [(1.0, "kick", 102), (3.0, "kick", 96)]
+        p += [(i * 0.25, "tamborim", [78, 52, 66, 52][i % 4]) for i in range(16)]
         p += [(0.0, "agogo_hi", 82), (0.75, "agogo_lo", 72), (1.5, "agogo_hi", 76),
               (2.0, "agogo_hi", 82), (2.75, "agogo_lo", 72), (3.5, "agogo_hi", 76)]
         p += [(i * 0.25, "shaker", 56 if i % 2 == 0 else 66) for i in range(16)]
-        p += [(0.5, "snare", 44), (2.5, "snare", 42)]                    # caixa fantasma
+        p += [(0.5, "snare", 44), (2.5, "snare", 42)]
     elif style == "bossa":
         p = [(0.0, "kick", 78), (0.75, "kick", 58), (2.0, "kick", 78), (2.75, "kick", 58)]
         p += [(1.0, "rim", 70), (3.0, "rim", 70)]
         p += [(i * 0.5, "hh_closed", 64 if i % 2 == 0 else 52) for i in range(8)]
-    elif style == "funk":  # funk carioca (tamborzão aproximado)
+    elif style == "funk":
         p = [(0.0, "kick", 105), (1.75, "kick", 92), (2.25, "kick", 100),
              (1.0, "clap", 96), (3.0, "clap", 98)]
         if bar % 2 == 1:
             p.append((3.5, "kick", 88))
         p += [(i * 0.25, "hh_closed", [58, 40, 50, 40][i % 4]) for i in range(16)]
-    elif style == "reggae":  # one drop
+    elif style == "reggae":
         p = [(2.0, "kick", 100), (2.0, "rim", 88)]
         if bar % 2 == 1:
             p.append((3.75, "kick", 68))
         p += [(i * 0.5, "hh_closed", 66 if i % 2 == 0 else 50) for i in range(8)]
-    elif style == "trap":  # half-time
+    elif style == "trap":
         p = [(0.0, "kick", 106), (1.75, "kick", 94), (2.0, "snare", 100)]
         if bar % 4 == 2:
             p.append((3.5, "kick", 90))
         p += [(i * 0.25, "hh_closed", [82, 48, 64, 48][i % 4]) for i in range(16)]
         if bar % 4 == 3 and rng.random() < 0.5:
-            p += [(3.0 + i * 0.125, "hh_closed", 60) for i in range(8)]   # roll
-    elif style == "electronic":  # four-on-the-floor
+            p += [(3.0 + i * 0.125, "hh_closed", 60) for i in range(8)]
+    elif style == "electronic":
         p = [(b, "kick", 100) for b in range(4)]
         p += [(1.0, "clap", 88), (3.0, "clap", 88)]
         p += [(b + 0.5, "hh_open", 70) for b in range(4)]
-    elif style == "hiphop":  # boom bap
+    elif style == "hiphop":
         p = [(0.0, "kick", 102), (2.5, "kick", 96), (1.0, "snare", 98), (3.0, "snare", 98)]
         p += [(i * 0.5, "hh_closed", 70 if i % 2 == 0 else 54) for i in range(8)]
-    elif style == "jazz":  # ride com swing aplicado na escrita
+    elif style == "jazz":
         p = [(i * 0.5, "ride", 74 if i % 2 == 0 else 58) for i in range(8)]
         p += [(1.0, "hh_pedal", 64), (3.0, "hh_pedal", 64)]
-        p += [(0.0, "kick", 34), (2.0, "kick", 30)]                      # feathering
+        p += [(0.0, "kick", 34), (2.0, "kick", 30)]
         if rng.random() < 0.4:
-            p.append((rng.choice([1.5, 2.5, 3.5]), "snare", 48))         # comping
-    elif style == "latin":  # tumbao + clave son 3-2
+            p.append((rng.choice([1.5, 2.5, 3.5]), "snare", 48))
+    elif style == "latin":
         p = [(0.5, "conga_low", 70), (1.5, "conga_open", 84), (2.5, "conga_low", 70),
              (3.5, "conga_open", 88), (3.75, "conga_slap", 74)]
         if bar % 2 == 0:
@@ -641,15 +615,20 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
         p = [(0.0, "timpani", 92), (2.0, "timpani", 84)]
         if bar % 4 == 0:
             p.append((0.0, "crash", 88))
-    elif style == "forro":  # zabumba + triângulo (baião)
+    elif style == "forro":
         p = [(0.0, "kick", 100), (2.0, "kick", 94), (1.5, "snare", 56), (3.5, "snare", 58)]
         p += [(i * 0.5, "triangle", 62) for i in range(8)]
     elif style == "folk":
         p = [(1.0, "tambourine", 62), (3.0, "tambourine", 60)]
         if rng.random() < 0.3:
             p.append((0.0, "kick", 58))
-    # --- v5: novos temas -------------------------------------------------------
-    elif style == "bossfight":  # marcha épica + rolo de caixa crescente
+    elif style == "choro":  # v6: vassourinha — levada leve de rim
+        p = [(0.0, "kick", 60), (2.0, "kick", 54)]
+        p += [(i * 0.5, "rim", 48 if i % 2 == 0 else 38) for i in range(8)]
+    elif style == "capoeira":  # v6: atabaque
+        p = [(0.0, "conga_low", 88), (1.0, "conga_low", 66), (1.5, "conga_open", 74),
+             (2.0, "conga_low", 88), (3.0, "conga_low", 66), (3.5, "conga_open", 74)]
+    elif style == "bossfight":
         p = [(b, "kick", 104) for b in range(4)]
         p += [(1.0, "snare", 98), (3.0, "snare", 100)]
         p += [(0.5, "snare", 56), (1.5, "snare", 60), (2.5, "snare", 64),
@@ -657,46 +636,46 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
         p += [(0.0, "timpani", 96), (2.0, "timpani", 90)]
         if bar % 4 == 0:
             p.append((0.0, "crash", 94))
-    elif style == "chiptune":  # bateria 8-bit minimalista
+    elif style == "chiptune":
         p = [(0.0, "kick", 88), (2.0, "kick", 84), (1.0, "snare", 86), (3.0, "snare", 88)]
         p += [(i * 0.5, "hh_closed", [72, 38, 54, 38][i % 4]) for i in range(8)]
-    elif style == "breakcore":  # amen break picotado
+    elif style == "breakcore":
         p = [(0.0, "kick", 104), (1.0, "snare", 100), (2.0, "snare", 98),
              (2.5, "kick", 96), (3.0, "snare", 100)]
-        if bar % 2 == 1:  # chop no compasso ímpar
+        if bar % 2 == 1:
             p += [(0.75, "snare", 84), (1.5, "kick", 88), (1.75, "snare", 80),
                   (3.25, "snare", 90), (3.5, "snare", 96), (3.75, "snare", 102)]
         p += [(i * 0.25, "hh_closed", [72, 40, 58, 40][i % 4]) for i in range(16)]
         if bar % 4 == 3:
             p += [(3.0 + i * 0.125, "snare", 50 + 6 * i) for i in range(8)]
-    elif style == "dnb":  # two-step clássico
+    elif style == "dnb":
         p = [(0.0, "kick", 104), (2.5, "kick", 96), (2.0, "snare", 102),
              (3.75, "snare", 66)]
         p += [(i * 0.5, "hh_closed", 68 if i % 2 == 0 else 50) for i in range(8)]
         p.append((1.5, "hh_open", 58))
-    elif style == "synthwave":  # gated snare + open hats no contratempo
+    elif style == "synthwave":
         p = [(0.0, "kick", 98), (1.0, "snare", 94), (2.0, "kick", 94), (3.0, "snare", 96)]
         p += [(b + 0.5, "hh_open", 62) for b in range(4)]
         if bar % 4 == 3:
             p.append((3.5, "tom_high", 70))
-    elif style == "disco":  # four-on-the-floor + open hat no contratempo
+    elif style == "disco":
         p = [(b, "kick", 100) for b in range(4)]
         p += [(1.0, "snare", 90), (3.0, "snare", 92)]
         p += [(b + 0.5, "hh_open", 74) for b in range(4)]
-    elif style == "blues":  # shuffle (o swing do estilo balança os 8avos)
+    elif style == "blues":
         p = [(0.0, "kick", 96), (2.0, "kick", 90), (1.0, "snare", 88), (3.0, "snare", 90)]
         p += [(i * 0.5, "ride", 66 if i % 2 == 0 else 52) for i in range(8)]
-    elif style == "metal":  # double kick alternando com 8avos
+    elif style == "metal":
         kick_pos = [i * 0.5 for i in range(8)]
         if bar % 2 == 1:
-            kick_pos = [i * 0.25 for i in range(16)]  # double kick em 16avos
+            kick_pos = [i * 0.25 for i in range(16)]
         p = [(k, "kick", 92) for k in kick_pos]
         p += [(1.0, "snare", 102), (3.0, "snare", 104)]
         p += [(i * 0.5, "ride", 70 if i % 2 == 0 else 56) for i in range(8)]
         if bar % 4 == 0:
             p.append((0.0, "crash", 100))
     elif style == "dungeon":
-        p = []  # silêncio e tensão
+        p = []
     elif style in ("ambient", "classical"):
         p = []
     else:
@@ -705,7 +684,6 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
 
 
 def _fill(style: str, rng: random.Random) -> List[Tuple[float, str, int]]:
-    # v5
     if style == "bossfight":
         return [(2.0, "snare", 60), (2.25, "snare", 68), (2.5, "snare", 76),
                 (2.75, "snare", 84), (3.0, "snare", 92), (3.25, "snare", 98),
@@ -722,12 +700,11 @@ def _fill(style: str, rng: random.Random) -> List[Tuple[float, str, int]]:
     if style == "chiptune":
         return [(2.5 + i * 0.125, "tom_high" if i % 2 == 0 else "snare", 60 + 4 * i)
                 for i in range(12)]
-    # base
     if style in ("rock", "pop", "electronic", "folk"):
         seq = ["snare", "snare", "tom_high", "tom_high",
                "tom_mid", "tom_mid", "tom_low", "tom_low"]
         return [(2.0 + 0.25 * i, seq[i], 78 + 5 * i) for i in range(8)]
-    if style in ("samba", "bossa", "forro", "latin"):
+    if style in ("samba", "bossa", "forro", "latin", "choro", "capoeira"):
         return [(2.5, "tamborim", 72), (2.75, "tamborim", 78), (3.0, "agogo_hi", 80),
                 (3.25, "tamborim", 76), (3.5, "agogo_hi", 82), (3.75, "agogo_lo", 76)]
     if style in ("trap", "hiphop", "funk"):
@@ -742,7 +719,6 @@ def _fill(style: str, rng: random.Random) -> List[Tuple[float, str, int]]:
     return []
 
 
-# Padrões por instrumento de percussão individual: velocity por 16avo (0 = pausa)
 PERC_16: Dict[str, Tuple[List[int], bool]] = {
     "pandeiro":   ([92, 0, 52, 68, 80, 0, 52, 68, 88, 0, 52, 68, 80, 0, 52, 72], False),
     "surdo":      ([0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 0, 0, 92, 0, 0, 0], False),
@@ -787,7 +763,6 @@ def _chord_offsets(scale: List[int], degree: int, add7: bool) -> List[int]:
 
 def _voice_chord(prev: Optional[List[int]], offsets: List[int],
                  root_midi: int, center: int = 62) -> List[int]:
-    """Voice leading: cada nota na oitava mais próxima da anterior."""
     voiced: List[int] = []
     for j, off in enumerate(offsets):
         target = prev[j % len(prev)] if prev else center
@@ -797,7 +772,7 @@ def _voice_chord(prev: Optional[List[int]], offsets: List[int],
         while pitch > target + 6:
             pitch -= 12
         voiced.append(pitch)
-    return sorted(set(min(127, max(0, p)) for p in voiced))   # defesa extra
+    return sorted(set(min(127, max(0, p)) for p in voiced))
 
 
 def _scale_pitch(root_midi: int, scale: List[int], idx: int) -> int:
@@ -825,7 +800,7 @@ def _bass_pitch(kind: str, root_abs: int, next_root_abs: int,
         p = root_abs + (3 if interval == 3 else 4)
     elif kind == "octave":
         p = root_abs + 12
-    elif kind == "approach":  # cromático que resolve na root seguinte
+    elif kind == "approach":
         p = next_root_abs - 1 if next_root_abs >= root_abs else next_root_abs + 1
     else:
         p = root_abs
@@ -833,23 +808,23 @@ def _bass_pitch(kind: str, root_abs: int, next_root_abs: int,
         p += 12
     while p > 50:
         p -= 12
-    if style == "trap" and p >= 33:  # 808 mais grave
+    if style == "trap" and p >= 33:
         p -= 12
     return p
 
 
 def _monophonic(inst_id: str) -> bool:
-    # v5: "square_lead" incluído — chiptune: arpejo e melodia NÃO colidem
     return any(m in inst_id for m in
                ("sax", "trumpet", "flute", "clarinet", "violin", "trombone",
                 "synth_lead", "square_lead"))
 
 
 # =============================================================================
-# MOTIVOS (melodia)
+# MOTIVOS E FRASES (v6: melodia em frases de 4 compassos)
 # =============================================================================
 
-def _new_motif(rng: random.Random, temperature: float, dense: bool):
+def _new_motif(rng: random.Random, dense: bool):
+    """Um compasso de melodia: lista de ((pos, dur), grau)."""
     cells = RHYTHM_CELLS_DENSE if (dense and rng.random() < 0.7) else RHYTHM_CELLS_SPARSE
     cell = list(rng.choice(cells))
     steps = [rng.choice([0, 2, 4])]
@@ -871,13 +846,34 @@ def _vary_motif(motif, rng: random.Random):
     return varied
 
 
+def _new_phrase(rng: random.Random, dense: bool) -> Dict[int, list]:
+    """Frase de 4 compassos: pergunta (0-1) + resposta (2) + respiro/variação (3).
+
+    Anti-repetição: o compasso 3 frequentemente DESCANSA (None) — a melodia
+    respira em vez de martelar todos os compassos iguais.
+    """
+    a = _new_motif(rng, dense)
+    rep = _vary_motif(a, rng) if rng.random() < 0.6 else [((p, d), s) for (p, d), s in a]
+    if rng.random() < 0.35:  # repete com contorno invertido
+        rep = [((p, d), max(-3, min(9, 4 - s))) for (p, d), s in rep]
+    answer = _new_motif(rng, dense)
+    if rng.random() < 0.5:  # resposta mais grave (pergunta-aguda, resposta-grave)
+        answer = [((p, d), max(-3, min(9, s - 2))) for (p, d), s in answer]
+    phrase: Dict[int, list] = {0: a, 1: rep, 2: answer}
+    phrase[3] = None if rng.random() < 0.55 else _vary_motif(answer, rng)
+    return phrase
+
+
+def _vary_phrase(phrase: Dict[int, list], rng: random.Random) -> Dict[int, list]:
+    return {k: (_vary_motif(v, rng) if v is not None and rng.random() < 0.6 else v)
+            for k, v in phrase.items()}
+
+
 # =============================================================================
 # DETECÇÃO NO PROMPT (PT-BR)
 # =============================================================================
 
 _STYLE_MAP: List[Tuple[Tuple[str, ...], str]] = [
-    # v5 — novos temas (detect_style() ordena por tamanho: nomes compostos e
-    # aliases longos ganham de palavras curtas; "bossa" vence "boss", etc.)
     (("boss fight", "bossfight", "chefe final", "batalha de chefe", "batalha",
       "luta", "guerra", "battle", "boss"), "bossfight"),
     (("chiptune", "chip tune", "8bit", "8 bits", "8 bit", "video game",
@@ -893,7 +889,6 @@ _STYLE_MAP: List[Tuple[Tuple[str, ...], str]] = [
     (("metal", "heavy metal", "thrash", "death metal", "doom"), "metal"),
     (("choro", "chorinho"), "choro"),
     (("capoeira",), "capoeira"),
-    # base
     (("samba", "sambinha", "pagode", "batucada"), "samba"),
     (("bossa nova", "bossa", "mpb"), "bossa"),
     (("rock and roll", "rock", "punk"), "rock"),
@@ -919,7 +914,7 @@ def detect_style(text: str) -> Optional[str]:
     if not t:
         return None
     pairs = sorted(((w, s) for words, s in _STYLE_MAP for w in words),
-                   key=lambda x: -len(x[0]))  # nomes compostos primeiro
+                   key=lambda x: -len(x[0]))
     for w, s in pairs:
         if re.search(rf"\b{re.escape(w)}\b", t):
             return s
@@ -927,7 +922,6 @@ def detect_style(text: str) -> Optional[str]:
 
 
 def detect_key(text: str) -> Tuple[Optional[int], Optional[bool]]:
-    """(pitch class, é menor?) a partir de 'em dó menor', 'tom de ré'..."""
     t = _norm(text)
     m = re.search(
         r"\b(?:em|tom de|tonalidade de)\s+(do|re|mi|fa|sol|la|si|[a-g])"
@@ -975,7 +969,6 @@ def parse_key_arg(s: str) -> Tuple[Optional[int], Optional[bool]]:
 # =============================================================================
 
 def _safe_title(text: str) -> str:
-    """ASCII puro (metadados MIDI usam latin-1; acentos ok, emoji não)."""
     t = _strip_accents(str(text))
     t = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in t)
     return re.sub(r"\s+", " ", t).strip()
@@ -990,8 +983,6 @@ def _make_composer(params: "SongParams", log: logging.Logger) -> "MidiComposer":
             "(pip install -r requirements.txt)."
         )
     key_name = PC_TO_NAME[params.key_root]
-    # O composer aceita major/minor/pentatonic; o resto é só metadado para ele
-    # (o gerador calcula os pitches ele mesmo).
     if "minor" in params.scale and "pentatonic" not in params.scale:
         scale_name = "minor"
     elif "pentatonic" in params.scale:
@@ -1008,45 +999,243 @@ def _make_composer(params: "SongParams", log: logging.Logger) -> "MidiComposer":
 
 def _export_midi(composer, path: Path, log: logging.Logger) -> bool:
     ok = composer.save_midi(path)
-    if ok is False:  # save_midi() retorna False (sem exceção!) se mido faltar
+    if ok is False:
         log.error("save_midi() retornou False — mido está instalado? (pip install mido)")
         return False
     return True
 
 
+# =============================================================================
+# v6: RENDERIZADOR WAV EMBUTIDO (numpy + soundfile) — bateria AUDÍVEL garantida
+# =============================================================================
+# Lê o .mid gerado e sintetiza o WAV nós mesmos:
+#   * canal 9  → percussão GM sintetizada (kick, caixa, chimbais, pratos com
+#     cauda, tons, agogô, cuíca, triângulo, congas, pandeiro...);
+#   * melódicos → síntese por família de programa GM (piano/guitarra decaem,
+#     órgão/cordas/synth sustentam, baixo encorpado).
+# Usado como fallback do soundfont_renderer — ou diretamente com --no-soundfont.
+# =============================================================================
+
+_SR = 22050
+
+
+def _synth_drum(pitch: int, dur: float, vel: int, seed: int = 0):
+    np = _np
+    rng = np.random.default_rng((pitch + 1) * 7919 + seed)
+    dur = float(min(max(dur, 0.02), 2.5))
+    n = max(8, int(_SR * dur))
+    t = np.arange(n) / _SR
+    amp = max(vel, 1) / 127.0
+    noise = rng.uniform(-1.0, 1.0, n)
+    hi = np.diff(noise, prepend=noise[:1])  # realce de agudos
+
+    def decay(tc: float):
+        return np.exp(-t / max(tc, 1e-3))
+
+    if pitch in (35, 36):        # kick / surdo: sweep 130→44 Hz
+        f = 44 + 90 * np.exp(-t * 30)
+        w = np.sin(2 * np.pi * np.cumsum(f) / _SR)
+        out = (w + 0.3 * hi * decay(0.004)) * decay(0.11)
+    elif pitch in (38, 40):      # caixa
+        out = (0.65 * noise * decay(0.075)
+               + 0.45 * np.sin(2 * np.pi * 185 * t) * decay(0.05)
+               + 0.25 * hi * decay(0.05))
+    elif pitch == 37:            # rimshot
+        out = (np.sin(2 * np.pi * 1700 * t) + 0.6 * hi) * decay(0.012) * 0.8
+    elif pitch == 39:            # clap (3 rajadas)
+        out = np.zeros(n)
+        for off in (0.0, 0.011, 0.023):
+            i0 = int(off * _SR)
+            if i0 < n:
+                out[i0:] += noise[i0:] * np.exp(-t[: n - i0] / 0.055)
+        out *= 0.55
+    elif pitch in (42, 44, 46):  # chimbais fechado/pedal/aberto
+        out = hi * decay({42: 0.030, 44: 0.050, 46: 0.300}[pitch]) * 1.4
+    elif pitch in (49, 57):      # crash
+        out = (0.7 * hi + 0.5 * noise) * decay(0.9) * 0.9
+    elif pitch in (51, 53, 59):  # ride
+        bell = np.sin(2 * np.pi * 1050 * t) + 0.5 * np.sin(2 * np.pi * 1570 * t)
+        out = 0.5 * hi * decay(0.45) + 0.12 * bell * decay(0.35)
+    elif pitch in (41, 43, 45, 47, 48, 50):  # tons / tímpano
+        base = {41: 85, 43: 105, 45: 125, 47: 155, 48: 185, 50: 215}[pitch]
+        f = base * (1 + 0.35 * np.exp(-t * 18))
+        w = np.sin(2 * np.pi * np.cumsum(f) / _SR)
+        out = (w + 0.15 * hi * decay(0.01)) * decay(0.22)
+    elif pitch == 54:            # pandeiro (tambourine GM)
+        jingle = np.sin(2 * np.pi * 5400 * t) + 0.7 * np.sin(2 * np.pi * 7300 * t)
+        out = 0.5 * hi * decay(0.05) + 0.25 * jingle * decay(0.10)
+    elif pitch == 56:            # cowbell
+        out = (np.sin(2 * np.pi * 555 * t) + 0.7 * np.sin(2 * np.pi * 835 * t)) * decay(0.13)
+    elif pitch in (61, 62, 63, 64):  # congas
+        base = {61: 190, 62: 255, 63: 300, 64: 165}[pitch]
+        out = (np.sin(2 * np.pi * base * t) + 0.25 * noise * decay(0.01)) * decay(0.11)
+    elif pitch in (65, 66):      # timbales
+        out = np.sin(2 * np.pi * 310 * t) * decay(0.2) + 0.2 * hi * decay(0.02)
+    elif pitch in (67, 68):      # agogô
+        base = 640 if pitch == 67 else 490
+        out = np.sin(2 * np.pi * base * t) * decay(0.085) + 0.15 * hi * decay(0.006)
+    elif pitch in (69, 70):      # cabasa / shaker / chocalho
+        out = hi * np.minimum(t / 0.008, 1.0) * decay(0.06)
+    elif pitch == 74:            # reco-reco / guiro (ripado)
+        out = noise * decay(0.035) * np.sign(np.sin(2 * np.pi * 9 * t))
+    elif pitch == 75:            # claves
+        out = np.sin(2 * np.pi * 1720 * t) * decay(0.016)
+    elif pitch in (76, 77):      # woodblock (tamborim aprox.)
+        base = 820 if pitch == 76 else 610
+        out = (np.sin(2 * np.pi * base * t)
+               + 0.3 * np.sin(2 * np.pi * base * 2.76 * t)) * decay(0.028)
+    elif pitch == 78:            # cuíca (sweep descendente)
+        f = 480 - 320 * np.clip(t / max(dur, 0.06), 0, 1)
+        out = (np.sin(2 * np.pi * np.cumsum(f) / _SR) * np.minimum(t / 0.02, 1.0)
+               * decay(max(dur * 0.7, 0.06)))
+    elif pitch == 80:            # triângulo
+        out = (np.sin(2 * np.pi * 4100 * t)
+               + 0.6 * np.sin(2 * np.pi * 6170 * t)) * decay(0.6) * 0.5
+    else:
+        out = hi * decay(0.05)
+
+    peak = float(np.max(np.abs(out))) if out.size else 0.0
+    if peak > 0:
+        out = out * (0.55 * amp / peak)
+    return out
+
+
+def _synth_melodic(program: int, pitch: int, dur: float, vel: int):
+    np = _np
+    freq = 440.0 * 2.0 ** ((pitch - 69) / 12.0)
+    dur = float(min(max(dur, 0.05), 8.0))
+    rel = 0.09
+    n = int(_SR * (dur + rel))
+    t = np.arange(n) / _SR
+    amp = max(vel, 1) / 127.0
+    attack = np.minimum(t / 0.012, 1.0)
+    if program < 8 or 24 <= program < 32 or 104 <= program < 112:
+        env = np.exp(-t / max(dur * 0.45, 0.09)) * attack          # piano/guitarra
+        wave = (np.sin(2 * np.pi * freq * t) + 0.35 * np.sin(4 * np.pi * freq * t)
+                + 0.12 * np.sin(6 * np.pi * freq * t))
+        gain = 0.30
+    elif 32 <= program < 40:
+        env = np.exp(-t / max(dur * 0.8, 0.12)) * attack           # baixo
+        wave = (np.sin(2 * np.pi * freq * t) + 0.2 * np.sin(4 * np.pi * freq * t)
+                + 0.08 * np.sin(6 * np.pi * freq * t))
+        gain = 0.34
+    else:                                                          # órgão/cordas/synth/flauta
+        env = np.ones(n)
+        a = int(0.025 * _SR)
+        env[:a] = np.linspace(0, 1, a)
+        r = int(rel * _SR)
+        env[n - r:] *= np.linspace(1, 0, r)
+        wave = (np.sin(2 * np.pi * freq * t) + 0.45 * np.sin(4 * np.pi * freq * t)
+                + 0.28 * np.sin(6 * np.pi * freq * t) + 0.15 * np.sin(8 * np.pi * freq * t))
+        gain = 0.22
+    return wave * env * amp * gain
+
+
+def _builtin_render_wav(midi_path: Path, wav_path: Path, log: logging.Logger) -> Optional[Path]:
+    """Sintetiza o WAV lendo o .mid — independente de FluidSynth/renderer."""
+    if _np is None:
+        log.warning("numpy ausente — WAV embutido indisponível.")
+        return None
+    try:
+        import mido
+        import soundfile as _sf
+    except ImportError as exc:
+        log.warning("WAV embutido precisa de mido + soundfile (%s).", exc)
+        return None
+
+    mid = mido.MidiFile(str(midi_path))
+    tempo = 500000
+    done = False
+    for tr in mid.tracks:
+        for msg in tr:
+            if msg.type == "set_tempo":
+                tempo, done = msg.tempo, True
+                break
+        if done:
+            break
+    spt = tempo / 1e6 / mid.ticks_per_beat
+    n = int((mid.length + 1.2) * _SR)
+    audio = _np.zeros(n, dtype=_np.float64)
+
+    count = 0
+
+    def _emit(start: float, end: float, pitch: int, vel: int, ch: int, programs: Dict[int, int]) -> None:
+        nonlocal count
+        dur = max(0.03, end - start)
+        if ch == 9:
+            w = _synth_drum(pitch, dur, vel, seed=int(start * 997))
+        else:
+            w = _synth_melodic(programs.get(ch, 0), pitch, dur, vel)
+        i0 = int(start * _SR)
+        i1 = min(n, i0 + len(w))
+        if i0 < n:
+            audio[i0:i1] += w[: i1 - i0]
+            count += 1
+
+    for track in mid.tracks:
+        t = 0.0
+        programs: Dict[int, int] = {}
+        active: Dict[int, List[Tuple[float, int, int]]] = {}
+        for msg in track:
+            t += msg.time * spt
+            if msg.type == "program_change":
+                programs[msg.channel] = msg.program
+            elif msg.type == "note_on" and msg.velocity > 0:
+                active.setdefault(msg.note, []).append((t, msg.velocity, msg.channel))
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                lst = active.get(msg.note)
+                if lst:
+                    start, vel, ch = lst.pop(0)
+                    _emit(start, t, msg.note, vel, ch, programs)
+        for note_id, lst in active.items():  # notas sem note_off (cauda curta)
+            for start, vel, ch in lst:
+                _emit(start, start + 0.35, note_id, vel, ch, programs)
+
+    if count == 0:
+        log.warning("WAV embutido: nenhuma nota encontrada.")
+        return None
+    peak = float(_np.max(_np.abs(audio)))
+    if peak > 0:
+        audio *= 0.86 / peak
+    _sf.write(str(wav_path), audio.astype(_np.float32), _SR)
+    log.info("WAV embutido: %d notas sintetizadas (percussão GM no canal 9) → %s",
+             count, wav_path)
+    return wav_path
+
+
 def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
                   log: logging.Logger) -> Optional[Path]:
-    if _RENDERER is None:
-        log.warning("soundfont_renderer não disponível (nenhuma função conhecida "
-                    "encontrada) — WAV não gerado. O MIDI foi gerado normalmente. "
-                    "Envie 'grep -n \"^def \" soundfont_renderer.py' para ajustar "
-                    "a integração.")
-        return None
-    import inspect
-    attempts: List[Tuple[Tuple, Dict[str, Any]]] = []
-    try:
-        sig = inspect.signature(_RENDERER)
-        kw: Dict[str, Any] = {}
-        for name in ("use_soundfont", "prefer_soundfont"):
-            if name in sig.parameters:
-                kw[name] = prefer_soundfont
-        if "soundfont" in sig.parameters and not prefer_soundfont:
-            kw["soundfont"] = None
-        attempts.append(((), kw))
-    except (TypeError, ValueError):
-        pass
-    attempts.append(((), {}))
-    for args_, kw in attempts:
+    # 1) soundfont_renderer / FluidSynth — melhor qualidade (se disponível)
+    if prefer_soundfont and _RENDERER is not None:
+        import inspect
+        attempts: List[Tuple[Tuple, Dict[str, Any]]] = []
         try:
-            _RENDERER(str(midi_path), str(wav_path), **kw)
+            sig = inspect.signature(_RENDERER)
+            kw: Dict[str, Any] = {}
+            for name in ("use_soundfont", "prefer_soundfont"):
+                if name in sig.parameters:
+                    kw[name] = True
+            attempts.append(((), kw))
+        except (TypeError, ValueError):
+            pass
+        attempts.append(((), {}))
+        for args_, kw in attempts:
+            try:
+                _RENDERER(str(midi_path), str(wav_path), **kw)
+                if wav_path.exists():
+                    log.info("WAV: soundfont_renderer")
+                    return wav_path
+            except TypeError:
+                continue
+            except Exception as exc:
+                log.warning("soundfont_renderer falhou (%s) — usando embutido.", exc)
+                break
+    # 2) EMBUTIDO — sempre disponível, com bateria sintetizada
+    try:
+        if _builtin_render_wav(midi_path, wav_path, log):
             return wav_path
-        except TypeError:
-            continue
-        except Exception as exc:
-            log.warning("Renderização falhou: %s", exc)
-            return None
-    log.warning("Não consegui chamar o renderer (esperado: f(midi, wav, ...)). "
-                "Ajuste _render_audio().")
+    except Exception as exc:
+        log.warning("Renderização embutida falhou: %s", exc)
     return None
 
 
@@ -1099,6 +1288,7 @@ class SongParams:
 
 
 def _fit_form(bars: int, style: str) -> List[Tuple[str, int]]:
+    """Forma da música. v6: insere PONTE a cada 3 ciclos em músicas longas."""
     form = list(SONG_FORMS.get(style, _DEFAULT_FORM))
     out: List[Tuple[str, int]] = []
     remaining = bars
@@ -1108,11 +1298,17 @@ def _fit_form(bars: int, style: str) -> List[Tuple[str, int]]:
         take = min(b, remaining)
         out.append((name, take))
         remaining -= take
-    toggle = True
+    toggle, cycle = True, 0
     while remaining >= 4:
-        out.append(("verso" if toggle else "refrao", 4))
-        toggle = not toggle
-        remaining -= 4
+        if cycle % 3 == 2 and remaining >= 8:
+            out.append(("ponte", 4))
+            out.append(("refrao", 4))
+            remaining -= 8
+        else:
+            out.append(("verso" if toggle else "refrao", 4))
+            toggle = not toggle
+            remaining -= 4
+        cycle += 1
     if remaining > 0:
         out.append(("refrao", remaining))
     return out
@@ -1166,7 +1362,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                 comp_ids.append(rid)
                 inst_ids.append(rid)
                 break
-    if not comp_ids:  # último recurso
+    if not comp_ids:
         for cand in ("piano", "acoustic_guitar", "organ", "strings"):
             rid = _resolve_id((cand,))
             if rid:
@@ -1174,8 +1370,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                 inst_ids.append(rid)
                 break
 
-    # lead monofônico toca melodia; senão o 1º harmônico vira lead DEDICADO
-    # (se houver outro para compor os acordes)
     mono_lead = next((i for i in comp_ids if _monophonic(i)), None)
     if mono_lead:
         lead_id = mono_lead
@@ -1187,11 +1381,8 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     log.info("Instrumentos: lead=%s | acordes=%s | baixo=%s | kit=%s | percussão=%s",
              lead_id, comp_ids or "-", bass_id, kit_id, perc_ids or "-")
 
-    # --- v4, CORREÇÃO 3: canais únicos por instrumento melódico -----------------
-    # O MidiComposer lê o canal do catálogo NO MOMENTO do save_midi(); então
-    # realocamos aqui para evitar que dois melódicos partilhem canal (o
-    # program_change de um sobrescreveria o timbre do outro).
-    used_ch = {9}  # 9 = percussão GM
+    # --- canais únicos por instrumento melódico --------------------------------
+    used_ch = {9}
     for inst in dict.fromkeys(inst_ids):
         entry = INSTRUMENTS.get(inst)
         if not entry or entry.get("is_percussion"):
@@ -1210,7 +1401,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     for inst in dict.fromkeys(inst_ids):
         try:
             idx = composer.add_track(inst)
-        except Exception as exc:  # ValueError se desconhecido no catálogo
+        except Exception as exc:
             log.warning("add_track(%r) falhou (%s) — instrumento ignorado.", inst, exc)
             continue
         if not isinstance(idx, int):
@@ -1221,7 +1412,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
 
     def note(track: int, bar: int, pos: float, dur_beats: float,
              pitch: int, vel: int, swing: bool = False) -> None:
-        """Escreve UMA nota. v4: clamp de pitch — nunca mais ValueError."""
         p = bar * beats_per_bar + pos
         if swing and abs((p % 1.0) - 0.5) < 1e-6:
             p += style_cfg["swing"]
@@ -1232,8 +1422,8 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         v = int(min(127, max(20, vel + rng.randint(-6, 6) + (6 if strong else 0))))
         pit = int(round(pitch))
         if not (0 <= pit <= 127):
-            log.warning("Pitch fora de 0..127 (%r) em bar=%d pos=%.2f — corrigido "
-                        "(investigue a origem se isto repetir)", pitch, bar, pos)
+            log.warning("Pitch fora de 0..127 (%r) em bar=%d pos=%.2f — corrigido",
+                        pitch, bar, pos)
             pit = min(127, max(21, pit))
         composer.add_note(track, start=start, duration=dur, pitch=pit, velocity=v)
 
@@ -1243,28 +1433,55 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     log.info("Estrutura: %s", " → ".join(f"{n}:{b}" for n, b in sections))
 
     opts = PROGRESSIONS.get(style, PROGRESSIONS["pop"])
-    prog_a = list(rng.choice(opts))
-    prog_b = list(rng.choice([o for o in opts if o != prog_a] or opts))
+    prog_a = list(rng.choice(opts))                     # verso 1
+    rest_opts = [o for o in opts if o != prog_a]
+    prog_a2 = list(rng.choice(rest_opts)) if rest_opts else prog_a   # v6: verso 2
+    rest2 = [o for o in rest_opts if o != prog_a2] or rest_opts or opts
+    prog_b = list(rng.choice(rest2))                     # refrão
     add7 = bool(style_cfg.get("sevenths")) or rng.random() < 0.25
-    log.info("Progressões: A=%s | B=%s (refrão) | tom=%s %s | %d BPM | seed=%d",
-             prog_a, prog_b, PC_TO_NAME[params.key_root], params.scale,
-             params.bpm, params.seed)
+    log.info("Progressões: A=%s | A2=%s (verso 2) | B=%s (refrão) | tom=%s %s | "
+             "%d BPM | seed=%d", prog_a, prog_a2, prog_b,
+             PC_TO_NAME[params.key_root], params.scale, params.bpm, params.seed)
 
-    # --- composição ------------------------------------------------------------
+    # --- composição (v6: variação por compasso) ---------------------------------
     prev_voicing: Optional[List[int]] = None
-    motif = None
+    phrase: Optional[Dict[int, list]] = None
+    verse_idx = 0
+    chorus_count = 0
     abs_bar = 0
     n = len(scale)
     for sec_i, (sec_name, sec_bars) in enumerate(sections):
-        profile = SECTION_PROFILES.get(sec_name, SECTION_PROFILES["verso"])
-        comp_rhythm = rng.choice(COMP_RHYTHMS.get(style, [[0.0, 2.0]]))
-        prog = prog_b if sec_name in ("refrao", "solo") else prog_a
+        profile = dict(SECTION_PROFILES.get(sec_name, SECTION_PROFILES["verso"]))
+        if sec_name == "refrao":  # v6: cada refrão repetido ganha intensidade
+            chorus_count += 1
+            profile["vel"] = min(110, profile["vel"] + 3 * (chorus_count - 1))
+        comp_rhythms = COMP_RHYTHMS.get(style, [[0.0, 2.0]])
+        comp_rhythm = rng.choice(comp_rhythms)
+        if sec_name in ("refrao", "solo"):
+            prog = prog_b
+        elif sec_name == "verso":
+            prog = prog_a if verse_idx % 2 == 0 else prog_a2  # v6: versos alternam
+            verse_idx += 1
+        elif sec_name == "ponte":
+            prog = prog_a2 if prog_a2 != prog_a else prog_b
+        else:
+            prog = prog_a
         if profile["melody"] and lead_id and lead_id in track_of:
-            motif = _new_motif(rng, params.temperature, profile["dense"])
+            phrase = _new_phrase(rng, profile["dense"])
         for b in range(sec_bars):
+            # v6: compasso novo → às vezes muda o ritmo do comp (25%)
+            if b > 0 and len(comp_rhythms) > 1 and rng.random() < 0.25:
+                comp_rhythm = rng.choice(
+                    [r for r in comp_rhythms if r != comp_rhythm] or comp_rhythms)
+
             degree = prog[b % len(prog)]
             next_degree = prog[(b + 1) % len(prog)]
             is_last = (b == sec_bars - 1)
+            # v6: turnaround — compasso 8 de cada grupo de 8 vira V (puxa de volta)
+            if (len(prog) == 4 and len(scale) == 7 and style != "blues"
+                    and abs_bar % 8 == 7 and not is_last):
+                degree = 4
+                next_degree = prog[0]
 
             # ---- acordes (comp) ----
             if profile["comp"] and comp_ids:
@@ -1282,9 +1499,15 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                             note(track_of[inst], abs_bar, hpos + off, dur,
                                  pit, profile["vel"] - 3 * j, swing=swing_on)
 
-            # ---- baixo ----
+            # ---- baixo (v6: com fills) ----
             if profile["bass"] and bass_id and bass_id in track_of:
-                pat = BASS_PATTERNS.get(style, BASS_PATTERNS["pop"])
+                use_fill = ((b % 4 == 3 or is_last) and rng.random() < 0.40
+                            and style not in ("ambient", "dungeon", "cinematic", "classical"))
+                if use_fill:  # walk-up clássico: root → 3ª → 5ª → aproximação
+                    pat = [(0.0, "root", 0.9), (1.0, "third", 0.9),
+                           (2.0, "fifth", 0.9), (3.0, "approach", 0.9)]
+                else:
+                    pat = BASS_PATTERNS.get(style, BASS_PATTERNS["pop"])
                 root_abs = root_midi + scale[degree % n]
                 next_root_abs = root_midi + scale[next_degree % n]
                 for pos, kind, dur in pat:
@@ -1292,20 +1515,26 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[bass_id], abs_bar, pos, dur, pitch,
                          profile["vel"] - 8, swing=swing_on)
 
-            # ---- bateria (kit) ----
+            # ---- bateria (kit, v6: vida por compasso) ----
             if kit_id and kit_id in track_of and profile["drums"]:
                 pattern = _kit_pattern(style, abs_bar, rng)
                 if is_last and sec_i < len(sections) - 1:
                     pattern = [h for h in pattern if h[0] < 2.0] + _fill(style, rng)
                 if b == 0 and sec_name in ("refrao", "solo") and style in CRASH_STYLES:
                     pattern.append((0.0, "crash", 94))
+                if rng.random() < 0.18 and style in ("rock", "pop", "funk", "hiphop",
+                                                     "blues", "metal", "bossfight", "dnb"):
+                    pattern.append((rng.choice([0.75, 1.5, 2.5, 3.25]), "snare", 30))
+                if rng.random() < 0.12 and style in ("rock", "pop", "funk", "disco",
+                                                     "synthwave", "electronic", "bossfight"):
+                    pattern.append((rng.choice([0.5, 1.5, 2.5, 3.5]), "hh_open", 60))
                 gain = profile["vel"] / 76.0
                 for pos, name, vel in pattern:
                     dur_beats = DRUM_DUR.get(name, DEFAULT_DRUM_DUR) / beat_sec
                     note(track_of[kit_id], abs_bar, pos, dur_beats,
                          GM[name], int(vel * gain), swing=swing_on)
 
-            # ---- percussão individual (pandeiro, surdo, tamborim...) ----
+            # ---- percussão individual ----
             for pid in perc_ids:
                 if pid not in track_of or not profile["drums"]:
                     continue
@@ -1322,17 +1551,19 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[pid], abs_bar, i * 0.25, dur / beat_sec,
                          pitch, int(v * (profile["vel"] / 76.0)))
 
-            # ---- melodia (motivo) ----
+            # ---- melodia (v6: FRASES de 4 compassos, com respiro) ----
             if profile["melody"] and lead_id and lead_id in track_of:
-                if motif is None:
-                    motif = _new_motif(rng, params.temperature, profile["dense"])
-                if b % 2 == 1 and rng.random() < params.temperature * 0.5:
-                    motif = _vary_motif(motif, rng)
-                rest = (abs_bar % 4 == 3) and rng.random() < 0.30 * (1.4 - params.temperature)
-                if not rest:
-                    for (pos, dur), step in motif:
+                if b % 4 == 0 and b > 0:
+                    r = rng.random()
+                    if r < 0.55 or phrase is None:
+                        phrase = _new_phrase(rng, profile["dense"])
+                    elif r < 0.85:
+                        phrase = _vary_phrase(phrase, rng)
+                cell = phrase.get(b % 4) if phrase else None
+                if cell:  # None = compasso de respiro
+                    for (pos, dur), step in cell:
                         idx = degree + step
-                        if pos in (0.0, 2.0):  # tempo forte → nota do acorde
+                        if pos in (0.0, 2.0):
                             idx = _snap_to_chord(idx, degree, n)
                         pitch = max(58, min(86, _scale_pitch(root_midi + 12, scale, idx)))
                         note(track_of[lead_id], abs_bar, pos, dur,
@@ -1347,7 +1578,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         raise RuntimeError("Falha ao exportar o MIDI.")
     audit_midi(midi_path, inst_by_track, log)
 
-    try:  # formato nativo do composer (resumo de tracks) — best effort
+    try:
         composer.save_json(out_dir / "composicao.json")
     except Exception as exc:
         log.debug("save_json() indisponível: %s", exc)
@@ -1368,9 +1599,10 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         "bars": abs_bar,
         "sections": [{"nome": nm, "bars": bb} for nm, bb in sections],
         "progression_a": prog_a,
+        "progression_a2": prog_a2,
         "progression_b": prog_b,
         "files": {"midi": str(midi_path), "wav": str(wav_path) if wav_path else None},
-        "generator": "music_generator.py v5 (MidiComposer)",
+        "generator": "music_generator.py v6",
     }
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1404,9 +1636,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--prompt", default="", help="prompt em português")
     p.add_argument("--style", default=None,
-                   help="base: rock, pop, samba, bossa, funk, reggae, trap, electronic, "
-                        "hiphop, jazz, ambient, cinematic, classical, folk, latin, forro | "
-                        "v5: bossfight, chiptune, dungeon, breakcore, dnb, synthwave, "
+                   help="rock, pop, samba, bossa, funk, reggae, trap, electronic, "
+                        "hiphop, jazz, ambient, cinematic, classical, folk, latin, forro, "
+                        "bossfight, chiptune, dungeon, breakcore, dnb, synthwave, "
                         "disco, blues, metal, choro, capoeira")
     p.add_argument("--instruments", default=None,
                    help='lista separada por vírgula (ex.: "bateria,piano")')
@@ -1415,13 +1647,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--key", default=None, help="ex.: C, F#, Am")
     p.add_argument("--scale", default=None, choices=sorted(SCALES))
     p.add_argument("--seed", type=int, default=None,
-                   help="seed do RNG (padrão: aleatório — cada execução gera "
-                        "música diferente)")
+                   help="seed do RNG (padrão: aleatório)")
     p.add_argument("--temperature", type=float, default=0.7,
                    help="0..1 — quanto maior, mais variação")
     p.add_argument("--output-dir", type=Path, default=Path("song_output"))
     p.add_argument("--no-soundfont", action="store_true",
-                   help="prefere síntese procedural (fallback) ao SoundFont")
+                   help="usa o renderizador WAV EMBUTIDO (bateria sintetizada "
+                        "garantida, sem depender de FluidSynth)")
     p.add_argument("--list-instruments", action="store_true")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args(argv)
@@ -1440,7 +1672,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.error("Informe --prompt e/ou --style.")
         return 1
 
-    # ANTI-REPETIÇÃO: seed aleatório por padrão; o valor é logado para reprodução
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(0, 999_999)
     rng = random.Random(seed)
 
