@@ -1,919 +1,1006 @@
 #!/usr/bin/env python3
-"""Treinamento da IA musical usando dataset real do Hugging Face.
+# -*- coding: utf-8 -*-
+"""
+train.py — Treinamento do autoencoder de estilo do IA Music Pro.
 
-Dataset: Kukedlc/suno-ai-music-dataset
-Licença: CC-BY-4.0
-Músicas: ~857
-Gêneros: Electronic, Hip-hop, Latin, Jazz, World, Rock, Ambient, Pop, Reggae, Classical
+Fluxo:
+    1. Lê os metadados do dataset Suno salvos por download_dataset.py
+       (datasets/suno-ai-music-dataset/metadata.json).
+    2. Converte cada música para um vetor de features simbólicas em um
+       SCHEMA FIXO (fonte única de verdade — ver GENRE_SCHEMA abaixo).
+    3. Gera amostras sintéticas de complemento no MESMO schema.
+    4. Treina um autoencoder denso (PyTorch, com fallback em NumPy puro)
+       com early stopping na validação.
+    5. Salva modelo + metadados e um relatório em memory/ (feedback loop).
+
+Schema de features (FEATURE_DIM = 17):
+    [0]        bpm normalizado (bpm / 200, bpm limitado a [30, 200])
+    [1 .. 12]  one-hot de gênero (GENRE_SCHEMA — 12 gêneros)
+    [13]       duração normalizada (s / 300, limitada a [0, 300])
+    [14]       energia       [0, 1]
+    [15]       complexidade  [0, 1]
+    [16]       valência      [0, 1]
+
+IMPORTANTE — fonte única de verdade:
+    Dados reais E sintéticos são construídos por song_to_features(), então é
+    estruturalmente impossível as dimensões divergirem (corrige o ValueError
+    do np.vstack reportado no CI: shape (100, 10) vs (50, 11)).
+    Se mudar GENRE_SCHEMA ou as features, faça bump da chave de cache
+    'models-vN' no workflow train_model.yml — a dimensionalidade muda e o
+    modelo em cache fica incompatível (load_autoencoder() detecta e recusa).
 
 Uso:
-    python train.py                                    # treino padrão
-    python train.py --dataset suno                     # usar dataset Suno
-    python train.py --dataset synthetic                # usar dados sintéticos
-    python train.py --dataset mixed                    # misturar ambos
-    python train.py --max-songs 100                    # limitar músicas
-    python train.py --epochs 50                        # mais épocas
-    python train.py --list-genres                      # listar gêneros disponíveis
+    python train.py --dataset mixed --max-songs 100 --epochs 20 --batch-size 8
+    python train.py --dataset suno --max-songs 0            # dataset completo
+    python train.py --dataset synthetic --synthetic-samples 200
+
+Outros módulos (music_generator.py, music_intelligence.py) devem carregar o
+modelo via load_autoencoder() — nunca abrir os arquivos diretamente.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import logging
-import os
 import sys
-import time
+import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+# ---------------------------------------------------------------------------
+# PyTorch é OPCIONAL: sem ele, treinamos com um autoencoder em NumPy puro.
+# ---------------------------------------------------------------------------
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    torch = None
+    nn = None
+    HAS_TORCH = False
+
+LOG = logging.getLogger("ia_music_pro.train")
+
+
+def _setup_logging(verbose: bool = False) -> logging.Logger:
+    """Logger no formato do restante do projeto: 'HH:MM:SS [LEVEL] mensagem'."""
+    LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
+    if not LOG.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                              datefmt="%H:%M:%S")
+        )
+        LOG.addHandler(handler)
+    LOG.propagate = False
+    return LOG
+
+
+# ---------------------------------------------------------------------------
+# Caminhos padrão (relativos à raiz do projeto)
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATASET_PATH = PROJECT_ROOT / "datasets" / "suno-ai-music-dataset" / "metadata.json"
+MODELS_DIR = PROJECT_ROOT / "models"
+MEMORY_DIR = PROJECT_ROOT / "memory"
+
+# Complemento sintético no modo 'mixed': com 100 músicas reais gera 50
+# sintéticas (mesmo comportamento do log do CI: "Gerando 50 amostras...").
+MIN_TRAIN_SAMPLES = 150
+
+# =============================================================================
+# SCHEMA DE FEATURES — FONTE ÚNICA DE VERDADE
+# =============================================================================
+
+GENRE_SCHEMA: List[str] = [
+    "generic", "electronic", "hiphop", "rock", "jazz",
+    "ambient", "latin", "pop", "samba", "bossa", "folk", "classical",
+]
+GENRE_TO_IDX: Dict[str, int] = {g: i for i, g in enumerate(GENRE_SCHEMA)}
+
+_GENRE_ALIASES: Dict[str, str] = {
+    "hip hop": "hiphop", "hip-hop": "hiphop", "rap": "hiphop", "trap": "hiphop",
+    "edm": "electronic", "house": "electronic", "techno": "electronic",
+    "bossa nova": "bossa", "mpb": "bossa",
+    "lo-fi": "ambient", "lofi": "ambient",
+    "world": "latin", "salsa": "latin",
+    "soundtrack": "generic", "other": "generic",
+}
+
+_TAIL_FEATURES: Tuple[str, ...] = ("duration", "energy", "complexity", "valence")
+
+FEATURE_NAMES: List[str] = (
+    ["bpm"] + [f"genre_{g}" for g in GENRE_SCHEMA] + list(_TAIL_FEATURES)
 )
-log = logging.getLogger("train")
-
-# ============================================================================
-# Constantes
-# ============================================================================
-
-DATASET_NAME = "Kukedlc/suno-ai-music-dataset"
-DATASETS_DIR = Path("datasets")
-SUNO_CACHE_DIR = DATASETS_DIR / "suno-ai-music-dataset"
-SUNO_METADATA = SUNO_CACHE_DIR / "metadata.json"
-MODELS_DIR = Path("models")
-MEMORY_DIR = Path("memory")
-KNOWLEDGE_BASE = Path("knowledge_base.json")
-NORMALIZATION_FILE = MODELS_DIR / "normalization.npz"
-
-FEATURE_SIZE = 128
-LATENT_DIM = 32
-DEFAULT_EPOCHS = 20
-DEFAULT_BATCH_SIZE = 8
-LEARNING_RATE = 0.001
-VALIDATION_SPLIT = 0.15
-TEST_SPLIT = 0.10
-EARLY_STOPPING_PATIENCE = 5
+FEATURE_DIM: int = len(FEATURE_NAMES)  # 1 + 12 + 4 = 17
+GENRE_SLICE: Tuple[int, int] = (1, 1 + len(GENRE_SCHEMA))
 
 
-# ============================================================================
-# Carregamento do Dataset Suno
-# ============================================================================
+def normalize_genre(raw: Any) -> str:
+    """Normaliza (lowercase + aliases) e faz fallback para 'generic' (índice 0).
 
-def check_suno_dataset() -> bool:
-    """Verifica se o dataset Suno já foi baixado."""
-    return SUNO_METADATA.is_file()
+    Metadados reais podem vir como 'Hip Hop, EDM, Party' — usamos o primeiro
+    tag. Gênero desconhecido NÃO quebra: cai no bucket 'generic'.
+    """
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else "generic"
+    g = str(raw or "").strip().lower()
+    for sep in (",", ";", "/"):
+        if sep in g:
+            g = g.split(sep)[0].strip()
+    g = _GENRE_ALIASES.get(g, g)
+    return g if g in GENRE_TO_IDX else "generic"
 
 
-def download_suno_dataset(max_songs: Optional[int] = None) -> bool:
-    """Baixa o dataset Suno do Hugging Face usando cache.
-    Se já estiver baixado, não baixa de novo.
+# =============================================================================
+# PRIORES MUSICAIS (dados sintéticos e valores default para dados reais)
+# =============================================================================
+
+GENRE_PROFILE: Dict[str, Dict[str, Tuple[float, float]]] = {
+    # gênero:    bpm         energia      complexidade  valência
+    "generic":    {"bpm": (60, 180),  "energy": (0.20, 0.90), "complexity": (0.20, 0.80), "valence": (0.20, 0.90)},
+    "electronic": {"bpm": (110, 145), "energy": (0.55, 0.95), "complexity": (0.20, 0.55), "valence": (0.40, 0.95)},
+    "hiphop":     {"bpm": (78, 105),  "energy": (0.50, 0.85), "complexity": (0.45, 0.85), "valence": (0.25, 0.80)},
+    "rock":       {"bpm": (110, 165), "energy": (0.60, 1.00), "complexity": (0.30, 0.65), "valence": (0.30, 0.85)},
+    "jazz":       {"bpm": (85, 175),  "energy": (0.30, 0.75), "complexity": (0.60, 0.95), "valence": (0.30, 0.80)},
+    "ambient":    {"bpm": (55, 90),   "energy": (0.05, 0.40), "complexity": (0.10, 0.45), "valence": (0.20, 0.70)},
+    "latin":      {"bpm": (90, 135),  "energy": (0.50, 0.90), "complexity": (0.40, 0.75), "valence": (0.50, 0.95)},
+    "pop":        {"bpm": (95, 130),  "energy": (0.50, 0.85), "complexity": (0.25, 0.60), "valence": (0.45, 0.90)},
+    "samba":      {"bpm": (85, 110),  "energy": (0.55, 0.90), "complexity": (0.50, 0.80), "valence": (0.55, 0.95)},
+    "bossa":      {"bpm": (68, 100),  "energy": (0.30, 0.60), "complexity": (0.55, 0.85), "valence": (0.50, 0.85)},
+    "folk":       {"bpm": (80, 125),  "energy": (0.25, 0.65), "complexity": (0.35, 0.70), "valence": (0.35, 0.80)},
+    "classical":  {"bpm": (60, 130),  "energy": (0.20, 0.70), "complexity": (0.50, 0.95), "valence": (0.25, 0.85)},
+}
+
+GENRE_COMPLEXITY_PRIOR: Dict[str, float] = {
+    "jazz": 0.75, "classical": 0.65, "bossa": 0.65, "samba": 0.60,
+    "hiphop": 0.60, "folk": 0.55, "latin": 0.55, "rock": 0.45,
+    "pop": 0.40, "electronic": 0.35, "ambient": 0.30, "generic": 0.50,
+}
+
+# (palavras-chave, (energia, valência)) — aplicadas sobre humor/prompt
+_MOOD_RULES: List[Tuple[Tuple[str, ...], Tuple[float, float]]] = [
+    (("aggressive", "agressivo", "heavy", "pesado", "distortion", "distorção"), (0.95, 0.35)),
+    (("epic", "épico", "epico", "cinematic", "cinematográfico", "trailer"),    (0.80, 0.60)),
+    (("party", "festa", "club", "dance", "dançante", "dancefloor"),           (0.85, 0.85)),
+    (("energetic", "energia", "energético", "upbeat", "animado", "groove"),    (0.80, 0.70)),
+    (("happy", "feliz", "alegre", "joyful", "verão", "verao", "sunshine"),     (0.65, 0.90)),
+    (("romantic", "romântico", "romantico", "love", "amor", "smooth", "suave"), (0.40, 0.75)),
+    (("chill", "relax", "relaxante", "calm", "calma", "calmo", "tranquilo", "lo-fi", "lofi"), (0.30, 0.60)),
+    (("melancholic", "melancólico", "melancolico", "nostalgic", "nostálgico", "saudade"),    (0.35, 0.30)),
+    (("sad", "triste", "somber", "dark", "sombrio", "escuro", "melancholy"),   (0.40, 0.20)),
+    (("ambient", "meditative", "meditativo", "sleep", "drone", "minimal"),    (0.15, 0.50)),
+]
+
+
+def infer_mood_features(mood_text: str, default_energy: float = 0.5,
+                        default_valence: float = 0.5) -> Tuple[float, float]:
+    """Estima (energia, valência) a partir do texto de humor/prompt via keywords."""
+    text = f" {str(mood_text or '').lower()} "
+    energies: List[float] = []
+    valences: List[float] = []
+    for keywords, (energy, valence) in _MOOD_RULES:
+        if any(k in text for k in keywords):
+            energies.append(energy)
+            valences.append(valence)
+    if not energies:
+        return float(default_energy), float(default_valence)
+    return float(np.mean(energies)), float(np.mean(valences))
+
+
+# =============================================================================
+# CONSTRUÇÃO DE FEATURES
+# =============================================================================
+
+def _clip01(value: Any, default: float = 0.5) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    if np.isnan(v):
+        return default
+    return min(max(v, 0.0), 1.0)
+
+
+def _stable_jitter(text: Any, spread: float = 0.05) -> float:
+    """Variação determinística em [-spread, +spread] derivada de um texto."""
+    if not text:
+        return 0.0
+    digest = zlib.crc32(str(text).encode("utf-8"))
+    return ((digest % 2001) - 1000) / 1000.0 * spread
+
+
+def song_to_features(bpm: float, genre: Any, duration: float,
+                     energy: float, complexity: float, valence: float) -> List[float]:
+    """ÚNICO lugar onde o layout do vetor de features é definido.
+
+    Dados reais E sintéticos passam por aqui — é estruturalmente impossível
+    as dimensões divergirem (bug do np.vstack antigo).
     """
     try:
-        from datasets import load_dataset, DownloadConfig
-    except ImportError:
-        log.error("Pacote 'datasets' não instalado.")
-        log.error("Execute: pip install datasets huggingface-hub")
-        return False
-
-    SUNO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_dir = DATASETS_DIR / "hf_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    download_config = DownloadConfig(
-        cache_dir=str(cache_dir),
-        resume_download=True,
-        max_retries=3,
-    )
-
-    log.info("Carregando dataset '%s'...", DATASET_NAME)
-    log.info("Cache em: %s", cache_dir)
-    log.info("Se for a primeira vez, pode levar vários minutos (~4 GB).")
-
-    start_time = time.time()
+        bpm = float(bpm)
+    except (TypeError, ValueError):
+        bpm = 120.0
+    bpm = min(max(bpm, 30.0), 200.0)          # garante feature em [0.15, 1.0]
 
     try:
-        ds = load_dataset(
-            DATASET_NAME,
-            split="train",
-            download_config=download_config,
-            trust_remote_code=False,
-        )
+        duration = float(duration)
+    except (TypeError, ValueError):
+        duration = 180.0
+    duration = min(max(duration, 0.0), 300.0)  # garante feature em [0, 1.0]
 
-        elapsed = time.time() - start_time
-        log.info("Dataset carregado em %.1f segundos", elapsed)
-        log.info("Total de músicas: %d", len(ds))
-
-        process_suno_dataset(ds, max_songs)
-        return True
-
-    except Exception as e:
-        log.error("Erro ao carregar dataset: %s", e)
-        return False
+    one_hot = [0.0] * len(GENRE_SCHEMA)
+    one_hot[GENRE_TO_IDX[normalize_genre(genre)]] = 1.0
+    return [
+        bpm / 200.0,
+        *one_hot,
+        duration / 300.0,
+        _clip01(energy),
+        _clip01(complexity),
+        _clip01(valence),
+    ]
 
 
-def process_suno_dataset(ds, max_songs: Optional[int] = None) -> None:
-    """Processa o dataset e salva metadados."""
-    SUNO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    metadata = {
-        "dataset": DATASET_NAME,
-        "songs": [],
-        "genre_stats": {},
-        "total_processed": 0,
-    }
-
-    genre_stats: Dict[str, Dict[str, Any]] = {}
-    processed = 0
-
-    items = list(ds) if max_songs is None else list(ds)[:max_songs]
-
-    log.info("Processando %d músicas...", len(items))
-
-    for item in items:
-        song_id = item.get("id") or str(processed)
-        title = item.get("title", "Sem título")
-        genre_raw = item.get("tax_genero") or item.get("tags", "")
-        subgenre = item.get("tax_subgenero", "")
-        bpm_str = item.get("tax_bpm_rango", "")
-        key_info = item.get("tax_key_tipico", "")
-        mood = item.get("tax_mood", "")
-        prompt = item.get("gpt_description_prompt") or item.get("tags", "")
-        duration = item.get("duration", 0)
-        is_instrumental = item.get("is_instrumental", True)
-
-        genre = normalize_genre(genre_raw)
-
-        if genre not in genre_stats:
-            genre_stats[genre] = {
-                "count": 0,
-                "bpm_values": [],
-                "scales": [],
-                "instruments": [],
-            }
-
-        stats = genre_stats[genre]
-        stats["count"] += 1
-
-        bpm_range = parse_bpm_range(bpm_str)
-        stats["bpm_values"].extend(bpm_range)
-        stats["bpm_values"] = sorted(set(stats["bpm_values"]))
-
-        if key_info:
-            for scale in ["major", "minor", "dorian", "pentatonic", "blues"]:
-                if scale in key_info.lower() and scale not in stats["scales"]:
-                    stats["scales"].append(scale)
-
-        if prompt:
-            common_instruments = [
-                "piano", "violin", "cello", "guitar", "bass", "drums",
-                "synth", "pad", "kick", "snare", "hihat",
-                "flute", "trumpet", "sax", "accordion",
-            ]
-            for inst in common_instruments:
-                if inst in prompt.lower() and inst not in stats["instruments"]:
-                    stats["instruments"].append(inst)
-
-        song_data = {
-            "id": song_id,
-            "title": title,
-            "genre": genre,
-            "genre_raw": genre_raw,
-            "subgenre": subgenre,
-            "bpm_range": bpm_range,
-            "key": key_info,
-            "mood": mood,
-            "prompt": prompt[:500] if prompt else "",
-            "duration": float(duration) if duration else 0,
-            "is_instrumental": bool(is_instrumental),
-        }
-
-        metadata["songs"].append(song_data)
-        processed += 1
-
-        if processed % 100 == 0:
-            log.info("  Processadas %d/%d músicas...", processed, len(items))
-
-    metadata["total_processed"] = processed
-    metadata["genre_stats"] = {
-        genre: {
-            "count": s["count"],
-            "bpm_range": [
-                min(s["bpm_values"]) if s["bpm_values"] else 100,
-                max(s["bpm_values"]) if s["bpm_values"] else 130,
-            ],
-            "scales": s["scales"][:5],
-            "instruments": s["instruments"][:8],
-        }
-        for genre, s in genre_stats.items()
-    }
-
-    SUNO_METADATA.write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    log.info("✓ Metadados salvos em %s", SUNO_METADATA)
-    log.info("  Total: %d músicas, %d gêneros", processed, len(genre_stats))
-
-    for genre, s in metadata["genre_stats"].items():
-        log.info("    %s: %d músicas (BPM %s)", genre, s["count"], s["bpm_range"])
-
-    update_knowledge_base(genre_stats)
+# Sanidade: o vetor produzido precisa bater com FEATURE_NAMES.
+assert len(song_to_features(120.0, "generic", 180.0, 0.5, 0.5, 0.5)) == FEATURE_DIM, (
+    "song_to_features() divergiu de FEATURE_NAMES — ajuste um dos dois."
+)
 
 
-def normalize_genre(genre: str) -> str:
-    """Normaliza nome de gênero."""
-    if not genre:
-        return "generic"
-
-    g = genre.lower().strip()
-
-    mapping = {
-        "electrónica": "electronic",
-        "electronic": "electronic",
-        "electrônica": "electronic",
-        "hip-hop": "hiphop",
-        "hip hop": "hiphop",
-        "hiphop": "hiphop",
-        "latin": "latin",
-        "latino": "latin",
-        "jazz": "jazz",
-        "world": "world",
-        "rock": "rock",
-        "ambient": "ambient",
-        "pop": "pop",
-        "reggae": "reggae",
-        "clásica": "classical",
-        "classical": "classical",
-        "clássica": "classical",
-    }
-
-    for key, value in mapping.items():
-        if key in g:
+def _first(song: Dict[str, Any], keys: Tuple[str, ...], default: Any) -> Any:
+    """Retorna o primeiro campo não-vazio entre os nomes alternativos."""
+    for key in keys:
+        value = song.get(key)
+        if value not in (None, "", [], {}):
             return value
-
-    return "generic"
-
-
-def parse_bpm_range(bpm_str: str) -> List[int]:
-    """Converte '125-135' em [125, 135]."""
-    if not bpm_str:
-        return [100, 130]
-
-    import re
-    numbers = re.findall(r"\d+", bpm_str)
-    if len(numbers) >= 2:
-        return [int(numbers[0]), int(numbers[1])]
-    if len(numbers) == 1:
-        v = int(numbers[0])
-        return [v - 5, v + 5]
-    return [100, 130]
+    return default
 
 
-def update_knowledge_base(genre_stats: Dict[str, Dict[str, Any]]) -> None:
-    """Atualiza knowledge_base.json com dados do dataset."""
-    if KNOWLEDGE_BASE.is_file():
-        try:
-            kb = json.loads(KNOWLEDGE_BASE.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            kb = {}
-    else:
-        kb = {}
+def _extract_bpm(song: Dict[str, Any]) -> float:
+    """Extrai BPM aceitando 'bpm', 'tempo' ou 'bpm_range' ([min, max])."""
+    for key in ("bpm", "tempo"):
+        value = song.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    bpm_range = song.get("bpm_range") or song.get("tempo_range")
+    if isinstance(bpm_range, (list, tuple)):
+        for value in bpm_range:
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                return float(value)
+    return 120.0
 
-    for genre, stats in genre_stats.items():
-        bpm_min = min(stats["bpm_values"]) if stats["bpm_values"] else 100
-        bpm_max = max(stats["bpm_values"]) if stats["bpm_values"] else 130
-        scales = stats["scales"][:3] if stats["scales"] else ["major", "minor"]
-        instruments = stats["instruments"][:6] if stats["instruments"] else []
-
-        kb[genre] = {
-            "bpm_range": [bpm_min, bpm_max],
-            "scales": scales,
-            "instruments": instruments,
-            "rhythm": "varied",
-            "energy": 0.6,
-            "source": "suno-ai-music-dataset",
-            "sample_count": stats["count"],
-        }
-
-    KNOWLEDGE_BASE.write_text(
-        json.dumps(kb, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    log.info("✓ knowledge_base.json atualizado com %d gêneros", len(kb))
-
-
-# ============================================================================
-# Extração de Features
-# ============================================================================
 
 def extract_features_from_metadata(songs: List[Dict[str, Any]]) -> np.ndarray:
-    """Extrai features numéricas dos metadados das músicas.
+    """Converte metadados do dataset em features no schema fixo.
 
-    Features por música:
-    - BPM normalizado (1)
-    - One-hot do gênero (10)
-    - Duração normalizada (1)
-    - É instrumental (1)
-    - Energia estimada (1)
-    - Complexidade estimada (1)
-    Total: ~15 features por música
+    Tolerante a nomes de campo alternativos e a valores ausentes —
+    dados reais vêm sujos do Hugging Face.
     """
-    genres = list(set(s["genre"] for s in songs))
-    genre_to_idx = {g: i for i, g in enumerate(genres)}
+    if not songs:
+        return np.zeros((0, FEATURE_DIM), dtype=np.float32)
 
-    features_list = []
-
+    rows: List[List[float]] = []
     for song in songs:
-        feat = []
+        genre = normalize_genre(
+            _first(song, ("genre", "genres", "style", "tag", "tags"), "generic")
+        )
+        profile = GENRE_PROFILE.get(genre, GENRE_PROFILE["generic"])
 
-        bpm = song["bpm_range"][0] if song.get("bpm_range") else 120
-        feat.append(bpm / 200.0)
+        bpm = _extract_bpm(song)
+        duration = _first(
+            song, ("duration", "length", "duration_seconds", "duration_secs", "seconds"), 180.0
+        )
 
-        genre_vec = np.zeros(len(genres))
-        if song["genre"] in genre_to_idx:
-            genre_vec[genre_to_idx[song["genre"]]] = 1.0
-        feat.extend(genre_vec.tolist())
+        mood_text = " ".join(
+            str(part) for part in (
+                _first(song, ("mood", "humor", "vibe", "moods", "tags"), ""),
+                _first(song, ("prompt", "description", "style_prompt"), ""),
+            ) if part
+        )
+        default_energy = sum(profile["energy"]) / 2.0
+        default_valence = sum(profile["valence"]) / 2.0
+        energy, valence = infer_mood_features(mood_text, default_energy, default_valence)
 
-        duration = song.get("duration", 0)
-        feat.append(min(duration / 600.0, 1.0))
+        title = _first(song, ("title", "name", "id", "prompt"), "")
+        complexity = _clip01(GENRE_COMPLEXITY_PRIOR.get(genre, 0.5) + _stable_jitter(title))
 
-        feat.append(1.0 if song.get("is_instrumental", False) else 0.0)
+        rows.append(song_to_features(bpm, genre, duration, energy, complexity, valence))
 
-        energy = estimate_energy(song)
-        feat.append(energy)
-
-        complexity = estimate_complexity(song)
-        feat.append(complexity)
-
-        features_list.append(feat)
-
-    return np.array(features_list, dtype=np.float32)
-
-
-def estimate_energy(song: Dict[str, Any]) -> float:
-    """Estima energia com base no gênero e BPM."""
-    genre = song.get("genre", "generic")
-    bpm = song["bpm_range"][0] if song.get("bpm_range") else 120
-
-    energy_by_genre = {
-        "electronic": 0.85,
-        "hiphop": 0.75,
-        "rock": 0.80,
-        "pop": 0.70,
-        "latin": 0.75,
-        "jazz": 0.50,
-        "ambient": 0.25,
-        "world": 0.60,
-        "reggae": 0.55,
-        "classical": 0.45,
-        "generic": 0.60,
-    }
-
-    base_energy = energy_by_genre.get(genre, 0.60)
-    bpm_factor = min(bpm / 160.0, 1.0) * 0.3
-
-    return min(base_energy + bpm_factor, 1.0)
+    return np.asarray(rows, dtype=np.float32)
 
 
-def estimate_complexity(song: Dict[str, Any]) -> float:
-    """Estima complexidade musical com base no prompt."""
-    prompt = song.get("prompt", "").lower()
-
-    complexity = 0.5
-
-    complex_terms = [
-        "polyrhythm", "jazz", "modal", "fusion", "progressive",
-        "complex", "intricate", "sophisticated", "odd meter",
-        "7/8", "5/4", "chromatic", "extended chords",
-    ]
-
-    simple_terms = [
-        "simple", "minimal", "ambient", "chill", "relaxing",
-        "lo-fi", "basic", "easy",
-    ]
-
-    for term in complex_terms:
-        if term in prompt:
-            complexity += 0.1
-
-    for term in simple_terms:
-        if term in prompt:
-            complexity -= 0.1
-
-    return max(0.0, min(1.0, complexity))
+def genre_indices_from_features(X: np.ndarray) -> np.ndarray:
+    """Índice do gênero (argmax do one-hot) de cada linha de features."""
+    if X.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    start, end = GENRE_SLICE
+    return X[:, start:end].argmax(axis=1).astype(np.int64)
 
 
-def generate_synthetic_data(num_samples: int = 200) -> np.ndarray:
-    """Gera dados sintéticos como complemento.
-    Usado apenas quando não há dados reais suficientes.
+def generate_synthetic_data(num_samples: int = 200,
+                             genres: Optional[List[str]] = None,
+                             seed: Optional[int] = None) -> np.ndarray:
+    """Gera amostras sintéticas SEMPRE no layout do schema fixo.
+
+    `genres` restringe o sorteio (modo 'mixed' passa os gêneros presentes nos
+    dados reais, para acompanhar a distribuição), mas o one-hot tem sempre
+    len(GENRE_SCHEMA) posições — não existe mais caminho pelo qual as
+    dimensões divergem.
     """
-    log.warning("Gerando %d amostras sintéticas (complemento)", num_samples)
+    rng = np.random.default_rng(seed)
+    pool = {normalize_genre(g) for g in (genres if genres is not None else GENRE_SCHEMA)}
+    pool = sorted(g for g in pool if g in GENRE_TO_IDX)
+    if not pool:
+        pool = list(GENRE_SCHEMA)
 
-    genres = ["electronic", "hiphop", "rock", "jazz", "ambient", "latin"]
-    features_list = []
-
+    rows: List[List[float]] = []
     for _ in range(num_samples):
-        feat = []
-
-        bpm = np.random.randint(60, 180)
-        feat.append(bpm / 200.0)
-
-        genre_vec = np.zeros(len(genres))
-        genre_idx = np.random.randint(len(genres))
-        genre_vec[genre_idx] = 1.0
-        feat.extend(genre_vec.tolist())
-
-        duration = np.random.uniform(60, 300)
-        feat.append(duration / 600.0)
-
-        is_instrumental = np.random.random() > 0.4
-        feat.append(1.0 if is_instrumental else 0.0)
-
-        energy = np.random.uniform(0.2, 0.9)
-        feat.append(energy)
-
-        complexity = np.random.uniform(0.3, 0.8)
-        feat.append(complexity)
-
-        features_list.append(feat)
-
-    return np.array(features_list, dtype=np.float32)
+        genre = pool[int(rng.integers(len(pool)))]
+        profile = GENRE_PROFILE.get(genre, GENRE_PROFILE["generic"])
+        rows.append(song_to_features(
+            bpm=int(rng.integers(profile["bpm"][0], profile["bpm"][1] + 1)),
+            genre=genre,
+            duration=float(rng.uniform(45.0, 300.0)),
+            energy=float(rng.uniform(*profile["energy"])),
+            complexity=float(rng.uniform(*profile["complexity"])),
+            valence=float(rng.uniform(*profile["valence"])),
+        ))
+    return np.asarray(rows, dtype=np.float32)
 
 
-# ============================================================================
-# Modelo Autoencoder
-# ============================================================================
+# =============================================================================
+# CARREGAMENTO E DIVISÃO DOS DADOS
+# =============================================================================
 
-def build_autoencoder(input_dim: int, latent_dim: int):
-    """Constrói o autoencoder. Tenta usar PyTorch, senão usa NumPy puro."""
+def load_suno_metadata(path: Path, max_songs: int, seed: int,
+                       log: logging.Logger) -> List[Dict[str, Any]]:
+    """Lê o metadata.json salvo por download_dataset.py.
+
+    Aceita lista pura ou dicionário com 'songs'/'data'/'items'.
+    A subamostragem (max_songs) é determinística (seed).
+    """
     try:
-        import torch
-        import torch.nn as nn
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.error("Não foi possível ler %s: %s", path, exc)
+        return []
 
-        class Autoencoder(nn.Module):
-            def __init__(self, input_dim, latent_dim):
-                super().__init__()
-                self.encoder = nn.Sequential(
-                    nn.Linear(input_dim, 64),
-                    nn.ReLU(),
-                    nn.Linear(64, 32),
-                    nn.ReLU(),
-                    nn.Linear(32, latent_dim),
-                )
-                self.decoder = nn.Sequential(
-                    nn.Linear(latent_dim, 32),
-                    nn.ReLU(),
-                    nn.Linear(32, 64),
-                    nn.ReLU(),
-                    nn.Linear(64, input_dim),
-                    nn.Sigmoid(),
-                )
-
-            def forward(self, x):
-                encoded = self.encoder(x)
-                decoded = self.decoder(encoded)
-                return decoded
-
-        model = Autoencoder(input_dim, latent_dim)
-        log.info("Autoencoder criado com PyTorch (input=%d, latent=%d)", input_dim, latent_dim)
-        return model, "pytorch"
-
-    except ImportError:
-        log.warning("PyTorch não encontrado. Usando autoencoder simplificado em NumPy.")
-        return None, "numpy"
-
-
-class NumpyAutoencoder:
-    """Autoencoder simples em NumPy puro para quando PyTorch não está disponível."""
-
-    def __init__(self, input_dim: int, latent_dim: int):
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-
-        scale = np.sqrt(2.0 / input_dim)
-        self.W1 = np.random.randn(input_dim, 64).astype(np.float32) * scale
-        self.b1 = np.zeros(64, dtype=np.float32)
-        self.W2 = np.random.randn(64, 32).astype(np.float32) * np.sqrt(2.0 / 64)
-        self.b2 = np.zeros(32, dtype=np.float32)
-        self.W3 = np.random.randn(32, latent_dim).astype(np.float32) * np.sqrt(2.0 / 32)
-        self.b3 = np.zeros(latent_dim, dtype=np.float32)
-
-        self.W4 = np.random.randn(latent_dim, 32).astype(np.float32) * np.sqrt(2.0 / latent_dim)
-        self.b4 = np.zeros(32, dtype=np.float32)
-        self.W5 = np.random.randn(32, 64).astype(np.float32) * np.sqrt(2.0 / 32)
-        self.b5 = np.zeros(64, dtype=np.float32)
-        self.W6 = np.random.randn(64, input_dim).astype(np.float32) * np.sqrt(2.0 / 64)
-        self.b6 = np.zeros(input_dim, dtype=np.float32)
-
-    def relu(self, x):
-        return np.maximum(0, x)
-
-    def sigmoid(self, x):
-        return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
-
-    def encode(self, x):
-        h1 = self.relu(x @ self.W1 + self.b1)
-        h2 = self.relu(h1 @ self.W2 + self.b2)
-        z = h2 @ self.W3 + self.b3
-        return z
-
-    def decode(self, z):
-        h4 = self.relu(z @ self.W4 + self.b4)
-        h5 = self.relu(h4 @ self.W5 + self.b5)
-        out = self.sigmoid(h5 @ self.W6 + self.b6)
-        return out
-
-    def forward(self, x):
-        z = self.encode(x)
-        out = self.decode(z)
-        return out
-
-
-def train_numpy_autoencoder(model: NumpyAutoencoder, data: np.ndarray,
-                            epochs: int, batch_size: int,
-                            val_data: np.ndarray) -> Dict[str, List[float]]:
-    """Treina o autoencoder em NumPy puro."""
-    history = {"train_loss": [], "val_loss": []}
-    lr = LEARNING_RATE
-    best_val_loss = float("inf")
-    patience_counter = 0
-    best_weights = None
-
-    for epoch in range(epochs):
-        indices = np.random.permutation(len(data))
-        epoch_loss = 0.0
-        num_batches = 0
-
-        for start in range(0, len(data), batch_size):
-            end = min(start + batch_size, len(data))
-            batch_idx = indices[start:end]
-            batch = data[batch_idx]
-
-            output = model.forward(batch)
-            loss = np.mean((batch - output) ** 2)
-            epoch_loss += loss
-            num_batches += 1
-
-            grad = 2 * (output - batch) / batch.shape[0]
-            model.W6 -= lr * (model.W5.T @ grad)
-            model.b6 -= lr * grad.sum(axis=0)
-
-        avg_train_loss = epoch_loss / max(num_batches, 1)
-        history["train_loss"].append(avg_train_loss)
-
-        val_output = model.forward(val_data)
-        val_loss = np.mean((val_data - val_output) ** 2)
-        history["val_loss"].append(val_loss)
-
-        log.info("Época %d/%d - train_loss: %.4f - val_loss: %.4f",
-                epoch + 1, epochs, avg_train_loss, val_loss)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            best_weights = {
-                "W1": model.W1.copy(), "b1": model.b1.copy(),
-                "W2": model.W2.copy(), "b2": model.b2.copy(),
-                "W3": model.W3.copy(), "b3": model.b3.copy(),
-                "W4": model.W4.copy(), "b4": model.b4.copy(),
-                "W5": model.W5.copy(), "b5": model.b5.copy(),
-                "W6": model.W6.copy(), "b6": model.b6.copy(),
-            }
-        else:
-            patience_counter += 1
-            if patience_counter >= EARLY_STOPPING_PATIENCE:
-                log.info("Early stopping na época %d", epoch + 1)
-                break
-
-        lr *= 0.98
-
-    if best_weights:
-        model.W1, model.b1 = best_weights["W1"], best_weights["b1"]
-        model.W2, model.b2 = best_weights["W2"], best_weights["b2"]
-        model.W3, model.b3 = best_weights["W3"], best_weights["b3"]
-        model.W4, model.b4 = best_weights["W4"], best_weights["b4"]
-        model.W5, model.b5 = best_weights["W5"], best_weights["b5"]
-        model.W6, model.b6 = best_weights["W6"], best_weights["b6"]
-
-    return history
-
-
-# ============================================================================
-# Treinamento Principal
-# ============================================================================
-
-def train(args) -> Dict[str, Any]:
-    """Função principal de treinamento."""
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-
-    log.info("=" * 60)
-    log.info("TREINAMENTO DA IA MUSICAL")
-    log.info("=" * 60)
-
-    dataset_mode = args.dataset
-
-    if dataset_mode in ("suno", "mixed"):
-        if not check_suno_dataset():
-            log.info("Dataset Suno não encontrado. Baixando...")
-            success = download_suno_dataset(max_songs=args.max_songs)
-            if not success:
-                if dataset_mode == "suno":
-                    log.error("Não foi possível baixar o dataset Suno.")
-                    sys.exit(1)
-                else:
-                    log.warning("Fallback para dados sintéticos.")
-                    dataset_mode = "synthetic"
-        else:
-            log.info("✓ Dataset Suno encontrado no cache: %s", SUNO_METADATA)
-
-    real_data = None
-    real_songs = []
-
-    if dataset_mode in ("suno", "mixed") and SUNO_METADATA.is_file():
-        try:
-            metadata = json.loads(SUNO_METADATA.read_text(encoding="utf-8"))
-            real_songs = metadata.get("songs", [])
-
-            if args.max_songs and len(real_songs) > args.max_songs:
-                real_songs = real_songs[:args.max_songs]
-
-            log.info("Carregadas %d músicas reais do dataset Suno", len(real_songs))
-
-            if len(real_songs) >= 10:
-                real_data = extract_features_from_metadata(real_songs)
-                log.info("Features extraídas: shape %s", real_data.shape)
-            else:
-                log.warning("Músicas reais insuficientes (%d). Usando sintéticos.", len(real_songs))
-                dataset_mode = "synthetic"
-
-        except Exception as e:
-            log.error("Erro ao carregar metadados: %s", e)
-            dataset_mode = "synthetic"
-
-    synthetic_data = None
-
-    if dataset_mode == "synthetic":
-        synthetic_data = generate_synthetic_data(num_samples=200)
-        log.info("Usando apenas dados sintéticos: %d amostras", len(synthetic_data))
-
-    elif dataset_mode == "mixed":
-        num_synthetic = max(50, len(real_data) // 4)
-        synthetic_data = generate_synthetic_data(num_samples=num_synthetic)
-        log.info("Adicionando %d amostras sintéticas", num_synthetic)
-
-    if real_data is not None and synthetic_data is not None:
-        data = np.vstack([real_data, synthetic_data])
-        log.info("Dataset misto: %d reais + %d sintéticas = %d total",
-                len(real_data), len(synthetic_data), len(data))
-    elif real_data is not None:
-        data = real_data
+    if isinstance(raw, dict):
+        songs = raw.get("songs") or raw.get("data") or raw.get("items") or []
+    elif isinstance(raw, list):
+        songs = raw
     else:
-        data = synthetic_data
+        log.warning("Formato inesperado em %s — ignorando dataset.", path)
+        return []
 
-    if data is None or len(data) == 0:
-        log.error("Nenhum dado disponível para treinamento.")
-        sys.exit(1)
+    songs = [s for s in songs if isinstance(s, dict)]
+    log.info("Dataset carregado: %d músicas em %s", len(songs), path)
 
-    np.random.shuffle(data)
+    if max_songs and 0 < max_songs < len(songs):
+        rng = np.random.default_rng(seed)
+        chosen = sorted(rng.permutation(len(songs))[:max_songs].tolist())
+        songs = [songs[i] for i in chosen]
+        log.info("Subamostragem determinística: usando %d de %d músicas (seed=%d).",
+                 len(songs), len(songs) and max_songs, seed)
+    return songs
 
-    input_dim = data.shape[1]
-    log.info("Dimensão das features: %d", input_dim)
 
-    mean = data.mean(axis=0)
-    std = data.std(axis=0) + 1e-8
-    data_norm = (data - mean) / std
+def stratified_split(genre_indices: np.ndarray, val_split: float,
+                     seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Divisão treino/validação estratificada por gênero.
 
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez(NORMALIZATION_FILE, mean=mean, std=std)
-    log.info("✓ Normalização salva em %s", NORMALIZATION_FILE)
+    Garante que gêneros presentes nos dados também apareçam na validação
+    (quando há amostras suficientes), evitando vieses com datasets pequenos.
+    """
+    rng = np.random.default_rng(seed)
+    train_parts: List[np.ndarray] = []
+    val_parts: List[np.ndarray] = []
 
-    n = len(data_norm)
-    val_size = max(1, int(n * VALIDATION_SPLIT))
-    test_size = max(1, int(n * TEST_SPLIT))
-    train_size = n - val_size - test_size
+    for g in np.unique(genre_indices):
+        idx = np.where(genre_indices == g)[0]
+        rng.shuffle(idx)
+        n_val = int(round(len(idx) * val_split))
+        if len(idx) >= 2 and n_val >= len(idx):
+            n_val = len(idx) - 1  # nunca esvazia o treino de um gênero
+        val_parts.append(idx[:n_val])
+        train_parts.append(idx[n_val:])
 
-    train_data = data_norm[:train_size]
-    val_data = data_norm[train_size:train_size + val_size]
-    test_data = data_norm[train_size + val_size:]
+    train_idx = (np.concatenate(train_parts) if train_parts
+                 else np.array([], dtype=np.int64))
+    val_idx = (np.concatenate(val_parts) if val_parts
+               else np.array([], dtype=np.int64))
 
-    log.info("Split: treino=%d, validação=%d, teste=%d",
-            train_size, val_size, test_size)
+    if len(val_idx) == 0 and len(genre_indices) >= 4:
+        perm = rng.permutation(len(genre_indices))
+        n_val = max(1, int(len(genre_indices) * val_split))
+        val_idx, train_idx = perm[:n_val], perm[n_val:]
 
-    model, backend = build_autoencoder(input_dim, LATENT_DIM)
+    return train_idx.astype(np.int64), val_idx.astype(np.int64)
 
-    history = {"train_loss": [], "val_loss": []}
-    start_time = time.time()
 
-    if backend == "pytorch":
-        import torch
-        import torch.nn as nn
+def _stack(parts: List[np.ndarray]) -> np.ndarray:
+    parts = [p for p in parts if len(p)]
+    return np.vstack(parts) if parts else np.zeros((0, FEATURE_DIM), dtype=np.float32)
 
-        device = torch.device("cpu")
-        model = model.to(device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-        criterion = nn.MSELoss()
 
-        train_tensor = torch.FloatTensor(train_data).to(device)
-        val_tensor = torch.FloatTensor(val_data).to(device)
+# =============================================================================
+# MODELOS
+# =============================================================================
 
-        best_val_loss = float("inf")
-        patience_counter = 0
-        best_state = None
+class NumPyAutoencoder:
+    """Autoencoder em NumPy puro — fallback quando PyTorch não está disponível.
 
-        for epoch in range(args.epochs):
-            model.train()
+    Arquitetura: input -> hidden(ReLU) -> latent -> hidden(ReLU) -> input(Sigmoid)
+    Treinamento por gradiente descendente em mini-batches com MSE.
+    """
+
+    ACTIVATIONS: Tuple[str, ...] = ("relu", "linear", "relu", "sigmoid")
+
+    def __init__(self, input_dim: int, latent_dim: int = 8,
+                 hidden_dim: int = 48, seed: int = 42):
+        rng = np.random.default_rng(seed)
+        sizes = [input_dim, hidden_dim, latent_dim, hidden_dim, input_dim]
+        self.weights: List[np.ndarray] = []
+        self.biases: List[np.ndarray] = []
+        for fan_in, fan_out in zip(sizes[:-1], sizes[1:]):
+            # Inicialização He (adequada para ReLU)
+            self.weights.append(
+                rng.normal(0.0, np.sqrt(2.0 / fan_in), size=(fan_in, fan_out)).astype(np.float32)
+            )
+            self.biases.append(np.zeros(fan_out, dtype=np.float32))
+
+    # -- forward ------------------------------------------------------------
+    def _forward(self, X: np.ndarray) -> List[np.ndarray]:
+        activations = [X]
+        for i, (W, b) in enumerate(zip(self.weights, self.biases)):
+            z = activations[-1] @ W + b
+            act = self.ACTIVATIONS[i]
+            if act == "relu":
+                a = np.maximum(z, 0.0)
+            elif act == "sigmoid":
+                z = np.clip(z, -30.0, 30.0)  # evita overflow em exp()
+                a = 1.0 / (1.0 + np.exp(-z))
+            else:  # linear (camada latente)
+                a = z
+            activations.append(a.astype(np.float32))
+        return activations
+
+    def reconstruct(self, X: np.ndarray) -> np.ndarray:
+        return self._forward(np.asarray(X, dtype=np.float32))[-1]
+
+    def encode(self, X: np.ndarray) -> np.ndarray:
+        """Espaço latente (útil para interpolação de estilos no gerador)."""
+        return self._forward(np.asarray(X, dtype=np.float32))[2]
+
+    # -- treinamento ---------------------------------------------------------
+    def _train_batch(self, batch: np.ndarray, lr: float) -> float:
+        acts = self._forward(batch)
+        out = acts[-1]
+        # Gradiente do MSE (média sobre o batch)
+        delta = (2.0 / len(batch)) * (out - batch)
+        for i in range(len(self.weights) - 1, -1, -1):
+            a = acts[i + 1]
+            act = self.ACTIVATIONS[i]
+            if act == "relu":
+                delta = delta * (a > 0)
+            elif act == "sigmoid":
+                delta = delta * a * (1.0 - a)
+            # linear: nada a fazer
+            grad_w = acts[i].T @ delta
+            grad_b = delta.sum(axis=0)
+            delta = delta @ self.weights[i].T  # propaga com os pesos ANTIGOS
+            self.weights[i] -= lr * grad_w
+            self.biases[i] -= lr * grad_b
+        return float(np.mean((out - batch) ** 2))
+
+    def fit(self, X_train: np.ndarray, X_val: Optional[np.ndarray] = None, *,
+            epochs: int = 50, batch_size: int = 8, lr: float = 1e-2,
+            patience: int = 5, seed: int = 42,
+            log: Optional[logging.Logger] = None) -> Dict[str, Any]:
+        log = log or LOG
+        rng = np.random.default_rng(seed)
+        X_train = np.asarray(X_train, dtype=np.float32)
+        n = len(X_train)
+        has_val = X_val is not None and len(X_val) > 0
+
+        best_val = float("inf")
+        best_weights = [w.copy() for w in self.weights]
+        best_biases = [b.copy() for b in self.biases]
+        history: List[Dict[str, float]] = []
+        bad_epochs = 0
+
+        for epoch in range(1, epochs + 1):
+            perm = rng.permutation(n)
             epoch_loss = 0.0
-            num_batches = 0
+            for start in range(0, n, batch_size):
+                batch = X_train[perm[start:start + batch_size]]
+                epoch_loss += self._train_batch(batch, lr) * len(batch)
+            train_loss = epoch_loss / n
 
-            indices = torch.randperm(len(train_tensor))
+            if has_val:
+                val_loss = float(np.mean((self.reconstruct(X_val) - X_val) ** 2))
+            else:
+                val_loss = train_loss
 
-            for start in range(0, len(train_tensor), args.batch_size):
-                end = min(start + args.batch_size, len(train_tensor))
-                batch_idx = indices[start:end]
-                batch = train_tensor[batch_idx]
+            history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+            if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
+                log.info("Época %3d/%d — treino: %.5f | validação: %.5f",
+                         epoch, epochs, train_loss, val_loss)
 
+            if has_val:
+                if val_loss < best_val - 1e-6:
+                    best_val = val_loss
+                    best_weights = [w.copy() for w in self.weights]
+                    best_biases = [b.copy() for b in self.biases]
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience:
+                        log.info("Early stopping na época %d (sem melhora por %d épocas).",
+                                 epoch, patience)
+                        break
+
+        if has_val:  # sem validação, mantém os pesos finais
+            self.weights, self.biases = best_weights, best_biases
+        return {"backend": "numpy", "history": history,
+                "best_val_loss": best_val if has_val else None}
+
+
+if HAS_TORCH:
+
+    class TorchAutoencoder(nn.Module):
+        """Autoencoder denso: input -> 48 (ReLU) -> latent -> 48 (ReLU) -> input (Sigmoid)."""
+
+        def __init__(self, input_dim: int, latent_dim: int = 8, hidden_dim: int = 48):
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+            self.decoder = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, input_dim),
+                nn.Sigmoid(),  # todas as features estão normalizadas em [0, 1]
+            )
+
+        def forward(self, x):
+            return self.decoder(self.encoder(x))
+
+    def _train_torch(X_train: np.ndarray, X_val: Optional[np.ndarray], *,
+                     latent_dim: int, epochs: int, batch_size: int, lr: float,
+                     patience: int, seed: int,
+                     log: logging.Logger) -> Tuple[TorchAutoencoder, Dict[str, Any]]:
+        torch.manual_seed(seed)
+        model = TorchAutoencoder(input_dim=X_train.shape[1], latent_dim=latent_dim)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        loss_fn = nn.MSELoss()
+
+        Xtr = torch.from_numpy(np.ascontiguousarray(X_train)).float()
+        Xva = (torch.from_numpy(np.ascontiguousarray(X_val)).float()
+               if X_val is not None and len(X_val) else None)
+        n = Xtr.shape[0]
+        has_val = Xva is not None
+
+        best_val = float("inf")
+        best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        history: List[Dict[str, float]] = []
+        bad_epochs = 0
+
+        for epoch in range(1, epochs + 1):
+            model.train()
+            perm = torch.randperm(n)
+            epoch_loss = 0.0
+            for start in range(0, n, batch_size):
+                batch = Xtr[perm[start:start + batch_size]]
                 optimizer.zero_grad()
-                output = model(batch)
-                loss = criterion(output, batch)
+                loss = loss_fn(model(batch), batch)
                 loss.backward()
                 optimizer.step()
+                epoch_loss += float(loss.item()) * batch.shape[0]
+            train_loss = epoch_loss / n
 
-                epoch_loss += loss.item()
-                num_batches += 1
-
-            avg_train_loss = epoch_loss / max(num_batches, 1)
-            history["train_loss"].append(avg_train_loss)
-
-            model.eval()
-            with torch.no_grad():
-                val_output = model(val_tensor)
-                val_loss = criterion(val_output, val_tensor).item()
-            history["val_loss"].append(val_loss)
-
-            log.info("Época %d/%d - train_loss: %.4f - val_loss: %.4f",
-                    epoch + 1, args.epochs, avg_train_loss, val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            if has_val:
+                model.eval()
+                with torch.no_grad():
+                    val_loss = float(loss_fn(model(Xva), Xva).item())
             else:
-                patience_counter += 1
-                if patience_counter >= EARLY_STOPPING_PATIENCE:
-                    log.info("Early stopping na época %d", epoch + 1)
-                    break
+                val_loss = train_loss
 
-            for param_group in optimizer.param_groups:
-                param_group["lr"] *= 0.98
+            history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+            if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
+                log.info("Época %3d/%d — treino: %.5f | validação: %.5f",
+                         epoch, epochs, train_loss, val_loss)
 
-        if best_state:
+            if has_val:
+                if val_loss < best_val - 1e-6:
+                    best_val = val_loss
+                    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience:
+                        log.info("Early stopping na época %d (sem melhora por %d épocas).",
+                                 epoch, patience)
+                        break
+
+        if has_val:  # sem validação, mantém os pesos finais
             model.load_state_dict(best_state)
-
-        model_path = MODELS_DIR / "autoencoder.pt"
-        torch.save(model.state_dict(), model_path)
-        log.info("✓ Modelo salvo em %s", model_path)
-
-    else:
-        np_model = NumpyAutoencoder(input_dim, LATENT_DIM)
-        history = train_numpy_autoencoder(
-            np_model, train_data, args.epochs, args.batch_size, val_data
-        )
-
-        model_path = MODELS_DIR / "autoencoder_np.npz"
-        np.savez(
-            model_path,
-            W1=np_model.W1, b1=np_model.b1,
-            W2=np_model.W2, b2=np_model.b2,
-            W3=np_model.W3, b3=np_model.b3,
-            W4=np_model.W4, b4=np_model.b4,
-            W5=np_model.W5, b5=np_model.b5,
-            W6=np_model.W6, b6=np_model.b6,
-        )
-        log.info("✓ Modelo salvo em %s", model_path)
-
-    elapsed = time.time() - start_time
-    log.info("Treinamento concluído em %.1f segundos", elapsed)
-
-    if backend == "pytorch":
-        import torch
         model.eval()
-        test_tensor = torch.FloatTensor(test_data)
+        return model, {"backend": "torch", "history": history,
+                       "best_val_loss": best_val if has_val else None}
+
+
+def train_autoencoder(X_train: np.ndarray, X_val: Optional[np.ndarray], *,
+                      latent_dim: int, epochs: int, batch_size: int, lr: float,
+                      patience: int, seed: int,
+                      log: logging.Logger) -> Tuple[Any, Dict[str, Any]]:
+    """Treina com PyTorch (se disponível) ou com o fallback em NumPy puro."""
+    if HAS_TORCH:
+        return _train_torch(X_train, X_val, latent_dim=latent_dim, epochs=epochs,
+                            batch_size=batch_size, lr=lr, patience=patience,
+                            seed=seed, log=log)
+    model = NumPyAutoencoder(input_dim=X_train.shape[1], latent_dim=latent_dim, seed=seed)
+    info = model.fit(X_train, X_val, epochs=epochs, batch_size=batch_size,
+                     lr=lr, patience=patience, seed=seed, log=log)
+    return model, info
+
+
+# =============================================================================
+# AVALIAÇÃO E PERSISTÊNCIA
+# =============================================================================
+
+def reconstruct(model: Any, X: np.ndarray, backend: str) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32)
+    if backend == "torch":
+        model.eval()
         with torch.no_grad():
-            test_output = model(test_tensor)
-            test_loss = torch.nn.functional.mse_loss(test_output, test_tensor).item()
-    else:
-        test_output = np_model.forward(test_data)
-        test_loss = np.mean((test_data - test_output) ** 2)
+            return model(torch.from_numpy(X)).numpy()
+    return model.reconstruct(X)
 
-    log.info("Loss no conjunto de teste: %.4f", test_loss)
 
-    training_report = {
-        "dataset_mode": dataset_mode,
-        "total_songs": len(data),
-        "real_songs": len(real_songs) if real_songs else 0,
-        "synthetic_songs": len(synthetic_data) if synthetic_data is not None else 0,
-        "input_dim": input_dim,
-        "latent_dim": LATENT_DIM,
-        "backend": backend,
-        "epochs_completed": len(history["train_loss"]),
-        "epochs_requested": args.epochs,
-        "final_train_loss": history["train_loss"][-1] if history["train_loss"] else None,
-        "final_val_loss": history["val_loss"][-1] if history["val_loss"] else None,
-        "test_loss": test_loss,
-        "training_time_seconds": round(elapsed, 2),
-        "early_stopping_triggered": len(history["train_loss"]) < args.epochs,
-        "genre_distribution": {},
+def encode(model: Any, X: np.ndarray, backend: str) -> np.ndarray:
+    """Retorna o espaço latente (p/ interpolação de estilos no gerador)."""
+    X = np.asarray(X, dtype=np.float32)
+    if backend == "torch":
+        model.eval()
+        with torch.no_grad():
+            return model.encoder(torch.from_numpy(X)).numpy()
+    return model.encode(X)
+
+
+def evaluate(model: Any, X: np.ndarray, backend: str) -> Dict[str, float]:
+    """Métricas interpretáveis: MSE, acurácia de gênero e erro de BPM."""
+    X = np.asarray(X, dtype=np.float32)
+    if X.size == 0:
+        return {"mse": float("nan"), "genre_accuracy": float("nan"),
+                "bpm_mae": float("nan")}
+    recon = reconstruct(model, X, backend)
+    start, end = GENRE_SLICE
+    return {
+        "mse": float(np.mean((recon - X) ** 2)),
+        "genre_accuracy": float(np.mean(
+            X[:, start:end].argmax(axis=1) == recon[:, start:end].argmax(axis=1)
+        )),
+        "bpm_mae": float(np.mean(np.abs(recon[:, 0] - X[:, 0])) * 200.0),
     }
 
-    if real_songs:
-        genre_counts = {}
-        for song in real_songs:
-            g = song.get("genre", "unknown")
-            genre_counts[g] = genre_counts.get(g, 0) + 1
-        training_report["genre_distribution"] = genre_counts
 
-    report_path = MEMORY_DIR / "training_report.json"
-    report_path.write_text(
-        json.dumps(training_report, indent=2, ensure_ascii=False),
+def _save_model(model: Any, backend: str, latent_dim: int,
+                metrics: Dict[str, float], models_dir: Path,
+                log: logging.Logger) -> Dict[str, Any]:
+    models_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "backend": backend,
+        "feature_dim": FEATURE_DIM,
+        "genre_schema": GENRE_SCHEMA,
+        "feature_names": FEATURE_NAMES,
+        "latent_dim": latent_dim,
+        "val_mse": metrics.get("mse"),
+        "val_genre_accuracy": metrics.get("genre_accuracy"),
+        "val_bpm_mae": metrics.get("bpm_mae"),
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    if backend == "torch":
+        weights_path = models_dir / "autoencoder.pt"
+        torch.save(model.state_dict(), weights_path)
+    else:
+        weights_path = models_dir / "autoencoder_np.npz"
+        arrays: Dict[str, np.ndarray] = {}
+        for i, (w, b) in enumerate(zip(model.weights, model.biases)):
+            arrays[f"W{i}"], arrays[f"b{i}"] = w, b
+        np.savez_compressed(weights_path, **arrays)
+
+    (models_dir / "autoencoder_meta.json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    log.info("Modelo salvo: %s | metadados: %s",
+             weights_path, models_dir / "autoencoder_meta.json")
+    return meta
+
+
+def load_autoencoder(models_dir: Path = MODELS_DIR) -> Tuple[Any, Dict[str, Any], str]:
+    """Carrega o modelo + metadados, VALIDANDO o schema (fonte única de verdade).
+
+    Use esta função em music_generator.py / music_intelligence.py em vez de
+    abrir os arquivos diretamente — ela recusa modelos treinados com schema
+    antigo, evitando erros silenciosos.
+    """
+    meta_path = models_dir / "autoencoder_meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"Nenhum modelo treinado em {models_dir}. Rode 'python train.py' primeiro."
+        )
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    if (meta.get("feature_dim") != FEATURE_DIM
+            or list(meta.get("genre_schema", [])) != list(GENRE_SCHEMA)):
+        raise ValueError(
+            "Modelo em cache incompatível com o schema atual "
+            f"(treinado com feature_dim={meta.get('feature_dim')}, "
+            f"gêneros={meta.get('genre_schema')}). "
+            "Retreine com 'python train.py --dataset mixed'."
+        )
+    latent_dim = int(meta.get("latent_dim", 8))
+
+    if HAS_TORCH and (models_dir / "autoencoder.pt").exists():
+        model = TorchAutoencoder(FEATURE_DIM, latent_dim=latent_dim)
+        model.load_state_dict(torch.load(models_dir / "autoencoder.pt",
+                                         map_location="cpu"))
+        model.eval()
+        return model, meta, "torch"
+
+    npz_path = models_dir / "autoencoder_np.npz"
+    if npz_path.exists():
+        with np.load(npz_path) as data:
+            n_layers = sum(1 for key in data.files if key.startswith("W"))
+            model = NumPyAutoencoder(FEATURE_DIM, latent_dim=latent_dim)
+            model.weights = [data[f"W{i}"].astype(np.float32) for i in range(n_layers)]
+            model.biases = [data[f"b{i}"].astype(np.float32) for i in range(n_layers)]
+        return model, meta, "numpy"
+
+    raise FileNotFoundError(
+        f"Metadados encontrados em {meta_path}, mas sem pesos utilizáveis "
+        "(modelos .pt exigem PyTorch instalado). Retreine com 'python train.py'."
+    )
+
+
+def _save_training_report(args: argparse.Namespace, *, info: Dict[str, Any],
+                          metrics: Dict[str, float], n_real: int, n_synth: int,
+                          n_train: int, n_val: int, log: logging.Logger) -> None:
+    args.memory_dir.mkdir(parents=True, exist_ok=True)
+    summary = {
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "backend": info["backend"],
+        "dataset_mode": args.dataset,
+        "num_real_songs": n_real,
+        "num_synthetic": n_synth,
+        "train_samples": n_train,
+        "val_samples": n_val,
+        "feature_dim": FEATURE_DIM,
+        "genre_schema": GENRE_SCHEMA,
+        "epochs_requested": args.epochs,
+        "epochs_run": len(info["history"]),
+        "best_val_loss": info["best_val_loss"],
+        "val_mse": metrics.get("mse"),
+        "val_genre_accuracy": metrics.get("genre_accuracy"),
+        "val_bpm_mae": metrics.get("bpm_mae"),
+    }
+    (args.memory_dir / "training_report.json").write_text(
+        json.dumps({**summary, "history": info["history"]},
+                   indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
-    log.info("✓ Relatório de treinamento salvo em %s", report_path)
 
-    log.info("")
-    log.info("=" * 60)
-    log.info("RESUMO DO TREINAMENTO")
-    log.info("=" * 60)
-    log.info("  Dataset: %s", dataset_mode)
-    log.info("  Músicas reais: %d", training_report["real_songs"])
-    log.info("  Músicas sintéticas: %d", training_report["synthetic_songs"])
-    log.info("  Backend: %s", backend)
-    log.info("  Épocas: %d/%d", training_report["epochs_completed"], args.epochs)
-    log.info("  Loss final (teste): %.4f", test_loss)
-    log.info("  Tempo: %.1f segundos", elapsed)
-    log.info("")
-
-    if training_report["real_songs"] == 0:
-        log.warning("⚠️  ATENÇÃO: Treinado apenas com dados sintéticos.")
-        log.warning("   A IA aprendeu padrões genéricos, não música real.")
-        log.warning("   Para melhor resultado, execute: python download_dataset.py")
-
-    return training_report
+    # Histórico acumulado — alimenta o feedback loop (music_intelligence.py)
+    history_path = args.memory_dir / "training_history.json"
+    try:
+        entries = (json.loads(history_path.read_text(encoding="utf-8"))
+                   if history_path.exists() else [])
+        if not isinstance(entries, list):
+            entries = []
+        entries.append(summary)
+        history_path.write_text(json.dumps(entries, indent=2, ensure_ascii=False),
+                               encoding="utf-8")
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Não foi possível atualizar o histórico de treinos: %s", exc)
 
 
-# ============================================================================
-# Listar Gêneros
-# ============================================================================
+# =============================================================================
+# TREINAMENTO (ENTRY POINT)
+# =============================================================================
 
-def list_genres():
-    """Lista gêneros disponíveis no dataset."""
-    if not SUNO_METADATA.is_file():
-        log.warning("Dataset Suno não encontrado.")
-        log.info("Execute: python train.py --dataset suno")
-        log.info("Ou: python download_dataset.py")
-        return
+def train(args: argparse.Namespace) -> int:
+    log = _setup_logging(args.verbose)
+    log.info("=" * 64)
+    log.info("IA Music Pro — Treinamento do autoencoder de estilo")
+    log.info("Backend: %s | modo: %s | seed: %d",
+             "PyTorch" if HAS_TORCH else "NumPy puro (fallback)",
+             args.dataset, args.seed)
+    log.info("Schema fixo: %d features (%d gêneros no one-hot)",
+             FEATURE_DIM, len(GENRE_SCHEMA))
+    log.info("=" * 64)
 
-    metadata = json.loads(SUNO_METADATA.read_text(encoding="utf-8"))
-    genre_stats = metadata.get("genre_stats", {})
+    if args.epochs < 1 or args.batch_size < 1:
+        log.error("--epochs e --batch-size devem ser >= 1.")
+        return 1
 
-    print("\n=== GÊNEROS DISPONÍVEIS ===\n")
+    np.random.seed(args.seed)
+    if HAS_TORCH:
+        torch.manual_seed(args.seed)
 
-    for genre, stats in sorted(genre_stats.items()):
-        print(f"  {genre:15s} - {stats['count']:3d} músicas - BPM {stats['bpm_range']}")
+    # -- 1. Dados reais ------------------------------------------------------
+    real_songs: List[Dict[str, Any]] = []
+    if args.dataset in ("suno", "mixed"):
+        if args.dataset_path.exists():
+            real_songs = load_suno_metadata(args.dataset_path, args.max_songs,
+                                            args.seed, log)
+        else:
+            log.warning("Dataset não encontrado em %s — rode "
+                        "'python download_dataset.py' antes.", args.dataset_path)
+        if not real_songs and args.dataset == "suno":
+            log.error("O modo 'suno' exige o dataset real. Abortando.")
+            return 1
 
-    print(f"\nTotal: {metadata['total_processed']} músicas")
-    print(f"Gêneros: {len(genre_stats)}")
+    real_data = extract_features_from_metadata(real_songs)
+    if len(real_data):
+        log.info("Features reais: shape %s (%d músicas carregadas)",
+                 real_data.shape, len(real_songs))
+    elif real_songs:
+        log.warning("Músicas carregadas, mas nenhuma feature extraída — "
+                    "verifique o formato de %s", args.dataset_path)
+    else:
+        log.warning("Nenhuma música real disponível.")
+
+    # -- 2. Dados sintéticos ---------------------------------------------------
+    synthetic_data = np.zeros((0, FEATURE_DIM), dtype=np.float32)
+    if args.dataset == "synthetic":
+        log.info("Modo sintético puro: gerando %d amostras.", args.synthetic_samples)
+        synthetic_data = generate_synthetic_data(
+            num_samples=args.synthetic_samples, seed=args.seed)
+    elif args.dataset == "mixed" and len(real_data) < MIN_TRAIN_SAMPLES:
+        num_synthetic = MIN_TRAIN_SAMPLES - len(real_data)
+        log.warning("Gerando %d amostras sintéticas (complemento)", num_synthetic)
+        real_genres = sorted({
+            normalize_genre(_first(s, ("genre", "genres", "style", "tag", "tags"), "generic"))
+            for s in real_songs
+        }) or None
+        synthetic_data = generate_synthetic_data(
+            num_samples=num_synthetic, genres=real_genres, seed=args.seed)
+        log.info("Adicionando %d amostras sintéticas", len(synthetic_data))
+    elif args.dataset == "mixed":
+        log.info("Reais suficientes (%d >= %d): sem complemento sintético.",
+                 len(real_data), MIN_TRAIN_SAMPLES)
+
+    # -- 3. Validação defensiva de dimensões -----------------------------------
+    for name, arr in (("real", real_data), ("sintético", synthetic_data)):
+        if arr.size and (arr.ndim != 2 or arr.shape[1] != FEATURE_DIM):
+            raise ValueError(
+                f"Dados {name}: shape {arr.shape} — esperado (n, {FEATURE_DIM}). "
+                "Alguém alterou GENRE_SCHEMA ou adicionou feature em um único extrator?"
+            )
+    if len(real_data) == 0 and len(synthetic_data) == 0:
+        log.error("Sem dados para treinar (reais e sintéticos vazios).")
+        return 1
+
+    # -- 4. Split treino/validação ANTES de misturar ---------------------------
+    empty = np.zeros((0, FEATURE_DIM), dtype=np.float32)
+    if len(real_data) >= 4:
+        tr, va = stratified_split(genre_indices_from_features(real_data),
+                                 args.val_split, args.seed)
+        real_train, real_val = real_data[tr], real_data[va]
+        # mixed: sintéticos vão SOMENTE para o treino — não contaminam a validação
+        synth_train, synth_val = synthetic_data, empty
+    elif len(synthetic_data) >= 4:
+        log.info("Sem dados reais suficientes: validação sai das amostras sintéticas.")
+        tr, va = stratified_split(genre_indices_from_features(synthetic_data),
+                                 args.val_split, args.seed)
+        synth_train, synth_val = synthetic_data[tr], synthetic_data[va]
+        real_train, real_val = real_data, empty
+    else:
+        real_train, real_val = real_data, empty
+        synth_train, synth_val = synthetic_data, empty
+
+    X_train = _stack([real_train, synth_train])
+    X_val = _stack([real_val, synth_val])
+
+    rng = np.random.default_rng(args.seed)
+    X_train = X_train[rng.permutation(len(X_train))]
+
+    if len(X_val) == 0:
+        log.warning("Validação vazia — early stopping desativado; "
+                    "métricas finais serão otimistas.")
+        X_val_fit: Optional[np.ndarray] = None
+    else:
+        X_val_fit = X_val
+
+    log.info("Amostras — treino: %d | validação: %d (reais: %d | sintéticas: %d)",
+             len(X_train), len(X_val), len(real_data), len(synthetic_data))
+
+    # -- 5. Treinamento ---------------------------------------------------------
+    # GD puro (NumPy) precisa de lr maior que o Adam (PyTorch).
+    lr = args.lr if HAS_TORCH else max(args.lr, 1e-2)
+    model, info = train_autoencoder(
+        X_train, X_val_fit,
+        latent_dim=args.latent_dim, epochs=args.epochs, batch_size=args.batch_size,
+        lr=lr, patience=args.patience, seed=args.seed, log=log,
+    )
+
+    # -- 6. Avaliação ------------------------------------------------------------
+    X_eval = X_val_fit if X_val_fit is not None else X_train
+    if X_val_fit is None:
+        log.warning("Avaliando no próprio treino (sem conjunto de validação).")
+    metrics = evaluate(model, X_eval, info["backend"])
+    log.info("Avaliação — MSE: %.5f | acurácia de gênero: %.1f%% | erro de BPM: ±%.1f",
+             metrics["mse"], 100.0 * metrics["genre_accuracy"], metrics["bpm_mae"])
+
+    # -- 7. Persistência + verificação de integridade -----------------------------
+    _save_model(model, info["backend"], args.latent_dim, metrics,
+                args.models_dir, log)
+    try:
+        reloaded, _, backend = load_autoencoder(args.models_dir)
+        check = evaluate(reloaded, X_eval, backend)
+        if np.isclose(check["mse"], metrics["mse"], rtol=1e-6, equal_nan=True):
+            log.info("Verificação pós-save OK: modelo recarregado reproduz "
+                     "o MSE (%.5f).", check["mse"])
+        else:
+            log.warning("Verificação pós-save divergiu: %.6f vs %.6f — "
+                        "o modelo salvo pode estar corrompido.",
+                        check["mse"], metrics["mse"])
+    except (OSError, ValueError) as exc:
+        log.error("Falha ao recarregar o modelo salvo: %s", exc)
+        return 1
+
+    # -- 8. Relatório (alimenta o feedback loop) ----------------------------------
+    _save_training_report(args, info=info, metrics=metrics, n_real=len(real_data),
+                          n_synth=len(synthetic_data), n_train=len(X_train),
+                          n_val=len(X_val), log=log)
+
+    log.info("Treinamento concluído com sucesso.")
+    return 0
 
 
-# ============================================================================
-# Main
-# ============================================================================
+# =============================================================================
+# CLI
+# =============================================================================
 
-def main():
-    parser = argparse.ArgumentParser(description="Treinar IA Musical")
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Treina o autoencoder de estilo do IA Music Pro.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--dataset", choices=("suno", "synthetic", "mixed"),
+                        default="mixed",
+                        help="suno: só dataset real | synthetic: só amostras "
+                             "sintéticas | mixed: real + complemento sintético")
+    parser.add_argument("--max-songs", type=int, default=100,
+                        help="Máximo de músicas reais usadas (0 = todas)")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Taxa de aprendizado (Adam no torch; GD no fallback)")
+    parser.add_argument("--latent-dim", type=int, default=8)
+    parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--patience", type=int, default=5,
+                        help="Épocas sem melhora antes do early stopping")
+    parser.add_argument("--synthetic-samples", type=int, default=200,
+                        help="Amostras no modo 'synthetic'")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset-path", type=Path, default=DATASET_PATH)
+    parser.add_argument("--models-dir", type=Path, default=MODELS_DIR)
+    parser.add_argument("--memory-dir", type=Path, default=MEMORY_DIR)
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args(argv)
 
-    parser.add_argument("--dataset", type=str, default="mixed",
-                       choices=["suno", "synthetic", "mixed"],
-                       help="Fonte de dados para treinamento")
-    parser.add_argument("--max-songs", type=int, default=None,
-                       help="Número máximo de músicas para usar")
-    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
-                       help="Número de épocas de treinamento")
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-                       help="Tamanho do batch")
-    parser.add_argument("--list-genres", action="store_true",
-                       help="Listar gêneros disponíveis no dataset")
 
-    args = parser.parse_args()
-
-    if args.list_genres:
-        list_genres()
-        return
-
-    train(args)
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+    sys.exit(train(args))
 
 
 if __name__ == "__main__":
