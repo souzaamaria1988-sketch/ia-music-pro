@@ -1,82 +1,109 @@
-name: Treinar Modelo (10.000 épocas completas)
+name: Treinar Modelo
 
 on:
   workflow_dispatch:
     inputs:
-      epochs:
-        description: "Épocas (padrão 10000)"
+      max_songs:
+        description: 'Máximo de músicas para treinar (0 = todas)'
         required: false
-        default: "10000"
-      early_stopping:
-        description: "Ativar early stopping?"
+        default: '100'
+      force_redownload:
+        description: 'Forçar novo download do dataset'
         required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
-
-permissions:
-  contents: write
+        default: 'false'
 
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 horas máximo
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
+    - uses: actions/checkout@v4
 
-    - name: Setup Python
+    - name: Configurar Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.11"
+        python-version: '3.11'
 
-    - name: Install Dependencies
-      run: pip install numpy scipy soundfile
+    - name: Cache de dependências Python
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
 
-    - name: Train Autoencoder (Complete)
-      env:
-        EPOCHS: ${{ github.event.inputs.epochs }}
-        EARLY_STOPPING: ${{ github.event.inputs.early_stopping }}
+    - name: Cache do dataset Hugging Face
+      uses: actions/cache@v4
+      with:
+        path: |
+          datasets/hf_cache
+          datasets/suno-ai-music-dataset
+        key: ${{ runner.os }}-suno-dataset-v1
+        restore-keys: |
+          ${{ runner.os }}-suno-dataset-
+
+    - name: Cache de modelos treinados
+      uses: actions/cache@v4
+      with:
+        path: |
+          models
+          memory
+        key: ${{ runner.os }}-models-v1
+        restore-keys: |
+          ${{ runner.os }}-models-
+
+    - name: Instalar dependências
       run: |
-        echo "=========================================="
-        echo "  🧠 TREINAMENTO COMPLETO"
-        echo "  Épocas: $EPOCHS"
-        echo "  Early stopping: $EARLY_STOPPING"
-        echo "=========================================="
-        
-        if [ "$EARLY_STOPPING" = "true" ]; then
-          python train.py --epochs $EPOCHS --early-stopping
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Verificar cache do dataset
+      id: dataset_check
+      run: |
+        if [ -f "datasets/suno-ai-music-dataset/metadata.json" ] && [ "${{ github.event.inputs.force_redownload }}" != "true" ]; then
+          echo "cached=true" >> $GITHUB_OUTPUT
+          echo "✓ Dataset encontrado no cache"
         else
-          python train.py --epochs $EPOCHS
+          echo "cached=false" >> $GITHUB_OUTPUT
+          echo "Dataset não encontrado - será baixado"
         fi
 
-    - name: Show Results
+    - name: Baixar dataset (se não estiver em cache)
+      if: steps.dataset_check.outputs.cached == 'false'
       run: |
-        echo "📊 Resultados:"
-        if [ -f models/autoencoder/training_log.json ]; then
-          cat models/autoencoder/training_log.json
-        fi
+        python download_dataset.py \
+          --max-songs ${{ github.event.inputs.max_songs }}
 
-    - name: Commit Models
+    - name: Mostrar estatísticas do dataset
       run: |
-        git config --local user.email "train-bot@github.com"
-        git config --local user.name "Train Bot"
-        git add models/
-        if git diff --staged --quiet; then
-          echo "Nada para commitar"
-        else
-          git commit -m "🧠 Autoencoder treinado: $(date '+%Y-%m-%d %H:%M')"
-          git pull --rebase origin main || true
-          git push
-        fi
+        python download_dataset.py --stats-only
 
-    - name: Upload Artifact
+    - name: Atualizar knowledge_base.json
+      run: |
+        python download_dataset.py --update-knowledge
+
+    - name: Treinar modelo
+      run: |
+        python train.py \
+          --dataset datasets/suno-ai-music-dataset/metadata.json \
+          --epochs 20 \
+          --batch-size 8
+
+    - name: Salvar artefatos de treinamento
       uses: actions/upload-artifact@v4
       with:
-        name: autoencoder-model
-        path: models/autoencoder/
-        retention-days: 90
+        name: trained-model
+        path: |
+          models/
+          memory/
+          knowledge_base.json
+        if-no-files-found: warn
+
+    - name: Commit knowledge_base atualizado
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add knowledge_base.json
+        git diff --quiet && git diff --staged --quiet || \
+          git commit -m "chore: atualiza knowledge_base com dataset Suno" && \
+          git push
