@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Baixa e processa o dataset Kukedlc/suno-ai-music-dataset do Hugging Face.
 
+Este script NÃO baixa os MP3s diretamente (URLs do CDN da Suno bloqueiam hotlinking).
+Em vez disso, usa os metadados do dataset, que são suficientes para treinar a IA.
+
 Uso:
-    python download_dataset.py                    # baixa tudo
-    python download_dataset.py --max-songs 50     # baixa só 50 músicas
+    python download_dataset.py                    # processa tudo (usa cache do HF)
+    python download_dataset.py --max-songs 50     # processa só 50 músicas
     python download_dataset.py --streaming        # modo streaming (não baixa tudo)
     python download_dataset.py --update-knowledge # atualiza knowledge_base.json
 
@@ -45,11 +48,6 @@ def check_dependencies():
         missing.append("datasets")
 
     try:
-        import soundfile  # noqa: F401
-    except ImportError:
-        missing.append("soundfile")
-
-    try:
         import numpy  # noqa: F401
     except ImportError:
         missing.append("numpy")
@@ -89,63 +87,6 @@ def load_dataset_cached(streaming: bool = False):
     elapsed = time.time() - start
     log.info("Dataset carregado em %.1f segundos", elapsed)
     return ds
-
-
-def extract_audio_features(audio_path: Path) -> Optional[Dict[str, Any]]:
-    """Extrai features básicas do áudio para treinamento."""
-    try:
-        import soundfile as sf
-        import numpy as np
-
-        data, samplerate = sf.read(str(audio_path))
-
-        if data.ndim > 1:
-            data = data.mean(axis=1)
-
-        duration = len(data) / samplerate
-        rms = float(np.sqrt(np.mean(data ** 2)))
-        peak = float(np.max(np.abs(data)))
-        spectral_centroid = float(
-            np.sum(np.fft.rfftfreq(len(data), 1.0 / samplerate) * np.abs(np.fft.rfft(data)))
-            / np.sum(np.abs(np.fft.rfft(data)))
-            if np.sum(np.abs(np.fft.rfft(data))) > 0 else 0
-        )
-
-        return {
-            "duration": duration,
-            "sample_rate": samplerate,
-            "rms": rms,
-            "peak": peak,
-            "spectral_centroid_hz": spectral_centroid,
-            "samples": len(data),
-        }
-
-    except Exception as e:
-        log.warning("Não foi possível extrair features de %s: %s", audio_path, e)
-        return None
-
-
-def download_audio(url: str, dest: Path, timeout: int = 60) -> bool:
-    """Baixa um arquivo de áudio da URL."""
-    import urllib.request
-
-    if dest.exists() and dest.stat().st_size > 1000:
-        return True
-
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "IA-Music-Pro/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            with open(dest, "wb") as f:
-                f.write(response.read())
-        return True
-    except Exception as e:
-        log.warning("Falha ao baixar %s: %s", url, e)
-        return False
 
 
 def normalize_genre(genre: str) -> str:
@@ -232,13 +173,15 @@ def update_knowledge_base(genre_stats: Dict[str, Dict[str, Any]]):
 
 
 def process_dataset(max_songs: Optional[int] = None, streaming: bool = False,
-                    download_audio_files: bool = True, update_kb: bool = True):
-    """Processa o dataset e salva metadados."""
+                    update_kb: bool = True):
+    """Processa o dataset e salva metadados.
+    
+    NOTA: Não baixa os arquivos MP3 (URLs do CDN da Suno bloqueiam hotlinking).
+    Usa apenas os metadados, que são suficientes para treinar a IA.
+    """
     check_dependencies()
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    audio_dir = CACHE_DIR / "audio"
-    audio_dir.mkdir(exist_ok=True)
 
     ds = load_dataset_cached(streaming=streaming)
 
@@ -247,18 +190,16 @@ def process_dataset(max_songs: Optional[int] = None, streaming: bool = False,
         "songs": [],
         "genre_stats": {},
         "total_processed": 0,
-        "total_downloaded": 0,
     }
 
     genre_stats: Dict[str, Dict[str, Any]] = {}
     processed = 0
-    downloaded = 0
 
     iterator = ds
     if max_songs:
         iterator = ds.take(max_songs) if streaming else list(ds)[:max_songs]
 
-    log.info("Processando músicas...")
+    log.info("Processando músicas (apenas metadados)...")
 
     for item in iterator:
         if max_songs and processed >= max_songs:
@@ -274,7 +215,6 @@ def process_dataset(max_songs: Optional[int] = None, streaming: bool = False,
         prompt = item.get("gpt_description_prompt") or item.get("tags", "")
         duration = item.get("duration", 0)
         is_instrumental = item.get("is_instrumental", True)
-        audio_url = item.get("audio_url", "")
 
         genre = normalize_genre(genre_raw)
 
@@ -284,7 +224,7 @@ def process_dataset(max_songs: Optional[int] = None, streaming: bool = False,
                 "bpm_values": [],
                 "scales": [],
                 "instruments": [],
-                "avg_rms": 0.0,
+                "avg_rms": 0.2,
                 "durations": [],
             }
 
@@ -326,22 +266,7 @@ def process_dataset(max_songs: Optional[int] = None, streaming: bool = False,
             "prompt": prompt[:500] if prompt else "",
             "duration": float(duration) if duration else 0,
             "is_instrumental": bool(is_instrumental),
-            "audio_url": audio_url,
         }
-
-        if download_audio_files and audio_url:
-            audio_path = audio_dir / f"{song_id}.mp3"
-            if download_audio(audio_url, audio_path):
-                downloaded += 1
-                song_data["local_audio"] = str(audio_path)
-
-                features = extract_audio_features(audio_path)
-                if features:
-                    song_data["features"] = features
-                    stats["avg_rms"] = (
-                        (stats["avg_rms"] * (stats["count"] - 1) + features["rms"])
-                        / stats["count"]
-                    )
 
         metadata["songs"].append(song_data)
         processed += 1
@@ -350,7 +275,6 @@ def process_dataset(max_songs: Optional[int] = None, streaming: bool = False,
             log.info("  Processadas %d músicas...", processed)
 
     metadata["total_processed"] = processed
-    metadata["total_downloaded"] = downloaded
     metadata["genre_stats"] = {
         genre: {
             "count": s["count"],
@@ -372,7 +296,6 @@ def process_dataset(max_songs: Optional[int] = None, streaming: bool = False,
     )
     log.info("✓ Metadados salvos em %s", METADATA_FILE)
     log.info("  Total processadas: %d", processed)
-    log.info("  Total baixadas: %d", downloaded)
     log.info("  Gêneros encontrados: %d", len(genre_stats))
 
     for genre, s in metadata["genre_stats"].items():
@@ -391,8 +314,6 @@ def main():
                        help="Número máximo de músicas para processar")
     parser.add_argument("--streaming", action="store_true",
                        help="Modo streaming (não baixa tudo de uma vez)")
-    parser.add_argument("--no-download", action="store_true",
-                       help="Não baixar arquivos de áudio, só metadados")
     parser.add_argument("--update-knowledge", action="store_true",
                        help="Apenas atualiza knowledge_base.json com metadados existentes")
     parser.add_argument("--stats-only", action="store_true",
@@ -423,8 +344,9 @@ def main():
         if METADATA_FILE.is_file():
             metadata = json.loads(METADATA_FILE.read_text(encoding="utf-8"))
             print(f"Total de músicas: {metadata['total_processed']}")
-            print(f"Total baixadas: {metadata['total_downloaded']}")
             print(f"Gêneros: {list(metadata['genre_stats'].keys())}")
+            for genre, stats in metadata['genre_stats'].items():
+                print(f"  {genre}: {stats['count']} músicas")
         else:
             log.error("Metadados não encontrados.")
         return
@@ -432,7 +354,6 @@ def main():
     process_dataset(
         max_songs=args.max_songs,
         streaming=args.streaming,
-        download_audio_files=not args.no_download,
     )
 
 
