@@ -1,106 +1,253 @@
-name: Gerar Música
+name: Treinar e Gerar Música
 
 on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: 'Prompt em português'
+        description: "Prompt em português"
         required: false
-        default: 'breakcore caótico'
+        default: "breakcore caótico"
+
       style:
-        description: 'Estilo (vazio = detectar do prompt)'
+        description: "Estilo da música"
         required: false
-        default: ''
+        default: ""
+
       duration:
-        description: 'Duração em segundos'
+        description: "Duração em segundos"
         required: false
-        default: '30'
+        default: "30"
+
       seed:
-        description: 'Seed (vazio = aleatório)'
+        description: "Seed; vazio = aleatório"
         required: false
-        default: ''
+        default: ""
+
+      max_songs:
+        description: "Quantidade máxima de músicas reais; 0 = todas"
+        required: false
+        default: "100"
+
+      epochs:
+        description: "Número de épocas do treinamento"
+        required: false
+        default: "50"
+
       audition:
-        description: 'Rodar audição dos SoundFonts antes (treino dos bancos)'
+        description: "Testar SoundFonts antes da geração"
         required: false
-        default: 'false'
+        default: "true"
 
 permissions:
   contents: read
 
 jobs:
-  generate:
+  train-and-generate:
+    name: Treinar modelo e gerar música
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v4
+      - name: Baixar código
+        uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
-    - name: Cache de dependências Python
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-        restore-keys: ${{ runner.os }}-pip-
+      - name: Verificar arquivos do projeto
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-    - name: Cache da memória da IA (audição dos bancos + feedback + modelos)
-      uses: actions/cache@v4
-      with:
-        path: |
-          memory
-          models
-        # chave única por run (cache só salva em miss) + restore pelo prefixo
-        key: ${{ runner.os }}-ia-memory-v1-${{ github.run_id }}
-        restore-keys: |
-          ${{ runner.os }}-ia-memory-v1
+          test -f train.py
+          test -f music_generator.py
+          test -f requirements.txt
 
-    - name: Instalar dependências
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
+          echo "Arquivos principais encontrados:"
+          ls -la
+          echo
+          echo "Datasets disponíveis:"
+          find datasets -maxdepth 4 -type f 2>/dev/null | sort || true
 
-    - name: Instalar FluidSynth + SoundFont GM
-      continue-on-error: true
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq fluidsynth fluid-soundfont-gm
+      - name: Instalar dependências Python
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-    - name: Sanidade da integração
-      run: |
-        python -c "from midi_composer import MidiComposer; print('MidiComposer OK')"
-        python -c "import real_instruments as ri; print(len(ri.INSTRUMENTS), 'instrumentos')"
-        python -c "import music_generator as mg; print(len(mg._sf2_files()), 'bancos .sf2 em soundfonts/')"
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-    - name: Audição dos SoundFonts (treino dos bancos)
-      if: github.event.inputs.audition == 'true'
-      run: python music_generator.py --audition
+          # Garante os pacotes necessários ao treinamento e à geração.
+          python -m pip install numpy mido
 
-    - name: Gerar música
-      env:
-        PROMPT: ${{ github.event.inputs.prompt }}
-        STYLE: ${{ github.event.inputs.style }}
-        DURATION: ${{ github.event.inputs.duration }}
-        SEED: ${{ github.event.inputs.seed }}
-      run: |
-        ARGS=(--duration "${DURATION:-30}")
-        [ -n "$PROMPT" ] && ARGS+=(--prompt "$PROMPT")
-        [ -n "$STYLE" ] && ARGS+=(--style "$STYLE")
-        [ -n "$SEED" ]  && ARGS+=(--seed "$SEED")
-        python music_generator.py "${ARGS[@]}"
+      - name: Instalar FluidSynth e SoundFont GM
+        shell: bash
+        run: |
+          set -euxo pipefail
 
-    - name: Listar arquivos gerados (debug)
-      if: always()
-      run: find song_output -type f | sort
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            fluidsynth \
+            fluid-soundfont-gm
 
-    - name: Upload dos arquivos gerados
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: musica-run-${{ github.run_number }}
-        path: |
-          song_output/**/*.mid
-          song_output/**/*.wav
-          song_output/**/*.json
-        if-no-files-found: error
-        retention-days: 30
+          fluidsynth --version
+
+      - name: Restaurar modelo e memória anteriores
+        uses: actions/cache@v4
+        with:
+          path: |
+            models
+            memory
+          key: ${{ runner.os }}-ia-model-v2-${{ hashFiles('train.py', 'requirements.txt') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-ia-model-v2-${{ hashFiles('train.py', 'requirements.txt') }}-
+            ${{ runner.os }}-ia-model-v2-
+
+      - name: Sanidade dos módulos
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python -c "import numpy; print('NumPy:', numpy.__version__)"
+          python -c "from train import FEATURE_DIM; print('FEATURE_DIM:', FEATURE_DIM)"
+          python -c "from midi_composer import MidiComposer; print('MidiComposer OK')"
+          python -c "import real_instruments as ri; print(len(ri.INSTRUMENTS), 'instrumentos')"
+          python -c "import music_generator as mg; print(len(mg._sf2_files()), 'bancos .sf2 encontrados')"
+
+      - name: Treinar modelo de IA
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p models memory
+
+          # O modo mixed usa o dataset real quando ele existe.
+          # Se o dataset não existir, o train.py usa amostras sintéticas
+          # para permitir que o treinamento seja concluído.
+          python -u train.py \
+            --dataset mixed \
+            --max-songs "${{ inputs.max_songs }}" \
+            --epochs "${{ inputs.epochs }}" \
+            --batch-size 8 \
+            --latent-dim 8 \
+            --patience 8 \
+            --seed 42 \
+            --verbose
+
+      - name: Verificar modelo treinado
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f models/autoencoder_meta.json
+
+          if [ -f models/autoencoder.pt ]; then
+            echo "Modelo PyTorch encontrado."
+          elif [ -f models/autoencoder_np.npz ]; then
+            echo "Modelo NumPy encontrado."
+          else
+            echo "ERRO: nenhum arquivo de pesos foi criado."
+            find models -maxdepth 2 -type f -print || true
+            exit 1
+          fi
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          metadata = json.loads(
+              Path("models/autoencoder_meta.json").read_text(encoding="utf-8")
+          )
+
+          print("Metadados do modelo:")
+          print(json.dumps(metadata, indent=2, ensure_ascii=False))
+
+          if metadata.get("feature_dim") != 17:
+              raise SystemExit(
+                  f"Feature dimension inválida: {metadata.get('feature_dim')}"
+              )
+          PY
+
+      - name: Audição dos SoundFonts
+        if: ${{ inputs.audition == 'true' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -u music_generator.py --audition
+
+      - name: Gerar música
+        env:
+          PROMPT: ${{ inputs.prompt }}
+          STYLE: ${{ inputs.style }}
+          DURATION: ${{ inputs.duration }}
+          SEED: ${{ inputs.seed }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p song_output
+
+          ARGS=(--duration "${DURATION:-30}")
+
+          if [ -n "${PROMPT:-}" ]; then
+            ARGS+=(--prompt "$PROMPT")
+          fi
+
+          if [ -n "${STYLE:-}" ]; then
+            ARGS+=(--style "$STYLE")
+          fi
+
+          if [ -n "${SEED:-}" ]; then
+            ARGS+=(--seed "$SEED")
+          fi
+
+          python -u music_generator.py "${ARGS[@]}"
+
+      - name: Verificar arquivos gerados
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Arquivos em song_output:"
+          find song_output -type f -print | sort
+
+          MIDI_COUNT=$(find song_output -type f -name "*.mid" | wc -l)
+          JSON_COUNT=$(find song_output -type f -name "*.json" | wc -l)
+
+          if [ "$MIDI_COUNT" -eq 0 ]; then
+            echo "ERRO: nenhum arquivo MIDI foi gerado."
+            exit 1
+          fi
+
+          if [ "$JSON_COUNT" -eq 0 ]; then
+            echo "ERRO: nenhum arquivo JSON foi gerado."
+            exit 1
+          fi
+
+          echo "MIDI encontrados: $MIDI_COUNT"
+          echo "JSON encontrados: $JSON_COUNT"
+
+      - name: Upload do modelo treinado
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modelo-treinado-${{ github.run_number }}
+          path: |
+            models/**
+            memory/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload das músicas geradas
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: musica-run-${{ github.run_number }}
+          path: |
+            song_output/**/*.mid
+            song_output/**/*.wav
+            song_output/**/*.json
+          if-no-files-found: warn
+          retention-days: 30
