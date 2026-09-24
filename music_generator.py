@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-music_generator.py — Gerador principal do IA Music Pro (v7).
+music_generator.py — Gerador principal do IA Music Pro (v8).
 
-v7 — CAMADA DE IA (níveis 1 e 4-lite) + FLUIDSYNTH:
-    1. FLUIDSYNTH CLI com prioridade máxima no render de WAV: usa amostras
-       SoundFont reais (FluidR3_GM) quando o binário existe — no CI do
-       GitHub Actions ele já está instalado. Fallbacks preservados:
-       soundfont_renderer → renderizador embutido (bateria sintetizada).
-    2. IA-nível 1a (dataset): knowledge_base.json → BPM médio REAL do gênero
-       (com desvio) substitui o sorteio cego, quando o usuário não passou
-       --bpm.
-    3. IA-nível 1b (autoencoder): carrega o modelo treinado via train.py,
-       reconstrói o protótipo do gênero e extrai energia/complexidade/
-       valência APRENDIDAS — que passam a controlar curva de velocity,
-       probabilidade de fill/variação e contorno da melodia. Sem modelo
-       treinado, usa priors por estilo (fallback).
-    4. IA-nível 4-lite (feedback): cada geração é auto-avaliada (score de
-       repetitividade 0..1), EMA por estilo salvo em memory/feedback.json,
-       e a TEMPERATURA da próxima geração é ajustada automaticamente.
-    * --no-ai desativa tudo (2, 3, 4) para depuração.
+v8 — SOUNDFONTS ESPECIALIZADOS POR TRILHA + IMPORTAÇÃO/REFERÊNCIA:
+    1. Renderização POR TRILHA (método principal): cada trilha sai com o banco
+       certo (synth_lead ← Juno106/Pro53, bass ← Moog, drums ← JD Rockset/
+       GiantDrumkit, strings ← Crunk String, pads ← HS Synth...); trilhas sem
+       banco usam o GM completo; mistura com ganho por papel. Banco
+       especializado que sair mudo → re-render com GM (rede de segurança).
+       Full-band com GM; banco especializado na música INTEIRA só com
+       --soundfont (escolha explícita — evita quebrar os outros timbres).
+    2. --reference <audio>: analisa MP3/WAV (librosa) → BPM + energia +
+       brilho da referência REAL passam a guiar a geração.
+    3. analyze_midi_tracks() + render_midi_file(): API pública para o
+       servidor renderizar MIDIs IMPORTADOS com os SoundFonts do repo.
+    Descoberta case-insensitive (.sf2/.SF2) em soundfonts/.
 
-v6.1: auditoria corrige offset da track de tempo ("BATERIA CONFIRMADA").
-v6:   frases de 4 compassos, versos alternados, fills, renderer embutido.
-v5:   28 estilos (bossfight, chiptune, breakcore, dnb, blues, metal...).
-v4:   catálogo essencial, clamp de pitch, canais únicos.
+v7: FluidSynth CLI, IA (knowledge_base BPM, personalidade autoencoder/priors,
+    feedback adaptativo de temperatura, auto-avaliação de repetitividade).
+v6.1: auditoria com offset da track de tempo. v6: frases/fills/renderer
+    embutido. v5: 28 estilos. v4: catálogo essencial/clamp/canais.
 """
 
 from __future__ import annotations
@@ -43,11 +39,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
-    import numpy as _np  # renderizador embutido + personalidade (autoencoder)
+    import numpy as _np
 except ImportError:
     _np = None
 
-# --- catálogo de instrumentos ------------------------------------------------
 try:
     from real_instruments import INSTRUMENTS
     _RI_ERR: Optional[str] = None
@@ -62,36 +57,35 @@ except ImportError as _exc:
                    "is_percussion": False},
     }
 
-# --- instrumentos essenciais (rede de segurança; não sobrescreve o catálogo) --
 _ESSENTIAL_INSTRUMENTS: Dict[str, Dict[str, Any]] = {
     "bass":            {"display_name": "Baixo", "channel": 3, "midi_program": 33,
-                        "is_percussion": False, "aliases": ["baixo", "contrabaixo"]},
+                         "is_percussion": False, "aliases": ["baixo", "contrabaixo"]},
     "acoustic_guitar": {"display_name": "Violão", "channel": 1, "midi_program": 24,
-                        "is_percussion": False, "aliases": ["violao"]},
+                         "is_percussion": False, "aliases": ["violao"]},
     "electric_guitar": {"display_name": "Guitarra", "channel": 2, "midi_program": 29,
-                        "is_percussion": False, "aliases": ["guitarra"]},
+                         "is_percussion": False, "aliases": ["guitarra"]},
     "electric_piano":  {"display_name": "Piano Elétrico", "channel": 5, "midi_program": 4,
-                        "is_percussion": False, "aliases": ["rhodes"]},
+                         "is_percussion": False, "aliases": ["rhodes"]},
     "organ":           {"display_name": "Órgão", "channel": 4, "midi_program": 16,
-                        "is_percussion": False, "aliases": ["orgao"]},
+                         "is_percussion": False, "aliases": ["orgao"]},
     "strings":         {"display_name": "Cordas", "channel": 6, "midi_program": 48,
-                        "is_percussion": False, "aliases": ["cordas"]},
+                         "is_percussion": False, "aliases": ["cordas"]},
     "accordion":       {"display_name": "Sanfona", "channel": 7, "midi_program": 21,
-                        "is_percussion": False, "aliases": ["acordeon", "acordeao"]},
+                         "is_percussion": False, "aliases": ["acordeon", "acordeao"]},
     "cavaquinho":      {"display_name": "Cavaquinho", "channel": 8, "midi_program": 105,
-                        "is_percussion": False, "aliases": ["cavaco"]},
+                         "is_percussion": False, "aliases": ["cavaco"]},
     "banjo":           {"display_name": "Banjo", "channel": 14, "midi_program": 105,
-                        "is_percussion": False},
+                         "is_percussion": False},
     "synth_pad":       {"display_name": "Synth Pad", "channel": 12, "midi_program": 89,
-                        "is_percussion": False, "aliases": ["pad"]},
+                         "is_percussion": False, "aliases": ["pad"]},
     "synth_lead":      {"display_name": "Synth Lead", "channel": 13, "midi_program": 81,
-                        "is_percussion": False, "aliases": ["sintetizador"]},
+                         "is_percussion": False, "aliases": ["sintetizador"]},
     "flute":           {"display_name": "Flauta", "channel": 10, "midi_program": 73,
-                        "is_percussion": False, "aliases": ["flauta"]},
+                         "is_percussion": False, "aliases": ["flauta"]},
     "trumpet":         {"display_name": "Trompete", "channel": 11, "midi_program": 56,
-                        "is_percussion": False, "aliases": ["trompete"]},
+                         "is_percussion": False, "aliases": ["trompete"]},
     "saxophone":       {"display_name": "Saxofone", "channel": 15, "midi_program": 65,
-                        "is_percussion": False, "aliases": ["sax", "saxofone"]},
+                         "is_percussion": False, "aliases": ["sax", "saxofone"]},
     "drums":     {"display_name": "Bateria", "channel": 9, "is_percussion": True,
                   "aliases": ["bateria", "tambor"]},
     "pandeiro":  {"display_name": "Pandeiro", "channel": 9, "is_percussion": True},
@@ -111,7 +105,6 @@ _ESSENTIAL_INSTRUMENTS: Dict[str, Dict[str, Any]] = {
 }
 for _id, _entry in _ESSENTIAL_INSTRUMENTS.items():
     INSTRUMENTS.setdefault(_id, _entry)
-
 INSTRUMENTS.setdefault("square_lead",
     {"display_name": "Square Lead", "channel": 0, "midi_program": 80,
      "is_percussion": False, "aliases": ["chiptune lead", "8bit lead"]})
@@ -119,14 +112,12 @@ INSTRUMENTS.setdefault("synth_bass",
     {"display_name": "Synth Bass", "channel": 3, "midi_program": 38,
      "is_percussion": False, "aliases": ["reese", "808 bass"]})
 
-# --- compositor --------------------------------------------------------------
 try:
     from midi_composer import MidiComposer
 except ImportError as _exc2:
     MidiComposer = None
     _MIDI_COMPOSER_ERR = str(_exc2)
 
-# --- renderizador externo (opcional; CLI FluidSynth e embutido são garantidos) -
 _RENDERER = None
 try:
     import soundfont_renderer as _sr
@@ -152,7 +143,7 @@ def _setup_logging(verbose: bool = False) -> logging.Logger:
 
 
 # =============================================================================
-# MAPA DE PERCUSSÃO GM (canal 9)
+# PERCUSSÃO GM
 # =============================================================================
 
 GM: Dict[str, int] = {
@@ -275,12 +266,10 @@ def parse_instrument_arg(arg: str) -> List[str]:
         if not part:
             continue
         rid = find_instrument(part)
-        if rid:
-            if rid not in ids:
-                ids.append(rid)
-        else:
-            LOG.warning("Instrumento não reconhecido (ignorado): %r — "
-                        "use --list-instruments", part)
+        if rid and rid not in ids:
+            ids.append(rid)
+        elif not rid:
+            LOG.warning("Instrumento não reconhecido (ignorado): %r", part)
     return ids
 
 
@@ -300,13 +289,10 @@ def parse_instruments_from_text(text: str) -> List[str]:
 # =============================================================================
 
 SCALES: Dict[str, List[int]] = {
-    "major": [0, 2, 4, 5, 7, 9, 11],
-    "minor": [0, 2, 3, 5, 7, 8, 10],
-    "dorian": [0, 2, 3, 5, 7, 9, 10],
-    "mixolydian": [0, 2, 4, 5, 7, 9, 10],
+    "major": [0, 2, 4, 5, 7, 9, 11], "minor": [0, 2, 3, 5, 7, 8, 10],
+    "dorian": [0, 2, 3, 5, 7, 9, 10], "mixolydian": [0, 2, 4, 5, 7, 9, 10],
     "harmonic_minor": [0, 2, 3, 5, 7, 8, 11],
-    "pentatonic_major": [0, 2, 4, 7, 9],
-    "pentatonic_minor": [0, 3, 5, 7, 10],
+    "pentatonic_major": [0, 2, 4, 7, 9], "pentatonic_minor": [0, 3, 5, 7, 10],
     "blues": [0, 3, 5, 6, 7, 10],
 }
 NOTE_NAMES_PT = {"do": 0, "re": 2, "mi": 4, "fa": 5, "sol": 7, "la": 9, "si": 11}
@@ -315,25 +301,22 @@ PC_TO_NAME = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 STYLES: Dict[str, Dict[str, Any]] = {
     "rock":       dict(bpm=(100, 150), scale="minor", swing=0.0,
-                       instruments=[("electric_guitar", "guitarra eletrica", "guitarra"),
-                                    ("bass", "baixo"), ("drums",)]),
+                       instruments=[("electric_guitar", "guitarra"), ("bass", "baixo"), ("drums",)]),
     "pop":        dict(bpm=(95, 130), scale="major", swing=0.0,
-                       instruments=[("piano", "teclado", "electric_piano"),
-                                    ("bass", "baixo"), ("drums",)]),
+                       instruments=[("piano",), ("bass", "baixo"), ("drums",)]),
     "samba":      dict(bpm=(85, 112), scale="major", swing=0.0,
                        instruments=[("cavaquinho", "cavaco", "banjo", "acoustic_guitar", "violao"),
-                                    ("acoustic_guitar", "violao"),
-                                    ("bass", "baixo"), ("surdo",), ("pandeiro",),
-                                    ("agogo", "tamborim")]),
+                                    ("acoustic_guitar", "violao"), ("bass", "baixo"),
+                                    ("surdo",), ("pandeiro",), ("agogo", "tamborim")]),
     "bossa":      dict(bpm=(68, 100), scale="major", swing=0.0, sevenths=True,
-                       instruments=[("acoustic_guitar", "violao", "nylon_guitar"),
-                                    ("piano",), ("bass", "baixo"), ("drums",)]),
+                       instruments=[("acoustic_guitar", "violao"), ("piano",),
+                                    ("bass", "baixo"), ("drums",)]),
     "funk":       dict(bpm=(120, 140), scale="minor", swing=0.0,
-                       instruments=[("synth_lead", "sintetizador", "electric_piano", "piano"),
+                       instruments=[("synth_lead", "sintetizador", "piano"),
                                     ("bass", "baixo"), ("drums",)]),
     "reggae":     dict(bpm=(72, 92), scale="minor", swing=0.0,
-                       instruments=[("electric_guitar", "guitarra eletrica", "acoustic_guitar", "violao"),
-                                    ("organ", "orgao"), ("bass", "baixo"), ("drums",)]),
+                       instruments=[("electric_guitar", "guitarra", "violao"), ("organ", "orgao"),
+                                    ("bass", "baixo"), ("drums",)]),
     "trap":       dict(bpm=(130, 150), scale="minor", swing=0.0,
                        instruments=[("synth_lead", "sintetizador", "flute", "flauta", "piano"),
                                     ("bass", "baixo"), ("drums",)]),
@@ -345,11 +328,10 @@ STYLES: Dict[str, Dict[str, Any]] = {
                        instruments=[("electric_piano", "rhodes", "piano", "teclado"),
                                     ("bass", "baixo"), ("drums",)]),
     "jazz":       dict(bpm=(100, 150), scale="major", swing=0.14, sevenths=True,
-                       instruments=[("saxophone", "saxofone", "sax", "trumpet", "trompete", "piano"),
+                       instruments=[("saxophone", "saxofone", "trumpet", "trompete", "piano"),
                                     ("piano",), ("bass", "contrabaixo", "baixo"), ("drums",)]),
     "ambient":    dict(bpm=(55, 85), scale="major", swing=0.0,
-                       instruments=[("synth_pad", "pad", "strings", "cordas", "piano"),
-                                    ("piano",)]),
+                       instruments=[("synth_pad", "pad", "strings", "cordas", "piano"), ("piano",)]),
     "cinematic":  dict(bpm=(70, 100), scale="minor", swing=0.0,
                        instruments=[("strings", "cordas"), ("piano",), ("drums",)]),
     "classical":  dict(bpm=(70, 120), scale="major", swing=0.0,
@@ -375,7 +357,7 @@ STYLES: Dict[str, Dict[str, Any]] = {
                        instruments=[("synth_lead", "sintetizador"), ("synth_pad", "pad"),
                                     ("bass", "baixo"), ("drums",)]),
     "dnb":        dict(bpm=(168, 178), scale="minor", swing=0.0,
-                       instruments=[("synth_lead", "sintetizador", "electric_piano", "piano"),
+                       instruments=[("synth_lead", "sintetizador", "piano"),
                                     ("synth_pad", "pad", "strings", "cordas"),
                                     ("bass", "baixo"), ("drums",)]),
     "synthwave":  dict(bpm=(100, 116), scale="minor", swing=0.0,
@@ -386,117 +368,113 @@ STYLES: Dict[str, Dict[str, Any]] = {
                                     ("synth_pad", "pad", "strings", "cordas"),
                                     ("bass", "baixo"), ("drums",)]),
     "blues":      dict(bpm=(72, 100), scale="blues", swing=0.12, sevenths=True,
-                       instruments=[("electric_guitar", "guitarra", "acoustic_guitar", "violao"),
-                                    ("organ", "orgao"), ("bass", "baixo"), ("drums",)]),
-    "metal":      dict(bpm=(140, 180), scale="harmonic_minor", swing=0.0,
-                       instruments=[("electric_guitar", "guitarra", "guitarra eletrica"),
+                       instruments=[("electric_guitar", "guitarra", "violao"), ("organ", "orgao"),
                                     ("bass", "baixo"), ("drums",)]),
+    "metal":      dict(bpm=(140, 180), scale="harmonic_minor", swing=0.0,
+                       instruments=[("electric_guitar", "guitarra"), ("bass", "baixo"), ("drums",)]),
     "choro":      dict(bpm=(110, 150), scale="major", swing=0.0, sevenths=True,
                        instruments=[("cavaquinho", "cavaco"), ("flute", "flauta"),
                                     ("pandeiro",), ("drums",)]),
     "capoeira":   dict(bpm=(122, 138), scale="mixolydian", swing=0.0,
                        instruments=[("acoustic_guitar", "violao"), ("berimbau",),
-                                    ("conga", "congas"), ("agogo",), ("pandeiro",),
-                                    ("drums",)]),
+                                    ("conga", "congas"), ("agogo",), ("pandeiro",), ("drums",)]),
 }
 NO_DRUMS_STYLES = {"ambient", "classical", "dungeon"}
-AUTO_BASS_STYLES = {"pop", "rock", "funk", "reggae", "trap", "electronic",
-                    "hiphop", "jazz", "bossa", "latin", "forro", "samba",
-                    "cinematic", "bossfight", "chiptune", "breakcore", "dnb",
-                    "synthwave", "disco", "blues", "metal", "choro", "dungeon"}
+AUTO_BASS_STYLES = {"pop", "rock", "funk", "reggae", "trap", "electronic", "hiphop",
+                    "jazz", "bossa", "latin", "forro", "samba", "cinematic",
+                    "bossfight", "chiptune", "breakcore", "dnb", "synthwave",
+                    "disco", "blues", "metal", "choro", "dungeon"}
 CRASH_STYLES = {"rock", "pop", "electronic", "funk", "trap", "cinematic", "latin",
                 "bossfight", "metal", "breakcore", "disco"}
 
 PROGRESSIONS: Dict[str, List[List[int]]] = {
-    "pop":        [[0, 4, 5, 3], [0, 5, 3, 4], [5, 3, 0, 4], [0, 4, 5, 4]],
-    "rock":       [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 3, 4], [5, 3, 0, 4]],
-    "samba":      [[1, 4, 0, 0], [2, 5, 1, 4], [1, 4, 0, 3], [0, 4, 5, 3]],
-    "bossa":      [[1, 4, 0, 0], [0, 5, 1, 4], [1, 4, 2, 5], [2, 5, 1, 4]],
-    "funk":       [[0, 0, 3, 3], [0, 3, 0, 3], [0, 3, 4, 3]],
-    "reggae":     [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 3, 3]],
-    "trap":       [[0, 5, 3, 4], [5, 3, 0, 4], [0, 5, 0, 4]],
+    "pop": [[0, 4, 5, 3], [0, 5, 3, 4], [5, 3, 0, 4], [0, 4, 5, 4]],
+    "rock": [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 3, 4], [5, 3, 0, 4]],
+    "samba": [[1, 4, 0, 0], [2, 5, 1, 4], [1, 4, 0, 3], [0, 4, 5, 3]],
+    "bossa": [[1, 4, 0, 0], [0, 5, 1, 4], [1, 4, 2, 5], [2, 5, 1, 4]],
+    "funk": [[0, 0, 3, 3], [0, 3, 0, 3], [0, 3, 4, 3]],
+    "reggae": [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 3, 3]],
+    "trap": [[0, 5, 3, 4], [5, 3, 0, 4], [0, 5, 0, 4]],
     "electronic": [[0, 5, 3, 4], [5, 3, 0, 4], [0, 3, 5, 4]],
-    "hiphop":     [[0, 3, 4, 3], [0, 5, 1, 4], [1, 4, 0, 0]],
-    "jazz":       [[1, 4, 0, 0], [1, 4, 0, 3], [0, 3, 6, 2]],
-    "ambient":    [[0, 3, 0, 4], [0, 4, 3, 0], [0, 3, 5, 4]],
-    "cinematic":  [[0, 5, 3, 4], [0, 3, 5, 4], [0, 5, 1, 4]],
-    "classical":  [[0, 4, 5, 3], [0, 3, 4, 0], [0, 4, 0, 4]],
-    "folk":       [[0, 3, 4, 3], [0, 4, 5, 3], [0, 3, 0, 4]],
-    "latin":      [[0, 3, 4, 3], [0, 4, 3, 4], [1, 4, 0, 0]],
-    "forro":      [[0, 3, 0, 4], [0, 4, 3, 4], [0, 3, 4, 0]],
-    "bossfight":  [[0, 5, 3, 4], [0, 1, 4, 0], [0, 3, 0, 4]],
-    "chiptune":   [[0, 4, 5, 3], [0, 3, 4, 4], [0, 5, 3, 4], [5, 3, 0, 4]],
-    "dungeon":    [[0, 3, 5, 4], [0, 5, 3, 0], [0, 1, 0, 4]],
-    "breakcore":  [[0, 5, 3, 4], [0, 3, 4, 3], [5, 3, 0, 4]],
-    "dnb":        [[0, 5, 3, 4], [0, 3, 0, 4], [5, 3, 0, 4]],
-    "synthwave":  [[0, 5, 3, 4], [5, 3, 0, 4], [0, 3, 5, 4]],
-    "disco":      [[0, 5, 3, 4], [0, 3, 4, 3], [0, 4, 5, 3]],
-    "blues":      [[0, 0, 0, 0, 3, 3, 0, 0, 4, 3, 0, 4]],
-    "metal":      [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 5, 4]],
-    "choro":      [[1, 4, 0, 0], [2, 5, 1, 4], [0, 4, 1, 4]],
-    "capoeira":   [[0, 3, 0, 4], [0, 4, 3, 4], [0, 0, 3, 4]],
+    "hiphop": [[0, 3, 4, 3], [0, 5, 1, 4], [1, 4, 0, 0]],
+    "jazz": [[1, 4, 0, 0], [1, 4, 0, 3], [0, 3, 6, 2]],
+    "ambient": [[0, 3, 0, 4], [0, 4, 3, 0], [0, 3, 5, 4]],
+    "cinematic": [[0, 5, 3, 4], [0, 3, 5, 4], [0, 5, 1, 4]],
+    "classical": [[0, 4, 5, 3], [0, 3, 4, 0], [0, 4, 0, 4]],
+    "folk": [[0, 3, 4, 3], [0, 4, 5, 3], [0, 3, 0, 4]],
+    "latin": [[0, 3, 4, 3], [0, 4, 3, 4], [1, 4, 0, 0]],
+    "forro": [[0, 3, 0, 4], [0, 4, 3, 4], [0, 3, 4, 0]],
+    "bossfight": [[0, 5, 3, 4], [0, 1, 4, 0], [0, 3, 0, 4]],
+    "chiptune": [[0, 4, 5, 3], [0, 3, 4, 4], [0, 5, 3, 4], [5, 3, 0, 4]],
+    "dungeon": [[0, 3, 5, 4], [0, 5, 3, 0], [0, 1, 0, 4]],
+    "breakcore": [[0, 5, 3, 4], [0, 3, 4, 3], [5, 3, 0, 4]],
+    "dnb": [[0, 5, 3, 4], [0, 3, 0, 4], [5, 3, 0, 4]],
+    "synthwave": [[0, 5, 3, 4], [5, 3, 0, 4], [0, 3, 5, 4]],
+    "disco": [[0, 5, 3, 4], [0, 3, 4, 3], [0, 4, 5, 3]],
+    "blues": [[0, 0, 0, 0, 3, 3, 0, 0, 4, 3, 0, 4]],
+    "metal": [[0, 3, 4, 3], [0, 5, 3, 4], [0, 0, 5, 4]],
+    "choro": [[1, 4, 0, 0], [2, 5, 1, 4], [0, 4, 1, 4]],
+    "capoeira": [[0, 3, 0, 4], [0, 4, 3, 4], [0, 0, 3, 4]],
 }
 
 BASS_PATTERNS: Dict[str, List[Tuple[float, str, float]]] = {
-    "rock":       [(i * 0.5, "root" if i != 5 else "fifth", 0.45) for i in range(8)],
-    "pop":        [(0.0, "root", 0.9), (1.5, "root", 0.4), (2.0, "fifth", 0.9), (3.5, "root", 0.4)],
-    "samba":      [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
-    "bossa":      [(0.0, "root", 1.4), (1.5, "root", 0.4), (2.0, "fifth", 1.4), (3.5, "fifth", 0.4)],
-    "jazz":       [(0.0, "root", 0.9), (1.0, "third", 0.9), (2.0, "fifth", 0.9), (3.0, "approach", 0.9)],
-    "funk":       [(0.0, "root", 0.4), (0.75, "root", 0.2), (1.5, "octave", 0.4),
-                   (2.0, "root", 0.4), (2.75, "fifth", 0.2), (3.5, "root", 0.4)],
-    "reggae":     [(2.0, "root", 0.7), (3.5, "fifth", 0.35)],
-    "trap":       [(0.0, "root", 1.4), (2.5, "root", 1.3)],
+    "rock": [(i * 0.5, "root" if i != 5 else "fifth", 0.45) for i in range(8)],
+    "pop": [(0.0, "root", 0.9), (1.5, "root", 0.4), (2.0, "fifth", 0.9), (3.5, "root", 0.4)],
+    "samba": [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
+    "bossa": [(0.0, "root", 1.4), (1.5, "root", 0.4), (2.0, "fifth", 1.4), (3.5, "fifth", 0.4)],
+    "jazz": [(0.0, "root", 0.9), (1.0, "third", 0.9), (2.0, "fifth", 0.9), (3.0, "approach", 0.9)],
+    "funk": [(0.0, "root", 0.4), (0.75, "root", 0.2), (1.5, "octave", 0.4),
+             (2.0, "root", 0.4), (2.75, "fifth", 0.2), (3.5, "root", 0.4)],
+    "reggae": [(2.0, "root", 0.7), (3.5, "fifth", 0.35)],
+    "trap": [(0.0, "root", 1.4), (2.5, "root", 1.3)],
     "electronic": [(i * 0.5, "root", 0.45) for i in range(8)],
-    "hiphop":     [(0.0, "root", 0.7), (2.0, "fifth", 0.65), (3.25, "root", 0.35)],
-    "ambient":    [(0.0, "root", 3.8)],
-    "cinematic":  [(0.0, "root", 3.8)],
-    "classical":  [(0.0, "root", 1.9), (2.0, "fifth", 1.9)],
-    "folk":       [(0.0, "root", 1.9), (2.0, "fifth", 1.9)],
-    "latin":      [(0.0, "root", 0.9), (1.5, "root", 0.4), (2.5, "root", 0.9), (3.5, "fifth", 0.4)],
-    "forro":      [(0.0, "root", 0.7), (1.75, "root", 0.3), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
-    "bossfight":  [(i * 0.5, "root" if i not in (3, 7) else "fifth", 0.45) for i in range(8)],
-    "chiptune":   [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.4) for i in range(8)],
-    "dungeon":    [(0.0, "root", 3.8)],
-    "breakcore":  [(0.0, "root", 0.2), (0.75, "root", 0.2), (1.5, "octave", 0.2),
-                   (2.25, "root", 0.2), (3.0, "fifth", 0.2), (3.5, "octave", 0.2)],
-    "dnb":        [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.45) for i in range(8)],
-    "synthwave":  [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.42) for i in range(8)],
-    "disco":      [(i * 0.25, "root" if i % 2 == 0 else "octave", 0.22) for i in range(16)],
-    "blues":      [(0.0, "root", 0.9), (1.0, "fifth", 0.9), (2.0, "root", 0.9), (3.0, "approach", 0.9)],
-    "metal":      [(i * 0.5, "root", 0.45) for i in range(8)],
-    "choro":      [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
-    "capoeira":   [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "fifth", 0.7), (3.5, "root", 0.35)],
+    "hiphop": [(0.0, "root", 0.7), (2.0, "fifth", 0.65), (3.25, "root", 0.35)],
+    "ambient": [(0.0, "root", 3.8)], "cinematic": [(0.0, "root", 3.8)],
+    "classical": [(0.0, "root", 1.9), (2.0, "fifth", 1.9)],
+    "folk": [(0.0, "root", 1.9), (2.0, "fifth", 1.9)],
+    "latin": [(0.0, "root", 0.9), (1.5, "root", 0.4), (2.5, "root", 0.9), (3.5, "fifth", 0.4)],
+    "forro": [(0.0, "root", 0.7), (1.75, "root", 0.3), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
+    "bossfight": [(i * 0.5, "root" if i not in (3, 7) else "fifth", 0.45) for i in range(8)],
+    "chiptune": [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.4) for i in range(8)],
+    "dungeon": [(0.0, "root", 3.8)],
+    "breakcore": [(0.0, "root", 0.2), (0.75, "root", 0.2), (1.5, "octave", 0.2),
+                  (2.25, "root", 0.2), (3.0, "fifth", 0.2), (3.5, "octave", 0.2)],
+    "dnb": [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.45) for i in range(8)],
+    "synthwave": [(i * 0.5, "root" if i % 2 == 0 else "octave", 0.42) for i in range(8)],
+    "disco": [(i * 0.25, "root" if i % 2 == 0 else "octave", 0.22) for i in range(16)],
+    "blues": [(0.0, "root", 0.9), (1.0, "fifth", 0.9), (2.0, "root", 0.9), (3.0, "approach", 0.9)],
+    "metal": [(i * 0.5, "root", 0.45) for i in range(8)],
+    "choro": [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "root", 0.7), (3.5, "fifth", 0.35)],
+    "capoeira": [(0.0, "root", 0.7), (1.5, "root", 0.35), (2.0, "fifth", 0.7), (3.5, "root", 0.35)],
 }
 
 COMP_RHYTHMS: Dict[str, List[List[float]]] = {
-    "pop":        [[0.0, 2.0], [0.0, 1.5, 2.0, 3.0], [0.0, 2.0, 3.5]],
-    "rock":       [[0.0, 2.0], [0.0, 2.0, 3.5], [0.0, 1.5, 2.0, 3.0]],
-    "samba":      [[0.0, 1.75, 2.5, 3.25], [0.75, 1.5, 2.25, 3.0, 3.75], [0.0, 0.75, 2.0, 2.75]],
-    "bossa":      [[0.0, 0.75, 2.0, 2.75], [0.0, 1.5, 2.5], [0.75, 1.5, 2.0, 2.75, 3.5]],
-    "jazz":       [[0.0, 1.5], [1.5], [0.0], [2.5, 3.5]],
-    "funk":       [[0.0, 0.75, 1.5, 2.25, 3.0], [0.0, 1.5, 2.5, 3.25]],
-    "reggae":     [[0.5, 1.5, 2.5, 3.5]],
-    "trap":       [[0.0], [0.0, 2.5]],
+    "pop": [[0.0, 2.0], [0.0, 1.5, 2.0, 3.0], [0.0, 2.0, 3.5]],
+    "rock": [[0.0, 2.0], [0.0, 2.0, 3.5], [0.0, 1.5, 2.0, 3.0]],
+    "samba": [[0.0, 1.75, 2.5, 3.25], [0.75, 1.5, 2.25, 3.0, 3.75], [0.0, 0.75, 2.0, 2.75]],
+    "bossa": [[0.0, 0.75, 2.0, 2.75], [0.0, 1.5, 2.5], [0.75, 1.5, 2.0, 2.75, 3.5]],
+    "jazz": [[0.0, 1.5], [1.5], [0.0], [2.5, 3.5]],
+    "funk": [[0.0, 0.75, 1.5, 2.25, 3.0], [0.0, 1.5, 2.5, 3.25]],
+    "reggae": [[0.5, 1.5, 2.5, 3.5]],
+    "trap": [[0.0], [0.0, 2.5]],
     "electronic": [[0.0], [0.0, 1.5, 3.5]],
-    "hiphop":     [[0.0, 2.5], [0.0, 1.75, 3.25]],
-    "ambient":    [[0.0]],
-    "cinematic":  [[0.0]],
-    "classical":  [[0.0, 2.0]],
-    "folk":       [[0.0, 2.0], [0.0, 1.0, 2.0, 3.0]],
-    "latin":      [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
-    "forro":      [[0.0, 0.75, 2.0, 2.75], [0.0, 1.5, 2.0, 3.5]],
-    "bossfight":  [[0.0, 1.5, 2.0, 3.5], [0.0, 0.75, 2.0, 2.75]],
-    "chiptune":   [[i * 0.25 for i in range(16)]],
-    "dungeon":    [[0.0]],
-    "breakcore":  [[0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
-    "dnb":        [[0.0, 2.5], [0.0, 1.75, 3.25]],
-    "synthwave":  [[0.0, 1.5, 2.5], [0.0, 0.75, 2.0, 2.75]],
-    "disco":      [[0.5, 1.5, 2.5, 3.5], [0.5, 1.5, 2.0, 3.5]],
-    "blues":      [[0.0, 1.0, 2.0, 3.0]],
-    "metal":      [[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]],
-    "choro":      [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.75, 1.5, 2.25, 3.0, 3.75]],
-    "capoeira":   [[0.0, 0.75, 1.5, 2.25, 3.0], [0.0, 1.5, 2.0, 3.5]],
+    "hiphop": [[0.0, 2.5], [0.0, 1.75, 3.25]],
+    "ambient": [[0.0]], "cinematic": [[0.0]],
+    "classical": [[0.0, 2.0]],
+    "folk": [[0.0, 2.0], [0.0, 1.0, 2.0, 3.0]],
+    "latin": [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
+    "forro": [[0.0, 0.75, 2.0, 2.75], [0.0, 1.5, 2.0, 3.5]],
+    "bossfight": [[0.0, 1.5, 2.0, 3.5], [0.0, 0.75, 2.0, 2.75]],
+    "chiptune": [[i * 0.25 for i in range(16)]],
+    "dungeon": [[0.0]],
+    "breakcore": [[0.0, 0.75, 1.5, 2.25, 3.0, 3.75]],
+    "dnb": [[0.0, 2.5], [0.0, 1.75, 3.25]],
+    "synthwave": [[0.0, 1.5, 2.5], [0.0, 0.75, 2.0, 2.75]],
+    "disco": [[0.5, 1.5, 2.5, 3.5], [0.5, 1.5, 2.0, 3.5]],
+    "blues": [[0.0, 1.0, 2.0, 3.0]],
+    "metal": [[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]],
+    "choro": [[0.0, 0.75, 1.5, 2.0, 2.75, 3.5], [0.75, 1.5, 2.25, 3.0, 3.75]],
+    "capoeira": [[0.0, 0.75, 1.5, 2.25, 3.0], [0.0, 1.5, 2.0, 3.5]],
 }
 
 STRUM_FAMILIES = ("guitar", "viola", "cavaquinho", "banjo", "ukulele", "cavaco")
@@ -511,23 +489,23 @@ SECTION_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 SONG_FORMS: Dict[str, List[Tuple[str, int]]] = {
-    "pop":        [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
-                   ("refrao", 4), ("ponte", 2), ("refrao", 4), ("outro", 2)],
-    "rock":       [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
-                   ("refrao", 4), ("solo", 4), ("refrao", 4)],
-    "samba":      [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
-                   ("refrao", 4), ("outro", 2)],
-    "bossa":      [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4), ("refrao", 4)],
-    "jazz":       [("intro", 1), ("verso", 4), ("solo", 4), ("verso", 4), ("outro", 1)],
-    "cinematic":  [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
-                   ("refrao", 4), ("ponte", 2), ("refrao", 4), ("outro", 2)],
-    "ambient":    [("verso", 4), ("verso", 4), ("verso", 4)],
-    "bossfight":  [("intro", 2), ("verso", 4), ("refrao", 4), ("ponte", 2),
-                   ("solo", 4), ("refrao", 4)],
-    "chiptune":   [("intro", 2), ("refrao", 4), ("verso", 4), ("refrao", 4),
-                   ("ponte", 2), ("refrao", 4)],
-    "breakcore":  [("intro", 2), ("verso", 4), ("refrao", 4), ("ponte", 2),
-                   ("refrao", 4), ("refrao", 4)],
+    "pop": [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
+            ("refrao", 4), ("ponte", 2), ("refrao", 4), ("outro", 2)],
+    "rock": [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
+             ("refrao", 4), ("solo", 4), ("refrao", 4)],
+    "samba": [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
+              ("refrao", 4), ("outro", 2)],
+    "bossa": [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4), ("refrao", 4)],
+    "jazz": [("intro", 1), ("verso", 4), ("solo", 4), ("verso", 4), ("outro", 1)],
+    "cinematic": [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4),
+                  ("refrao", 4), ("ponte", 2), ("refrao", 4), ("outro", 2)],
+    "ambient": [("verso", 4), ("verso", 4), ("verso", 4)],
+    "bossfight": [("intro", 2), ("verso", 4), ("refrao", 4), ("ponte", 2),
+                  ("solo", 4), ("refrao", 4)],
+    "chiptune": [("intro", 2), ("refrao", 4), ("verso", 4), ("refrao", 4),
+                 ("ponte", 2), ("refrao", 4)],
+    "breakcore": [("intro", 2), ("verso", 4), ("refrao", 4), ("ponte", 2),
+                  ("refrao", 4), ("refrao", 4)],
 }
 _DEFAULT_FORM = [("intro", 2), ("verso", 4), ("refrao", 4), ("verso", 4), ("refrao", 4)]
 
@@ -545,7 +523,7 @@ RHYTHM_CELLS_DENSE = [
 
 
 # =============================================================================
-# PADRÕES DE PERCUSSÃO
+# PERCUSSÃO (kits por estilo)
 # =============================================================================
 
 def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, str, int]]:
@@ -648,8 +626,7 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
         if bar % 4 == 3:
             p += [(3.0 + i * 0.125, "snare", 50 + 6 * i) for i in range(8)]
     elif style == "dnb":
-        p = [(0.0, "kick", 104), (2.5, "kick", 96), (2.0, "snare", 102),
-             (3.75, "snare", 66)]
+        p = [(0.0, "kick", 104), (2.5, "kick", 96), (2.0, "snare", 102), (3.75, "snare", 66)]
         p += [(i * 0.5, "hh_closed", 68 if i % 2 == 0 else 50) for i in range(8)]
         p.append((1.5, "hh_open", 58))
     elif style == "synthwave":
@@ -673,9 +650,7 @@ def _kit_pattern(style: str, bar: int, rng: random.Random) -> List[Tuple[float, 
         p += [(i * 0.5, "ride", 70 if i % 2 == 0 else 56) for i in range(8)]
         if bar % 4 == 0:
             p.append((0.0, "crash", 100))
-    elif style == "dungeon":
-        p = []
-    elif style in ("ambient", "classical"):
+    elif style in ("dungeon", "ambient", "classical"):
         p = []
     else:
         return _kit_pattern("pop", bar, rng)
@@ -700,8 +675,7 @@ def _fill(style: str, rng: random.Random) -> List[Tuple[float, str, int]]:
         return [(2.5 + i * 0.125, "tom_high" if i % 2 == 0 else "snare", 60 + 4 * i)
                 for i in range(12)]
     if style in ("rock", "pop", "electronic", "folk"):
-        seq = ["snare", "snare", "tom_high", "tom_high",
-               "tom_mid", "tom_mid", "tom_low", "tom_low"]
+        seq = ["snare", "snare", "tom_high", "tom_high", "tom_mid", "tom_mid", "tom_low", "tom_low"]
         return [(2.0 + 0.25 * i, seq[i], 78 + 5 * i) for i in range(8)]
     if style in ("samba", "bossa", "forro", "latin", "choro", "capoeira"):
         return [(2.5, "tamborim", 72), (2.75, "tamborim", 78), (3.0, "agogo_hi", 80),
@@ -735,7 +709,7 @@ _DEFAULT_PERC_16 = ([60, 0, 0, 0, 60, 0, 0, 0, 60, 0, 0, 0, 60, 0, 0, 0], False)
 
 
 # =============================================================================
-# HELPERS DE TEORIA / INSTRUMENTOS
+# HELPERS
 # =============================================================================
 
 def _is_perc(inst_id: str) -> bool:
@@ -753,10 +727,7 @@ def _perc_pitch(inst_id: str) -> int:
 
 def _chord_offsets(scale: List[int], degree: int, add7: bool) -> List[int]:
     n = len(scale)
-    offs = []
-    for k in (0, 2, 4, 6):
-        idx = degree + k
-        offs.append(scale[idx % n] + 12 * (idx // n))
+    offs = [scale[(degree + k) % n] + 12 * ((degree + k) // n) for k in (0, 2, 4, 6)]
     return offs if add7 else offs[:3]
 
 
@@ -819,11 +790,10 @@ def _monophonic(inst_id: str) -> bool:
 
 
 # =============================================================================
-# MOTIVOS E FRASES (up_bias: contorno melódico guiado pela valência da IA)
+# MOTIVOS E FRASES
 # =============================================================================
 
 def _new_motif(rng: random.Random, dense: bool, up_bias: float = 0.5):
-    """Um compasso de melodia. up_bias > 0.5 → contorno mais ascendente."""
     cells = RHYTHM_CELLS_DENSE if (dense and rng.random() < 0.7) else RHYTHM_CELLS_SPARSE
     cell = list(rng.choice(cells))
     steps = [rng.choice([0, 2, 4])]
@@ -848,7 +818,6 @@ def _vary_motif(motif, rng: random.Random):
 
 
 def _new_phrase(rng: random.Random, dense: bool, up_bias: float = 0.5) -> Dict[int, list]:
-    """Frase de 4 compassos: pergunta (0-1) + resposta (2) + respiro (3)."""
     a = _new_motif(rng, dense, up_bias)
     rep = _vary_motif(a, rng) if rng.random() < 0.6 else [((p, d), s) for (p, d), s in a]
     if rng.random() < 0.35:
@@ -879,8 +848,7 @@ _STYLE_MAP: List[Tuple[Tuple[str, ...], str]] = [
       "medo", "suspense", "dark"), "dungeon"),
     (("breakcore",), "breakcore"),
     (("drum and bass", "drum n bass", "dnb", "jungle", "liquid"), "dnb"),
-    (("synthwave", "synth wave", "retrowave", "vaporwave", "anos 80",
-      "oitenta"), "synthwave"),
+    (("synthwave", "synth wave", "retrowave", "vaporwave", "anos 80", "oitenta"), "synthwave"),
     (("disco", "boogie", "discoteca"), "disco"),
     (("blues",), "blues"),
     (("metal", "heavy metal", "thrash", "death metal", "doom"), "metal"),
@@ -962,30 +930,23 @@ def parse_key_arg(s: str) -> Tuple[Optional[int], Optional[bool]]:
 
 
 # =============================================================================
-# v7 — CAMADA DE IA
-# =============================================================================
-# 1) knowledge_base.json → BPM real do gênero (nível 1a)
-# 2) autoencoder do train.py → personalidade (nível 1b)
-# 3) memory/feedback.json → temperatura adaptativa (nível 4-lite)
-# Tudo com fallback seguro: sem arquivo/modelo → comportamento v6.1.
+# CAMADA DE IA (v7, mantida)
 # =============================================================================
 
 _KB_GENRES: Dict[str, Tuple[str, ...]] = {
     "rock": ("rock",), "pop": ("pop",), "samba": ("samba", "latin"),
-    "bossa": ("bossa", "latin"), "funk": ("funk", "hiphop"),
-    "reggae": ("reggae", "latin"), "trap": ("trap", "hiphop"),
-    "electronic": ("electronic", "edm"), "hiphop": ("hiphop", "hip hop", "rap"),
-    "jazz": ("jazz",), "ambient": ("ambient",), "cinematic": ("cinematic", "soundtrack"),
-    "classical": ("classical",), "folk": ("folk",), "latin": ("latin",),
-    "forro": ("forro", "latin"), "bossfight": ("cinematic", "classical"),
-    "chiptune": ("chiptune", "electronic"), "dungeon": ("ambient",),
-    "breakcore": ("breakcore", "electronic"), "dnb": ("dnb", "electronic"),
-    "synthwave": ("synthwave", "electronic"), "disco": ("disco", "pop"),
-    "blues": ("blues",), "metal": ("metal", "rock"), "choro": ("choro", "latin"),
-    "capoeira": ("capoeira", "latin"),
+    "bossa": ("bossa", "latin"), "funk": ("funk", "hiphop"), "reggae": ("reggae", "latin"),
+    "trap": ("trap", "hiphop"), "electronic": ("electronic", "edm"),
+    "hiphop": ("hiphop", "hip hop", "rap"), "jazz": ("jazz",), "ambient": ("ambient",),
+    "cinematic": ("cinematic", "soundtrack"), "classical": ("classical",),
+    "folk": ("folk",), "latin": ("latin",), "forro": ("forro", "latin"),
+    "bossfight": ("cinematic", "classical"), "chiptune": ("chiptune", "electronic"),
+    "dungeon": ("ambient",), "breakcore": ("breakcore", "electronic"),
+    "dnb": ("dnb", "electronic"), "synthwave": ("synthwave", "electronic"),
+    "disco": ("disco", "pop"), "blues": ("blues",), "metal": ("metal", "rock"),
+    "choro": ("choro", "latin"), "capoeira": ("capoeira", "latin"),
 }
 
-# fallback (energia, complexidade, valência) por estilo — usado sem autoencoder
 _VIBE_FALLBACK: Dict[str, Tuple[float, float, float]] = {
     "rock": (0.80, 0.45, 0.55), "pop": (0.65, 0.40, 0.70), "samba": (0.75, 0.60, 0.80),
     "bossa": (0.45, 0.65, 0.70), "funk": (0.85, 0.55, 0.60), "reggae": (0.55, 0.45, 0.65),
@@ -1002,7 +963,6 @@ _FEEDBACK_PATH = Path("memory/feedback.json")
 
 
 def _kb_find(node: Any, keys: set, depth: int = 0) -> Optional[Dict[str, Any]]:
-    """Busca recursiva (profundidade <= 4) por um dict cuja CHAVE é o gênero."""
     if depth > 4 or not isinstance(node, dict):
         return None
     for k, v in node.items():
@@ -1017,7 +977,6 @@ def _kb_find(node: Any, keys: set, depth: int = 0) -> Optional[Dict[str, Any]]:
 
 
 def _kb_bpm(style: str, log: logging.Logger) -> Optional[Tuple[float, float]]:
-    """(média, desvio) de BPM do gênero no knowledge_base.json, se existir."""
     try:
         kb = json.loads(Path("knowledge_base.json").read_text(encoding="utf-8"))
     except Exception as exc:
@@ -1044,15 +1003,13 @@ def _kb_bpm(style: str, log: logging.Logger) -> Optional[Tuple[float, float]]:
 
 def _ai_personality(style: str, rng: random.Random, log: logging.Logger,
                     use_ae: bool = True) -> Dict[str, Any]:
-    """Energia/complexidade/valência: do autoencoder treinado (protótipo do
-    gênero reconstruído) ou de priors por estilo. Varia com a seed."""
     src = "priors"
     e: Optional[float] = None
     c: Optional[float] = None
     v: Optional[float] = None
     if use_ae:
         try:
-            import train as _train  # módulo do próprio projeto
+            import train as _train
             model, _meta, backend = _train.load_autoencoder()
             genre = _KB_GENRES.get(style, (style,))[0]
             proto = _train.song_to_features(120, genre, 180.0, 0.5, 0.5, 0.5)
@@ -1072,6 +1029,29 @@ def _ai_personality(style: str, rng: random.Random, log: logging.Logger,
     log.info("IA: personalidade (%s) energia=%.2f complexidade=%.2f valência=%.2f",
              src, p["energy"], p["complexity"], p["valence"])
     return p
+
+
+def _reference_bias(path: str, log: logging.Logger) -> Optional[Dict[str, Any]]:
+    """v8: analisa um áudio de referência (librosa) → BPM/energia/brilho."""
+    try:
+        import librosa
+        y, sr = librosa.load(str(path), sr=22050, mono=True, duration=180.0)
+        if y.size < sr:
+            return None
+        tempo = librosa.beat.beat_track(y=y, sr=sr)[0]
+        tempo = float(_np.atleast_1d(tempo)[0])
+        if not (40 <= tempo <= 220):
+            tempo = 120.0
+        rms = float(_np.mean(librosa.feature.rms(y=y)))
+        cent = float(_np.mean(librosa.feature.spectral_centroid(y=y, sr=sr)))
+        energy = min(1.0, max(0.05, rms * 6.5))
+        brightness = min(1.0, max(0.05, cent / 4000.0))
+        return {"bpm": int(round(tempo)), "energy": round(energy, 3),
+                "valence": round(0.3 + 0.5 * brightness, 3),
+                "duration_s": round(len(y) / sr, 1)}
+    except Exception as exc:
+        log.warning("Análise da referência falhou (%s) — ignorada.", exc)
+        return None
 
 
 def _load_feedback() -> Dict[str, Any]:
@@ -1099,12 +1079,6 @@ def _feedback_style_state(style: str) -> Dict[str, Any]:
 
 
 def _repetitiveness_score(composer, beat_sec: float) -> float:
-    """Score heurístico 0..1 (0=variado, 1=repetitivo).
-
-    - compassos duplicados (assinatura = notas quantizadas em 16avos);
-    - baixa diversidade de pitches.
-    Percussão pesa 0.4 (repetição rítmica é musical); melódicos pesam 1.0.
-    """
     bar_len = beat_sec * 4.0
     dup_w = div_w = wsum = 0.0
     for t in composer.tracks:
@@ -1133,9 +1107,7 @@ def _repetitiveness_score(composer, beat_sec: float) -> float:
         wsum += w
     if wsum <= 0:
         return 0.5
-    dup = dup_w / wsum
-    div = div_w / wsum
-    return float(min(1.0, max(0.0, 0.55 * dup + 0.45 * (1.0 - div))))
+    return float(min(1.0, max(0.0, 0.55 * (dup_w / wsum) + 0.45 * (1.0 - div_w / wsum))))
 
 
 def _auto_evaluate_and_update(composer, style: str, beat_sec: float,
@@ -1156,9 +1128,9 @@ def _auto_evaluate_and_update(composer, style: str, beat_sec: float,
         prev = st.get("ema_rep")
         ema = score if prev is None else round(0.7 * float(prev) + 0.3 * score, 4)
         delta = float(st.get("temp_delta", 0.0))
-        if ema > 0.55:                      # repetitivo → mais variação
+        if ema > 0.55:
             delta = min(0.30, delta + 0.05)
-        elif ema < 0.35:                    # variado demais/caótico → menos
+        elif ema < 0.35:
             delta = max(-0.10, delta - 0.02)
         st.update({"ema_rep": ema, "temp_delta": round(delta, 3),
                    "n": int(st.get("n", 0)) + 1,
@@ -1174,7 +1146,7 @@ def _auto_evaluate_and_update(composer, style: str, beat_sec: float,
 
 
 # =============================================================================
-# INTEGRAÇÃO com midi_composer.MidiComposer (API real)
+# INTEGRAÇÃO com midi_composer.MidiComposer
 # =============================================================================
 
 def _safe_title(text: str) -> str:
@@ -1187,9 +1159,8 @@ def _make_composer(params: "SongParams", log: logging.Logger) -> "MidiComposer":
     if MidiComposer is None:
         raise RuntimeError(
             "midi_composer.MidiComposer não pôde ser importado ("
-            f"{_MIDI_COMPOSER_ERR or 'motivo desconhecido'}). Verifique se "
-            "real_instruments.py e mido estão disponíveis "
-            "(pip install -r requirements.txt)."
+            f"{_MIDI_COMPOSER_ERR or 'motivo desconhecido'}). "
+            "Verifique real_instruments.py e mido (pip install -r requirements.txt)."
         )
     key_name = PC_TO_NAME[params.key_root]
     if "minor" in params.scale and "pentatonic" not in params.scale:
@@ -1214,49 +1185,215 @@ def _export_midi(composer, path: Path, log: logging.Logger) -> bool:
     return True
 
 
+def _midi_offset(mid) -> int:
+    """1 se a track 0 do arquivo for tempo/meta (padrão do MidiComposer)."""
+    if mid.tracks:
+        first = mid.tracks[0]
+        if (not any(m.type == "note_on" and m.velocity > 0 for m in first)
+                and any(m.type in ("set_tempo", "time_signature") for m in first)):
+            return 1
+    return 0
+
+
 # =============================================================================
-# RENDERIZAÇÃO DE ÁUDIO — FluidSynth CLI > renderer externo > embutido
+# v8: RENDERIZAÇÃO — SoundFonts especializados POR TRILHA (método principal)
 # =============================================================================
 
-def _try_fluidsynth_cli(midi_path: Path, wav_path: Path,
-                        log: logging.Logger) -> Optional[Path]:
-    """MELHOR QUALIDADE: FluidSynth via CLI com SoundFont real (FluidR3_GM).
+_SF_DIR = Path("soundfonts")
+_SR_MIX = 44100
+_ELECTRONIC_SF_STYLES = {"electronic", "synthwave", "breakcore", "dnb", "chiptune",
+                         "disco", "trap", "funk"}
+_ROLE_GAIN = {"drums": 1.0, "perc": 0.9, "bass": 0.85, "lead": 0.95, "comp": 0.75}
 
-    O CI instala fluidsynth + fluid-soundfont-gm via apt. Localmente:
-    Linux: sudo apt install fluidsynth fluid-soundfont-gm
-    macOS: brew install fluidsynth soundfont-fluid
-    Windows: baixe o binário + um .sf2 em soundfonts/
-    """
-    import glob as _glob
+
+def _sf2_files() -> Dict[str, Path]:
+    """{nome_minúsculo: caminho}. Case-insensitive (.sf2 e .SF2)."""
+    out: Dict[str, Path] = {}
+    if _SF_DIR.is_dir():
+        for p in sorted(_SF_DIR.iterdir()):
+            if p.is_file() and p.suffix.lower() == ".sf2":
+                out.setdefault(p.name.lower(), p)
+    return out
+
+
+def _gm_bank() -> Optional[Path]:
+    for p in ("/usr/share/sounds/sf2/default-GM.sf2",
+              "/usr/share/sounds/sf2/FluidR3_GM.sf2"):
+        if Path(p).exists():
+            return Path(p)
+    return None
+
+
+def _bank_for_instrument(inst_id: str, style: str,
+                         files: Dict[str, Path]) -> Optional[Path]:
+    """Banco especializado para a trilha, ou None (= renderizar com GM)."""
+
+    def pick(names):
+        return next((files[n.lower()] for n in names if n.lower() in files), None)
+
+    if style in _ELECTRONIC_SF_STYLES:
+        if inst_id in ("synth_lead", "square_lead"):
+            return pick(("198_Juno106_LeadSynth.sf2", "Pro53 Lead.sf2",
+                         "FlangerSaw.SF2", "TJ.Meinsynt08.SF2"))
+        if inst_id in ("bass", "synth_bass"):
+            return pick(("Crunk [moog]2007.with.sustain.sf2", "Bandpass.sf2"))
+        if inst_id == "synth_pad":
+            return pick(("HS Synth Collection I.sf2", "HS Synthetic Electronic.sf2",
+                         "UK.Fatonic04.SF2", "UK.Syntlegend01.SF2"))
+        if inst_id == "drums":
+            return pick(("Drum Set JD Rockset 5.sf2", "GiantSoundfontDrumkit2.1.sf2"))
+    if inst_id == "strings":
+        return pick(("Crunk String.SF2",))
+    return None
+
+
+def _stem_midi(src_mid, file_idx: int, out_path: Path, strip_programs: bool) -> bool:
+    """MIDI de UMA trilha (arquivo novo: meta-tempo + a trilha)."""
+    import mido
+    if not (0 <= file_idx < len(src_mid.tracks)):
+        return False
+    tempo = 500000
+    for t in src_mid.tracks:
+        for m in t:
+            if m.type == "set_tempo":
+                tempo = m.tempo
+                break
+        else:
+            continue
+        break
+    sub = mido.MidiFile(type=1, ticks_per_beat=src_mid.ticks_per_beat)
+    meta = mido.MidiTrack()
+    meta.append(mido.MetaMessage("set_tempo", tempo=tempo))
+    sub.tracks.append(meta)
+    tr = src_mid.tracks[file_idx]
+    if strip_programs:  # banco especializado: usa o preset do próprio banco
+        tr = mido.MidiTrack(m for m in tr if m.type != "program_change")
+    sub.tracks.append(tr)
+    sub.save(str(out_path))
+    return True
+
+
+def _render_stem(fs: str, bank: Path, midi_in: Path, wav_out: Path) -> bool:
+    import subprocess
+    try:
+        subprocess.run([fs, "-ni", str(bank), str(midi_in), "-F", str(wav_out),
+                        "-r", str(_SR_MIX), "-g", "0.8", "-R", "0", "-C", "0"],
+                       check=True, capture_output=True, timeout=120)
+    except Exception:
+        return False
+    return wav_out.exists() and wav_out.stat().st_size > 1000
+
+
+def _wav_mono(path: Path):
+    import soundfile as _sf
+    data, sr = _sf.read(str(path), dtype="float32", always_2d=True)
+    return data.mean(axis=1), sr
+
+
+def _render_per_track(midi_path: Path, wav_path: Path,
+                      track_map: Dict[int, Tuple[str, str]], style: str,
+                      log: logging.Logger) -> Optional[Path]:
+    """track_map: {índice_da_track_NO_ARQUIVO: (instrumento, papel)}."""
+    import shutil
+    import tempfile
+    if _np is None or not track_map:
+        return None
+    import mido
+    fs = shutil.which("fluidsynth")
+    gm = _gm_bank()
+    files = _sf2_files()
+    if not fs or gm is None:
+        return None
+    mid = mido.MidiFile(str(midi_path))
+
+    stems: List[Tuple[Any, float]] = []
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        for file_idx, (inst, role) in sorted(track_map.items()):
+            if not (0 <= file_idx < len(mid.tracks)):
+                continue
+            bank = _bank_for_instrument(inst, style, files) if files else None
+            mono = None
+            if bank:
+                stem_mid, wav = td / f"t{file_idx}.mid", td / f"t{file_idx}.wav"
+                if _stem_midi(mid, file_idx, stem_mid, strip_programs=True) \
+                        and _render_stem(fs, bank, stem_mid, wav):
+                    try:
+                        m, _ = _wav_mono(wav)
+                        if m.size and float(_np.max(_np.abs(m))) > 1e-3:
+                            mono = m
+                            log.info("  trilha %-14s ← %s", inst, bank.name)
+                    except Exception:
+                        pass
+            if mono is None:  # sem banco, ou banco ficou mudo → GM
+                stem_gm, wav = td / f"t{file_idx}_gm.mid", td / f"t{file_idx}_gm.wav"
+                if _stem_midi(mid, file_idx, stem_gm, strip_programs=False) \
+                        and _render_stem(fs, gm, stem_gm, wav):
+                    try:
+                        m, _ = _wav_mono(wav)
+                        if m.size and float(_np.max(_np.abs(m))) > 1e-4:
+                            mono = m
+                            log.info("  trilha %-14s ← GM%s", inst,
+                                     " (banco especializado ficou mudo)" if bank else "")
+                    except Exception:
+                        pass
+            if mono is not None:
+                stems.append((mono, _ROLE_GAIN.get(role, 0.8)))
+            else:
+                log.warning("  trilha %s não renderizou", inst)
+
+    if not stems:
+        return None
+    n = max(len(m) for m, _ in stems)
+    mix = _np.zeros(n, dtype=_np.float64)
+    for m, g in stems:
+        mix[: len(m)] += m.astype(_np.float64) * g
+    peak = float(_np.max(_np.abs(mix)))
+    if peak > 0:
+        mix *= 0.86 / peak
+    import soundfile as _sf
+    _sf.write(str(wav_path), mix.astype(_np.float32), _SR_MIX)
+    log.info("WAV: %d trilhas misturadas (SoundFonts especializados + GM) → %s",
+             len(stems), wav_path)
+    return wav_path
+
+
+def _try_fluidsynth_cli(midi_path: Path, wav_path: Path, log: logging.Logger,
+                        forced: Optional[str] = None) -> Optional[Path]:
+    """Música INTEIRA num banco só: GM completo (padrão) ou --soundfont forçado."""
     import shutil
     import subprocess
     fs = shutil.which("fluidsynth")
     if not fs:
         return None
-    candidates = ["/usr/share/sounds/sf2/default-GM.sf2",
-                  "/usr/share/sounds/sf2/FluidR3_GM.sf2"]
-    candidates += sorted(_glob.glob("soundfonts/*.sf2"))
-    candidates += sorted(_glob.glob("soundfonts/**/*.sf2", recursive=True))
-    sf2 = next((p for p in candidates if Path(p).exists()), None)
-    if not sf2:
-        log.debug("FluidSynth presente, mas nenhum SoundFont (.sf2) encontrado.")
+    bank: Optional[Path] = None
+    if forced:
+        p = Path(forced)
+        if not p.exists():
+            p = _sf2_files().get(forced.lower(), _SF_DIR / forced)
+        if p.exists():
+            bank = p
+        else:
+            log.warning("--soundfont %r não encontrado — usando GM.", forced)
+    if bank is None:
+        bank = _gm_bank()  # full-band SOMENTE com banco GM completo
+    if bank is None:
         return None
     try:
-        subprocess.run(
-            [fs, "-ni", sf2, str(midi_path), "-F", str(wav_path),
-             "-r", "44100", "-g", "0.7"],
-            check=True, capture_output=True, timeout=180,
-        )
+        subprocess.run([fs, "-ni", str(bank), str(midi_path), "-F", str(wav_path),
+                        "-r", str(_SR_MIX), "-g", "0.7"],
+                       check=True, capture_output=True, timeout=300)
         if wav_path.exists() and wav_path.stat().st_size > 1000:
-            log.info("WAV: FluidSynth CLI + %s (amostras SoundFont reais)", sf2)
+            log.info("WAV: FluidSynth CLI + %s", bank.name)
             return wav_path
-        log.warning("FluidSynth rodou mas o WAV não apareceu — caindo.")
     except Exception as exc:
-        log.warning("FluidSynth CLI falhou (%s) — caindo para fallback.", exc)
+        log.warning("FluidSynth CLI falhou (%s).", exc)
     return None
 
 
-_SR = 22050  # sample rate do renderizador EMBUTIDO (fallback)
+# --- renderizador embutido (procedural — SÓ fallback) -----------------------
+
+_SR = 22050
 
 
 def _synth_drum(pitch: int, dur: float, vel: int, seed: int = 0):
@@ -1333,7 +1470,6 @@ def _synth_drum(pitch: int, dur: float, vel: int, seed: int = 0):
                + 0.6 * np.sin(2 * np.pi * 6170 * t)) * decay(0.6) * 0.5
     else:
         out = hi * decay(0.05)
-
     peak = float(np.max(np.abs(out))) if out.size else 0.0
     if peak > 0:
         out = out * (0.55 * amp / peak)
@@ -1395,7 +1531,6 @@ def _builtin_render_wav(midi_path: Path, wav_path: Path, log: logging.Logger) ->
     spt = tempo / 1e6 / mid.ticks_per_beat
     n = int((mid.length + 1.2) * _SR)
     audio = _np.zeros(n, dtype=_np.float64)
-
     count = 0
 
     def _emit(start, end, pitch, vel, ch, programs):
@@ -1443,26 +1578,35 @@ def _builtin_render_wav(midi_path: Path, wav_path: Path, log: logging.Logger) ->
 
 
 def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
-                  log: logging.Logger) -> Optional[Path]:
-    # 1) FluidSynth CLI — MELHOR QUALIDADE (amostras SoundFont reais)
-    if prefer_soundfont and _try_fluidsynth_cli(midi_path, wav_path, log):
-        return wav_path
-    # 2) soundfont_renderer (compatibilidade, se a API casar)
-    if prefer_soundfont and _RENDERER is not None:
-        import inspect
-        try:
-            sig = inspect.signature(_RENDERER)
-            kw: Dict[str, Any] = {}
-            for name in ("use_soundfont", "prefer_soundfont"):
-                if name in sig.parameters:
-                    kw[name] = True
-            _RENDERER(str(midi_path), str(wav_path), **kw)
-            if wav_path.exists():
-                log.info("WAV: soundfont_renderer")
-                return wav_path
-        except Exception as exc:
-            log.warning("soundfont_renderer falhou (%s) — caindo.", exc)
-    # 3) Embutido — sempre disponível (bateria sintetizada garantida)
+                  log: logging.Logger, track_map: Optional[Dict[int, Tuple[str, str]]] = None,
+                  style: str = "", forced_soundfont: Optional[str] = None) -> Optional[Path]:
+    if prefer_soundfont:
+        # 1) POR TRILHA — SoundFonts especializados do repositório (principal)
+        if track_map and not forced_soundfont:
+            try:
+                if _render_per_track(midi_path, wav_path, track_map, style, log):
+                    return wav_path
+            except Exception as exc:
+                log.warning("Render por trilha falhou (%s) — full-band.", exc)
+        # 2) FULL-BAND — GM completo (ou banco forçado pelo usuário)
+        if _try_fluidsynth_cli(midi_path, wav_path, log, forced=forced_soundfont):
+            return wav_path
+        # 3) soundfont_renderer (compatibilidade)
+        if _RENDERER is not None:
+            import inspect
+            try:
+                sig = inspect.signature(_RENDERER)
+                kw: Dict[str, Any] = {}
+                for name in ("use_soundfont", "prefer_soundfont"):
+                    if name in sig.parameters:
+                        kw[name] = True
+                _RENDERER(str(midi_path), str(wav_path), **kw)
+                if wav_path.exists():
+                    log.info("WAV: soundfont_renderer")
+                    return wav_path
+            except Exception as exc:
+                log.warning("soundfont_renderer falhou (%s) — caindo.", exc)
+    # 4) Embutido — procedural, APENAS fallback (requisito do projeto)
     try:
         if _builtin_render_wav(midi_path, wav_path, log):
             return wav_path
@@ -1471,22 +1615,82 @@ def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
     return None
 
 
+# =============================================================================
+# v8: APIs PARA ARQUIVOS IMPORTADOS (usadas pelo server.py)
+# =============================================================================
+
+def _inst_from_program(prog: int, is_drum: bool) -> str:
+    if is_drum:
+        return "drums"
+    if prog >= 96:
+        return "synth_pad"
+    if 88 <= prog < 96:
+        return "synth_pad"
+    if 80 <= prog < 88:
+        return "synth_lead"
+    if 72 <= prog < 80:
+        return "flute"
+    if 64 <= prog < 72:
+        return "saxophone"
+    if 56 <= prog < 64:
+        return "trumpet"
+    if 40 <= prog < 56:
+        return "strings"
+    if 32 <= prog < 40:
+        return "bass"
+    if 24 <= prog < 32:
+        return "electric_guitar"
+    if 16 <= prog < 24:
+        return "organ"
+    return "piano"
+
+
+def analyze_midi_tracks(midi_path: Path) -> Dict[int, Tuple[str, str]]:
+    """{índice_da_track_no_arquivo: (instrumento, papel)} de um MIDI qualquer."""
+    import mido
+    mid = mido.MidiFile(str(midi_path))
+    track_map: Dict[int, Tuple[str, str]] = {}
+    for idx, tr in enumerate(mid.tracks):
+        notes = [m for m in tr if m.type == "note_on" and m.velocity > 0]
+        if not notes:
+            continue
+        chans = {m.channel for m in notes}
+        is_drum = 9 in chans
+        prog = 0
+        for m in tr:
+            if m.type == "program_change" and not is_drum:
+                prog = m.program
+                break
+        inst = _inst_from_program(prog, is_drum)
+        role = ("drums" if inst == "drums" else "bass" if inst in ("bass", "synth_bass")
+                else "lead" if _monophonic(inst) or "lead" in inst else "comp")
+        track_map[idx] = (inst, role)
+    return track_map
+
+
+def render_midi_file(midi_path: Path, out_dir: Path, style: str = "",
+                     log: Optional[logging.Logger] = None) -> Optional[Path]:
+    """Renderiza um MIDI IMPORTADO com os SoundFonts do repositório (por trilha).
+    Retorna o caminho do WAV ou None."""
+    log = log or LOG
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = out_dir / (Path(midi_path).stem + ".wav")
+    track_map = analyze_midi_tracks(Path(midi_path))
+    log.info("MIDI importado: %d trilhas com notas %s",
+             len(track_map), {i: r for i, r in track_map.items()})
+    wav = _render_audio(Path(midi_path), wav_path, prefer_soundfont=True, log=log,
+                        track_map=track_map, style=style)
+    return wav
+
+
 def audit_midi(path: Path, inst_by_track: Dict[int, str], log: logging.Logger) -> bool:
-    """Auditoria pós-geração (v6.1: detecta a track de tempo no índice 0)."""
     try:
         import mido
     except ImportError:
         log.warning("mido não instalado — auditoria de MIDI pulada.")
         return True
     mid = mido.MidiFile(str(path))
-
-    offset = 0
-    if mid.tracks:
-        first = mid.tracks[0]
-        if (not any(m.type == "note_on" and m.velocity > 0 for m in first)
-                and any(m.type in ("set_tempo", "time_signature") for m in first)):
-            offset = 1
-
+    offset = _midi_offset(mid)
     ok = True
     drums_found = False
     log.info("Auditoria do MIDI (%d tracks no arquivo, %d de instrumento):",
@@ -1537,8 +1741,10 @@ class SongParams:
     temperature: float = 0.7
     output_dir: Path = Path("song_output")
     prefer_soundfont: bool = True
-    bpm_explicit: bool = False   # v7: --bpm explícito desativa bias do dataset
-    use_ai: bool = True          # v7: --no-ai desativa bias/personalidade/feedback
+    bpm_explicit: bool = False
+    use_ai: bool = True
+    forced_soundfont: Optional[str] = None   # v8
+    reference: Optional[str] = None          # v8: caminho do áudio de referência
 
 
 def _fit_form(bars: int, style: str) -> List[Tuple[str, int]]:
@@ -1573,7 +1779,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     style_cfg = STYLES.get(style, STYLES["pop"])
     ai_on = bool(params.use_ai)
 
-    # --- v7: temperatura adaptativa (feedback de gerações anteriores) ---------
+    # temperatura adaptativa (feedback)
     temperature = params.temperature
     if ai_on:
         delta = float(_feedback_style_state(style).get("temp_delta", 0.0))
@@ -1582,7 +1788,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             log.info("IA (feedback): temperatura %.2f → %.2f (Δ%+.2f, aprendido)",
                      params.temperature, temperature, delta)
 
-    # --- v7: BPM do dataset real (knowledge_base.json) ------------------------
+    # BPM do dataset real
     bpm_source = "style_default"
     if ai_on and not params.bpm_explicit:
         kb = _kb_bpm(style, log)
@@ -1601,15 +1807,30 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     root_midi = 48 + params.key_root
     swing_on = style_cfg["swing"] > 0
 
-    # --- v7: personalidade (autoencoder ou priors) ------------------------------
+    # personalidade (autoencoder/priors) + override pela REFERÊNCIA (v8)
     personality = _ai_personality(style, rng, log, use_ae=ai_on)
-    vel_scale = 0.78 + 0.45 * personality["energy"]            # ~0.80..1.21
-    p_rhythm_change = 0.15 + 0.30 * personality["complexity"]  # 0.17..0.44
-    p_bass_fill = 0.25 + 0.35 * personality["complexity"]      # 0.27..0.58
-    up_bias = 0.35 + 0.30 * personality["valence"]              # 0.36..0.63
-    p_motif_vary = min(0.85, 0.5 * (0.7 + 0.6 * personality["complexity"]))
+    ref_info: Optional[Dict[str, Any]] = None
+    if params.reference:
+        rb = _reference_bias(params.reference, log)
+        if rb:
+            ref_info = rb
+            if ai_on:
+                if not params.bpm_explicit and rb.get("bpm"):
+                    params.bpm = int(rb["bpm"])
+                    bpm_source = "reference"
+                    beat_sec = 60.0 / params.bpm
+                personality["energy"] = rb["energy"]
+                personality["valence"] = rb["valence"]
+                personality["source"] = "reference"
+                log.info("IA (referência): BPM → %d | energia=%.2f | valência=%.2f (%s)",
+                         params.bpm, rb["energy"], rb["valence"], params.reference)
 
-    # --- instrumentação ---------------------------------------------------------
+    vel_scale = 0.78 + 0.45 * personality["energy"]
+    p_rhythm_change = 0.15 + 0.30 * personality["complexity"]
+    p_bass_fill = 0.25 + 0.35 * personality["complexity"]
+    up_bias = 0.35 + 0.30 * personality["valence"]
+
+    # instrumentação
     inst_ids: List[str] = list(params.instruments)
     if not inst_ids:
         for cand in style_cfg["instruments"]:
@@ -1628,14 +1849,13 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         kit_id = "drums"
         perc_ids = [i for i in perc_ids if i != "drums"]
     elif style not in NO_DRUMS_STYLES and not perc_ids:
-        kit_id = _resolve_id(("drums", "drum kit", "bateria"))
+        kit_id = _resolve_id(("drums", "bateria"))
         if kit_id:
             inst_ids.append(kit_id)
             log.info("Bateria (kit) adicionada automaticamente para o estilo '%s'.", style)
 
     if bass_id is None and style in AUTO_BASS_STYLES:
-        bass_id = _resolve_id(("bass", "baixo", "electric_bass", "fingered_bass",
-                               "acoustic_bass"))
+        bass_id = _resolve_id(("bass", "baixo"))
         if bass_id:
             inst_ids.append(bass_id)
             log.info("Baixo adicionado automaticamente para o estilo '%s'.", style)
@@ -1666,7 +1886,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     log.info("Instrumentos: lead=%s | acordes=%s | baixo=%s | kit=%s | percussão=%s",
              lead_id, comp_ids or "-", bass_id, kit_id, perc_ids or "-")
 
-    # --- canais únicos por instrumento melódico -----------------------------------
+    # canais únicos
     used_ch = {9}
     for inst in dict.fromkeys(inst_ids):
         entry = INSTRUMENTS.get(inst)
@@ -1679,7 +1899,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     break
         used_ch.add(entry["channel"])
 
-    # --- composer e tracks -------------------------------------------------------
     composer = _make_composer(params, log)
     track_of: Dict[str, int] = {}
     inst_by_track: Dict[int, str] = {}
@@ -1690,7 +1909,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             log.warning("add_track(%r) falhou (%s) — instrumento ignorado.", inst, exc)
             continue
         if not isinstance(idx, int):
-            log.warning("add_track(%r) não retornou índice — instrumento ignorado.", inst)
+            log.warning("add_track(%r) sem índice — instrumento ignorado.", inst)
             continue
         track_of[inst] = idx
         inst_by_track[idx] = inst
@@ -1712,7 +1931,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             pit = min(127, max(21, pit))
         composer.add_note(track, start=start, duration=dur, pitch=pit, velocity=v)
 
-    # --- plano da música -----------------------------------------------------------
     bars = max(4, int(round(params.duration / (beat_sec * beats_per_bar))))
     sections = _fit_form(bars, style)
     log.info("Estrutura: %s", " → ".join(f"{n}:{b}" for n, b in sections))
@@ -1723,13 +1941,11 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     prog_a2 = list(rng.choice(rest_opts)) if rest_opts else prog_a
     rest2 = [o for o in rest_opts if o != prog_a2] or rest_opts or opts
     prog_b = list(rng.choice(rest2))
-    # v7: complexidade aprendida aumenta a chance de acordes com 7ª
     add7 = bool(style_cfg.get("sevenths")) or rng.random() < (0.15 + 0.30 * personality["complexity"])
-    log.info("Progressões: A=%s | A2=%s (verso 2) | B=%s (refrão) | tom=%s %s | "
-             "%d BPM | seed=%d", prog_a, prog_a2, prog_b,
-             PC_TO_NAME[params.key_root], params.scale, params.bpm, params.seed)
+    log.info("Progressões: A=%s | A2=%s | B=%s | tom=%s %s | %d BPM | seed=%d",
+             prog_a, prog_a2, prog_b, PC_TO_NAME[params.key_root], params.scale,
+             params.bpm, params.seed)
 
-    # --- composição ------------------------------------------------------------------
     prev_voicing: Optional[List[int]] = None
     phrase: Optional[Dict[int, list]] = None
     verse_idx = 0
@@ -1741,7 +1957,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         if sec_name == "refrao":
             chorus_count += 1
             profile["vel"] = min(110, profile["vel"] + 3 * (chorus_count - 1))
-        # v7: energia aprendida escala a intensidade de TODA a seção
         profile["vel"] = int(min(115, profile["vel"] * vel_scale))
         comp_rhythms = COMP_RHYTHMS.get(style, [[0.0, 2.0]])
         comp_rhythm = rng.choice(comp_rhythms)
@@ -1757,11 +1972,9 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
         if profile["melody"] and lead_id and lead_id in track_of:
             phrase = _new_phrase(rng, profile["dense"], up_bias)
         for b in range(sec_bars):
-            # v7: complexidade aprendida controla a variação rítmica por compasso
             if b > 0 and len(comp_rhythms) > 1 and rng.random() < p_rhythm_change:
                 comp_rhythm = rng.choice(
                     [r for r in comp_rhythms if r != comp_rhythm] or comp_rhythms)
-
             degree = prog[b % len(prog)]
             next_degree = prog[(b + 1) % len(prog)]
             is_last = (b == sec_bars - 1)
@@ -1770,7 +1983,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                 degree = 4
                 next_degree = prog[0]
 
-            # ---- acordes (comp) ----
             if profile["comp"] and comp_ids:
                 offsets = _chord_offsets(scale, degree, add7)
                 prev_voicing = _voice_chord(prev_voicing, offsets, root_midi + 12)
@@ -1786,7 +1998,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                             note(track_of[inst], abs_bar, hpos + off, dur,
                                  pit, profile["vel"] - 3 * j, swing=swing_on)
 
-            # ---- baixo (fills guiados pela complexidade) ----
             if profile["bass"] and bass_id and bass_id in track_of:
                 use_fill = ((b % 4 == 3 or is_last) and rng.random() < p_bass_fill
                             and style not in ("ambient", "dungeon", "cinematic", "classical"))
@@ -1802,7 +2013,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[bass_id], abs_bar, pos, dur, pitch,
                          profile["vel"] - 8, swing=swing_on)
 
-            # ---- bateria (kit) ----
             if kit_id and kit_id in track_of and profile["drums"]:
                 pattern = _kit_pattern(style, abs_bar, rng)
                 if is_last and sec_i < len(sections) - 1:
@@ -1821,7 +2031,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[kit_id], abs_bar, pos, dur_beats,
                          GM[name], int(vel * gain), swing=swing_on)
 
-            # ---- percussão individual ----
             for pid in perc_ids:
                 if pid not in track_of or not profile["drums"]:
                     continue
@@ -1838,7 +2047,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[pid], abs_bar, i * 0.25, dur / beat_sec,
                          pitch, int(v * (profile["vel"] / 76.0)))
 
-            # ---- melodia (frases; variação e contorno guiados pela IA) ----
             if profile["melody"] and lead_id and lead_id in track_of:
                 if b % 4 == 0 and b > 0:
                     r = rng.random()
@@ -1857,11 +2065,10 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                              pitch, profile["vel"] + 4, swing=swing_on)
             abs_bar += 1
 
-    # --- v7: auto-avaliação + atualização do feedback -------------------------------
     score = _auto_evaluate_and_update(composer, style, beat_sec, temperature,
                                       ai_on, log)
 
-    # --- exportação --------------------------------------------------------------------
+    # exportação
     out_dir = params.output_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{style}_s{params.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
     midi_path = out_dir / f"musica_{style}_s{params.seed}.mid"
@@ -1874,34 +2081,39 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     except Exception as exc:
         log.debug("save_json() indisponível: %s", exc)
 
+    # v8: track_map com índices DO ARQUIVO (offset da track de tempo)
+    import mido as _mido
+    _mid = _mido.MidiFile(str(midi_path))
+    _off = _midi_offset(_mid)
+    track_map: Dict[int, Tuple[str, str]] = {}
+    for inst, ti in track_of.items():
+        role = ("drums" if inst == kit_id else "perc" if inst in perc_ids
+                else "bass" if inst == bass_id else "lead" if inst == lead_id
+                else "comp")
+        track_map[ti + _off] = (inst, role)
+
     wav_path = _render_audio(midi_path, out_dir / f"musica_{style}_s{params.seed}.wav",
-                             params.prefer_soundfont, log)
+                            params.prefer_soundfont, log, track_map=track_map,
+                            style=style, forced_soundfont=params.forced_soundfont)
 
     meta = {
         "gerado_em": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "seed": params.seed,
-        "prompt": params.prompt,
-        "style": style,
-        "bpm": params.bpm,
-        "key": PC_TO_NAME[params.key_root],
-        "scale": params.scale,
+        "seed": params.seed, "prompt": params.prompt, "style": style,
+        "bpm": params.bpm, "key": PC_TO_NAME[params.key_root], "scale": params.scale,
         "instruments": [i for i in inst_ids if i in track_of],
         "duration_s": round(abs_bar * beats_per_bar * beat_sec, 1),
         "bars": abs_bar,
         "sections": [{"nome": nm, "bars": bb} for nm, bb in sections],
-        "progression_a": prog_a,
-        "progression_a2": prog_a2,
-        "progression_b": prog_b,
-        "ai": {
-            "enabled": ai_on,
-            "bpm_source": bpm_source,
-            "personality": personality,
-            "temperature_used": round(temperature, 3),
-            "feedback_delta_applied": round(temperature - params.temperature, 3),
-            "auto_score_repetitividade": round(score, 4) if score is not None else None,
-        },
+        "progression_a": prog_a, "progression_a2": prog_a2, "progression_b": prog_b,
+        "ai": {"enabled": ai_on, "bpm_source": bpm_source,
+               "personality": personality,
+               "temperature_used": round(temperature, 3),
+               "feedback_delta_applied": round(temperature - params.temperature, 3),
+               "auto_score_repetitividade": round(score, 4) if score is not None else None,
+               "reference": ref_info},
+        "forced_soundfont": params.forced_soundfont,
         "files": {"midi": str(midi_path), "wav": str(wav_path) if wav_path else None},
-        "generator": "music_generator.py v7",
+        "generator": "music_generator.py v8",
     }
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1935,27 +2147,31 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--prompt", default="", help="prompt em português")
     p.add_argument("--style", default=None,
-                   help="rock, pop, samba, bossa, funk, reggae, trap, electronic, "
-                        "hiphop, jazz, ambient, cinematic, classical, folk, latin, forro, "
+                   help="rock, pop, samba, bossa, funk, reggae, trap, electronic, hiphop, "
+                        "jazz, ambient, cinematic, classical, folk, latin, forro, "
                         "bossfight, chiptune, dungeon, breakcore, dnb, synthwave, "
                         "disco, blues, metal, choro, capoeira")
     p.add_argument("--instruments", default=None,
                    help='lista separada por vírgula (ex.: "bateria,piano")')
-    p.add_argument("--duration", type=float, default=30.0, help="duração em segundos")
-    p.add_argument("--bpm", type=int, default=None,
-                   help="BPM explícito (desativa o bias do dataset)")
+    p.add_argument("--duration", type=float, default=30.0)
+    p.add_argument("--bpm", type=int, default=None)
     p.add_argument("--key", default=None, help="ex.: C, F#, Am")
     p.add_argument("--scale", default=None, choices=sorted(SCALES))
-    p.add_argument("--seed", type=int, default=None,
-                   help="seed do RNG (padrão: aleatório)")
-    p.add_argument("--temperature", type=float, default=0.7,
-                   help="0..1 — quanto maior, mais variação (a IA ajusta sozinha)")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--output-dir", type=Path, default=Path("song_output"))
     p.add_argument("--no-soundfont", action="store_true",
-                   help="pula FluidSynth/SoundFont e usa o renderizador embutido")
+                   help="pula SoundFont/FluidSynth e usa o renderizador embutido")
     p.add_argument("--no-ai", action="store_true",
-                   help="desativa knowledge_base, autoencoder e feedback "
-                        "(depuração: comportamento v6.1)")
+                   help="desativa knowledge_base/autoencoder/feedback/referência")
+    p.add_argument("--soundfont", default=None,
+                   help="v8: força um .sf2 (nome em soundfonts/ ou caminho) para a "
+                        "música INTEIRA — por padrão usa render por trilha + GM")
+    p.add_argument("--reference", default=None,
+                   help="v8: áudio de referência (MP3/WAV) — BPM/energia/brilho "
+                        "passam a guiar a geração")
+    p.add_argument("--render-midi", default=None,
+                   help="v8: renderiza um MIDI existente com os SoundFonts do repo")
     p.add_argument("--list-instruments", action="store_true")
     p.add_argument("--verbose", action="store_true")
     return p.parse_args(argv)
@@ -1965,11 +2181,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     log = _setup_logging(args.verbose)
     if _RI_ERR:
-        log.warning("real_instruments.py não importado (%s) — usando catálogo "
-                    "de emergência + essenciais.", _RI_ERR)
+        log.warning("real_instruments.py não importado (%s) — catálogo de emergência.",
+                    _RI_ERR)
     if args.list_instruments:
         list_instruments()
         return 0
+
+    # v8: modo renderização de MIDI importado
+    if args.render_midi:
+        src = Path(args.render_midi)
+        if not src.exists():
+            log.error("Arquivo não encontrado: %s", src)
+            return 1
+        wav = render_midi_file(src, Path("song_output"), style="", log=log)
+        if wav:
+            log.info("Pronto: %s", wav)
+            return 0
+        log.error("Não foi possível renderizar %s", src)
+        return 1
+
     if not args.prompt and not args.style:
         log.error("Informe --prompt e/ou --style.")
         return 1
@@ -2014,7 +2244,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if instruments:
         log.info("Instrumentos detectados: %s", instruments)
     else:
-        log.info("Nenhum instrumento no prompt — usando padrão do estilo '%s'.", style)
+        log.info("Nenhum instrumento no prompt — padrão do estilo '%s'.", style)
 
     params = SongParams(
         prompt=args.prompt, style=style,
@@ -2023,8 +2253,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         duration=max(8.0, args.duration), seed=seed,
         temperature=min(1.0, max(0.0, args.temperature)),
         output_dir=args.output_dir, prefer_soundfont=not args.no_soundfont,
-        bpm_explicit=bool(args.bpm),
-        use_ai=not args.no_ai,
+        bpm_explicit=bool(args.bpm), use_ai=not args.no_ai,
+        forced_soundfont=args.soundfont, reference=args.reference,
     )
     try:
         generate_song(params, log)
