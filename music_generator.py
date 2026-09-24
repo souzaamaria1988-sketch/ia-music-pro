@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-music_generator.py — Gerador principal do IA Music Pro (v9).
+music_generator.py — Gerador principal do IA Music Pro (v10).
 
-v9 — OS SEUS SOUNDFONTS COMO SOM PRINCIPAL + ANTI-REPETIÇÃO:
-    1. SOUNDFONT ENGINE: os 15 bancos de soundfonts/ são a fonte primária de
-       timbre. Cada trilha é renderizada com o banco certo (lead ← Juno106/
-       Pro53/FlangerSaw/TJ, bass ← Moog/Bandpass, pads ← HS/UK, drums ←
-       JD Rockset/Giant/Darbuka, cordas ← Crunk String). Pareamento por
-       NOME PARECIDO + SOUNDFONT_CORE (editável) + notas aprendidas.
-    2. AUDIÇÃO/TREINO DOS BANCOS (--audition): renderiza sondas cromáticas e
-       de bateria com CADA banco, mede RMS/brilho/graves, detecta bancos
-       mudos e salva o aprendizado em memory/sf2_scores.json — o gerador
-       passa a preferir os bancos que soam melhor em cada papel.
-    3. ROTAÇÃO: dentro de cada papel os melhores bancos alternam entre
-       gerações → os 15 bancos são usados, não só um.
-    4. ANTI-REPETIÇÃO: modulação de tom por seção (relativa na ponte, +2
-       semitons no refrão final — "truck driver"), melodia com
-       DESENVOLVIMENTO temático (inversão/retrogrado/transposição do motivo),
-       breakdown antes do refrão final, dropout de bateria, arco dinâmico
-       crescente ao longo da música e fade no outro.
-    5. --gm-instruments: usa timbres GM para acústicos (piano/órgão) se você
-       preferir o som acústico; padrão = seus bancos para tudo que eles
-       cobrem (conforme pedido).
+v10 — SEMPRE OS MEUS SOUNDFONTS + BANDIT + VARIEDADE:
+    1. OS 15 BANCOS DE soundfonts/ SÃO O SOM PRINCIPAL, sempre:
+       * drums ← JD Rockset / Giant Drumkit / Darbuka (meus bancos);
+       * melódicos ← melhor banco MEU (nome + audição + personalidade);
+         sem casamento por nome, usa QUALQUER banco meu por rotação —
+         GM só quando não existir .sf2 no repositório;
+       * GM deixou de ser obrigatório: cascata por trilha
+         (meu banco → GM → procedural).
+    2. BANDIT DE USO: cada uso de banco é contabilizado; 40% das escolhas
+       pegam o MENOS USADO → com o tempo TODOS os 15 bancos entram.
+    3. TIMBRE POR PERSONALIDADE: energia/valência da IA preferem bancos
+       mais claros ou mais escuros (métrica 'bright' da --audition).
+    4. VARIEDADE ENTRE GERAÇÕES: 30% das gerações trocam o lead de síntese
+       (synth_lead ↔ square_lead) — músicas soam menos "iguais".
+    5. Fix _develop_motif (NameError com seed=180).
 
-v8: render por trilha, --reference, --render-midi. v7: FluidSynth CLI + IA
-    (knowledge_base, personalidade, feedback). v6.1: auditoria com offset.
+v9: audição/treino dos bancos (--audition), modulação por seção,
+    desenvolvimento temático, breakdown/dropout/arco dinâmico.
+v8: render por trilha, --reference, --render-midi.
+v7: FluidSynth CLI, IA (knowledge_base, personalidade, feedback).
 """
 
 from __future__ import annotations
@@ -393,7 +390,6 @@ AUTO_BASS_STYLES = {"pop", "rock", "funk", "reggae", "trap", "electronic", "hiph
 CRASH_STYLES = {"rock", "pop", "electronic", "funk", "trap", "cinematic", "latin",
                 "bossfight", "metal", "breakcore", "disco"}
 
-# v9: pools maiores de progressão (mais variedade entre gerações)
 PROGRESSIONS: Dict[str, List[List[int]]] = {
     "pop": [[0, 4, 5, 3], [0, 5, 3, 4], [5, 3, 0, 4], [0, 4, 5, 4],
             [0, 5, 1, 4], [3, 4, 0, 0]],
@@ -804,7 +800,7 @@ def _monophonic(inst_id: str) -> bool:
 
 
 # =============================================================================
-# v9: MOTIVOS COM DESENVOLVIMENTO TEMÁTICO (fim do "tudo igual")
+# MOTIVOS COM DESENVOLVIMENTO TEMÁTICO
 # =============================================================================
 
 def _new_motif(rng: random.Random, dense: bool, up_bias: float = 0.5):
@@ -820,7 +816,8 @@ def _new_motif(rng: random.Random, dense: bool, up_bias: float = 0.5):
 
 
 def _develop_motif(motif, op: str, rng: Optional[random.Random] = None):
-    """Transforma um motivo (técnica clássica de desenvolvimento temático)."""
+    """Transforma um motivo (técnica clássica de desenvolvimento temático).
+    v10 fix: rng é parâmetro (NameError da v9)."""
     if motif is None:
         return None
     out = [((p, d), s) for (p, d), s in motif]
@@ -851,11 +848,11 @@ def _vary_motif(motif, rng: random.Random):
 
 def _new_phrase(rng: random.Random, dense: bool, up_bias: float = 0.5,
                 prev: Optional[Dict[int, list]] = None) -> Dict[int, list]:
-    """Frase de 4 compassos. Com `prev`, DERIVA do tema anterior (coerência
-    com variedade) em vez de sortear tudo de novo."""
+    """Frase de 4 compassos. Com `prev`, DERIVA do tema anterior
+    (coerência com variedade) em vez de sortear tudo de novo."""
     if prev and prev.get(0) and rng.random() < 0.7:
         op = rng.choice(("invert", "shift", "retro", "sparse"))
-        a = _develop_motif(prev[0], op)
+        a = _develop_motif(prev[0], op, rng)
     else:
         a = _new_motif(rng, dense, up_bias)
     rep = _vary_motif(a, rng) if rng.random() < 0.6 else [((p, d), s) for (p, d), s in a]
@@ -1182,15 +1179,15 @@ def _auto_evaluate_and_update(composer, style: str, beat_sec: float,
 
 
 # =============================================================================
-# v9: SOUNDFONT ENGINE — os 15 bancos do repositório como som principal
+# v10: SOUNDFONT ENGINE — SEMPRE os bancos do repositório
 # =============================================================================
 
 _SF_DIR = Path("soundfonts")
 _SR_MIX = 44100
 _SF_SCORES_PATH = Path("memory/sf2_scores.json")
 
-# BANCO PRINCIPAL ("core") DE CADA PAPEL — troque o nome pelo EXATO do arquivo
-# em soundfonts/ que você quer como padrão daquele papel.
+# BANCO "CORE" DE CADA PAPEL — troque pelo nome EXATO do arquivo que você
+# quer como padrão daquele papel.
 SOUNDFONT_CORE: Dict[str, str] = {
     "lead":    "198_Juno106_LeadSynth.sf2",
     "bass":    "Crunk [moog]2007.with.sustain.sf2",
@@ -1201,6 +1198,8 @@ SOUNDFONT_CORE: Dict[str, str] = {
 
 _SF_SYNTH_HINTS = ("synth", "juno", "pro53", "flanger", "fatonic",
                    "syntlegend", "meinsynt", "electronic", "collection")
+_ELECTRONIC_SF_STYLES = {"electronic", "synthwave", "breakcore", "dnb", "chiptune",
+                         "disco", "trap", "funk"}
 
 
 def _sf2_files() -> Dict[str, Path]:
@@ -1249,8 +1248,7 @@ def _bank_name_score(inst_id: str, role: str, bl: str) -> int:
         return s - 4 if ("drum" in bl or "string" in bl) else s
     if role == "strings":
         return 5 if "string" in bl else -5
-    # pad / comp: bancos de síntese servem para tudo sintético e também dão
-    # timbre às trilhas harmônicas (pedido: usar os bancos do repo)
+    # pad / comp
     if any(h in bl for h in _SF_SYNTH_HINTS):
         return 4 if inst_id == "synth_pad" else 2
     return -6 if ("drum" in bl or "darbuka" in bl) else 0
@@ -1288,30 +1286,60 @@ def _role_metric(info: Optional[Dict[str, Any]], role: str) -> float:
 
 
 def _bank_for_track(inst_id: str, role: str, files: Dict[str, Path],
-                    rng: random.Random, learned: Dict[str, Any]) -> Optional[Path]:
-    """Escolhe o banco da trilha: nome + core + notas da audição + ROTAÇÃO
-    (para que cada banco seja usado ao longo das gerações)."""
+                    rng: random.Random, learned: Dict[str, Any],
+                    personality: Optional[Dict[str, Any]] = None) -> Optional[Path]:
+    """v10 — SEMPRE os meus bancos (enquanto houver .sf2 em soundfonts/).
+
+    * drums → um dos bancos de bateria MEUS;
+    * melódicos → melhor banco MEU por nome+audição; sem casamento, ANY
+      banco meu (GM só se não existir .sf2 nenhum);
+    * Bandit: uso contabilizado; 40% escolhe o MENOS USADO → todos os
+      bancos entram em uso ao longo das gerações;
+    * Personalidade → timbre: energia/valência altas preferem bancos mais
+      claros (métrica 'bright' da --audition).
+    """
     banks = learned.get("banks") or {}
-    scored: List[Tuple[float, Path]] = []
-    for p in files.values():
-        bl = p.name.lower()
-        ns = _bank_name_score(inst_id, role, bl)
-        ls = _role_metric(banks.get(bl), role)
-        if ns <= 0 and ls <= 0:
-            continue
-        scored.append((2.0 * ns + ls, p))
-    if not scored:
+    usage = learned.setdefault("usage", {})
+
+    def is_drummy(bl: str) -> bool:
+        return "drum" in bl or "darbuka" in bl or "giant" in bl
+
+    cands = [p for p in files.values()
+             if is_drummy(p.name.lower()) == (role == "drums")
+             and not banks.get(p.name.lower(), {}).get("silent")]
+    if not cands:  # família sem banco meu → qualquer banco meu não-mudo
+        cands = [p for p in files.values()
+                 if not banks.get(p.name.lower(), {}).get("silent")]
+    if not cands:
         return None
-    scored.sort(key=lambda x: -x[0])
+
+    # banco "core" definido por você tem prioridade parcial
     core = SOUNDFONT_CORE.get(role)
-    if core:
-        cp = files.get(core.lower())
-        if cp is not None and any(p == cp for _, p in scored) and rng.random() < 0.55:
-            return cp
+    core_p = files.get(core.lower()) if core else None
+    if core_p in cands and rng.random() < 0.45:
+        return core_p
+
+    # exploração (bandit): banco menos usado → todo mundo é usado
+    if rng.random() < 0.40:
+        return min(cands, key=lambda p: usage.get(p.name.lower(), 0))
+
+    # escolha dirigida: nome + audição + personalidade (timbre)
+    def cand_score(p: Path) -> float:
+        bl = p.name.lower()
+        s = 2.0 * _bank_name_score(inst_id, role, bl) + _role_metric(banks.get(bl), role)
+        info = banks.get(bl)
+        if personality and info:
+            bright = float(info.get("bright") or 0)
+            want = 0.5 * (personality.get("energy", 0.5)
+                          + personality.get("valence", 0.5))
+            s += 1.5 * (1.0 - abs(bright - want)) - 0.75
+        return s
+
+    scored = sorted(cands, key=cand_score, reverse=True)
     rot = learned.setdefault("rot", {})
     idx = int(rot.get(role, 0)) % min(3, len(scored))
     rot[role] = idx + 1
-    return scored[idx][1]
+    return scored[idx]
 
 
 # --- AUDIÇÃO DOS BANCOS ("treino" dos SoundFonts) ---------------------------
@@ -1393,6 +1421,7 @@ def run_audition(log: Optional[logging.Logger] = None) -> Dict[str, Any]:
                      info.get("bright", "?"), "  ← MUDO" if info["silent"] else "")
     old = _sf_learned()
     out["rot"] = old.get("rot") or {}
+    out["usage"] = old.get("usage") or {}
     _save_sf_scores(out)
     log.info("Audição concluída → %s", _SF_SCORES_PATH)
     return out
@@ -1448,7 +1477,7 @@ def _midi_offset(mid) -> int:
 
 
 # =============================================================================
-# RENDERIZAÇÃO — por trilha com os SEUS bancos; GM e procedural de fallback
+# RENDERIZAÇÃO — por trilha com os SEUS bancos; cascata até procedural
 # =============================================================================
 
 _ROLE_GAIN = {"drums": 1.0, "perc": 0.9, "bass": 0.85, "lead": 0.95, "comp": 0.75}
@@ -1498,18 +1527,28 @@ def _wav_mono(path: Path):
 
 def _render_per_track(midi_path: Path, wav_path: Path,
                       track_map: Dict[int, Tuple[str, str]], style: str,
-                      log: logging.Logger) -> Optional[Path]:
-    """Cada trilha com o banco CERTO dos seus .sf2; GM para o resto."""
+                      log: logging.Logger,
+                      personality: Optional[Dict[str, Any]] = None) -> Optional[Path]:
+    """v10 — cada trilha com um dos SEUS .sf2 (sempre que existam).
+    Cascata de fallback POR TRILHA: seu banco → GM → procedural.
+    GM deixou de ser obrigatório para o modo por trilha existir."""
     import shutil
     import tempfile
     if _np is None or not track_map:
         return None
     import mido
     fs = shutil.which("fluidsynth")
-    gm = _gm_bank()
-    files = _sf2_files()
-    if not fs or gm is None:
+    if not fs:
+        log.warning("FluidSynth não encontrado — impossível usar seus .sf2 "
+                    "(Linux: apt install fluidsynth | macOS: brew install "
+                    "fluidsynth). Caindo para fallbacks.")
         return None
+    files = _sf2_files()
+    if not files:
+        log.warning("Nenhum .sf2 em soundfonts/ — no CI verifique "
+                    "'git ls-files soundfonts/' (bancos gitignored?).")
+        return None
+    gm = _gm_bank()
     learned = _sf_learned()
     rng = random.Random()
     mid = mido.MidiFile(str(midi_path))
@@ -1523,9 +1562,9 @@ def _render_per_track(midi_path: Path, wav_path: Path,
                 continue
             bank_role = _bank_role_of(inst)
             if _GM_INSTRUMENTS and bank_role == "comp":
-                bank = None  # modo acústico: comp com GM
+                bank = None
             else:
-                bank = _bank_for_track(inst, bank_role, files, rng, learned) if files else None
+                bank = _bank_for_track(inst, bank_role, files, rng, learned, personality)
             mono = None
             if bank:
                 stem_mid, wav = td / f"t{file_idx}.mid", td / f"t{file_idx}.wav"
@@ -1535,20 +1574,29 @@ def _render_per_track(midi_path: Path, wav_path: Path,
                         m, _ = _wav_mono(wav)
                         if m.size and float(_np.max(_np.abs(m))) > 1e-3:
                             mono = m
-                            used_banks.append(bank.name)
+                            used_banks.append(bank.name.lower())
                             log.info("  trilha %-14s ← %s", inst, bank.name)
                     except Exception:
                         pass
-            if mono is None:  # sem banco, ou banco mudo → GM
-                stem_gm, wav = td / f"t{file_idx}_gm.mid", td / f"t{file_idx}_gm.wav"
-                if _stem_midi(mid, file_idx, stem_gm, strip_programs=False) \
-                        and _render_stem(fs, gm, stem_gm, wav):
+            if mono is None:  # seu banco mudo/inexistente → GM → procedural
+                stem_gm, wav_gm = td / f"t{file_idx}_gm.mid", td / f"t{file_idx}_gm.wav"
+                ok_stem = _stem_midi(mid, file_idx, stem_gm, strip_programs=False)
+                if ok_stem and gm and _render_stem(fs, gm, stem_gm, wav_gm):
                     try:
-                        m, _ = _wav_mono(wav)
+                        m, _ = _wav_mono(wav_gm)
                         if m.size and float(_np.max(_np.abs(m))) > 1e-4:
                             mono = m
                             log.info("  trilha %-14s ← GM%s", inst,
                                      " (banco ficou mudo)" if bank else "")
+                    except Exception:
+                        pass
+                if mono is None and ok_stem:  # última instância: procedural
+                    try:
+                        if _builtin_render_wav(stem_gm, wav_gm, log):
+                            m, _ = _wav_mono(wav_gm)
+                            if m.size:
+                                mono = m
+                                log.info("  trilha %-14s ← procedural (fallback)", inst)
                     except Exception:
                         pass
             if mono is not None:
@@ -1556,8 +1604,12 @@ def _render_per_track(midi_path: Path, wav_path: Path,
             else:
                 log.warning("  trilha %s não renderizou", inst)
 
-    if "rot" in learned:  # persiste a rotação (cada banco é usado com o tempo)
-        _save_sf_scores(learned)
+    # bandit: registra o uso dos bancos desta geração
+    usage = learned.setdefault("usage", {})
+    for b in used_banks:
+        usage[b] = int(usage.get(b, 0)) + 1
+    _save_sf_scores(learned)
+
     if not stems:
         return None
     n = max(len(m) for m, _ in stems)
@@ -1569,8 +1621,8 @@ def _render_per_track(midi_path: Path, wav_path: Path,
         mix *= 0.86 / peak
     import soundfile as _sf
     _sf.write(str(wav_path), mix.astype(_np.float32), _SR_MIX)
-    log.info("WAV: %d trilhas | bancos usados: %s → %s",
-             len(stems), ", ".join(dict.fromkeys(used_banks)) or "GM", wav_path)
+    log.info("WAV: %d trilhas | SEUS bancos usados: %s → %s",
+             len(stems), ", ".join(sorted(set(used_banks))) or "nenhum", wav_path)
     return wav_path
 
 
@@ -1793,12 +1845,14 @@ def _builtin_render_wav(midi_path: Path, wav_path: Path, log: logging.Logger) ->
 
 def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
                   log: logging.Logger, track_map: Optional[Dict[int, Tuple[str, str]]] = None,
-                  style: str = "", forced_soundfont: Optional[str] = None) -> Optional[Path]:
+                  style: str = "", forced_soundfont: Optional[str] = None,
+                  personality: Optional[Dict[str, Any]] = None) -> Optional[Path]:
     if prefer_soundfont:
         # 1) POR TRILHA — os SEUS bancos (método principal)
         if track_map and not forced_soundfont:
             try:
-                if _render_per_track(midi_path, wav_path, track_map, style, log):
+                if _render_per_track(midi_path, wav_path, track_map, style, log,
+                                     personality=personality):
                     return wav_path
             except Exception as exc:
                 log.warning("Render por trilha falhou (%s) — full-band.", exc)
@@ -1981,9 +2035,7 @@ def _fit_form(bars: int, style: str) -> List[Tuple[str, int]]:
 
 def _transpose_plan(sections: List[Tuple[str, int]],
                     rng: random.Random) -> List[int]:
-    """v9: modulação por seção — a música muda de tom (e não 'toca igual').
-    Ponte → tonalidade relativa; último refrão → +2 semitons (truck driver);
-    versos posteriores podem subir para a relativa maior."""
+    """Modulação por seção — a música muda de tom (fim do 'toca igual')."""
     plan: List[int] = []
     total_chorus = sum(1 for n, _ in sections if n == "refrao")
     ci = 0
@@ -2066,6 +2118,15 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             if rid and rid not in inst_ids:
                 inst_ids.append(rid)
         log.info("Instrumentação padrão do estilo '%s': %s", style, inst_ids)
+
+    # v10: 30% das gerações trocam o lead de síntese (variedade entre músicas)
+    if ai_on and rng.random() < 0.30 and style in _ELECTRONIC_SF_STYLES:
+        for i, inst in enumerate(inst_ids):
+            if inst in ("synth_lead", "square_lead"):
+                alt = "square_lead" if inst == "synth_lead" else "synth_lead"
+                inst_ids[i] = alt
+                log.info("Variedade: lead %s → %s nesta geração", inst, alt)
+                break
 
     perc_ids = [i for i in inst_ids if _is_perc(i)]
     mel_ids = [i for i in inst_ids if i not in perc_ids]
@@ -2159,7 +2220,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             pit = min(127, max(21, pit))
         composer.add_note(track, start=start, duration=dur, pitch=pit, velocity=v)
 
-    # plano: forma + modulação (v9)
+    # plano: forma + modulação
     bars = max(4, int(round(params.duration / (beat_sec * beats_per_bar))))
     sections = _fit_form(bars, style)
     sec_tr = _transpose_plan(sections, rng)
@@ -2191,7 +2252,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             chorus_count += 1
             profile["vel"] = min(110, profile["vel"] + 3 * (chorus_count - 1))
         profile["vel"] = int(min(115, profile["vel"] * vel_scale))
-        sec_root = root_midi + sec_tr[sec_i]        # v9: tom da seção
+        sec_root = root_midi + sec_tr[sec_i]        # tom da seção
         comp_rhythms = COMP_RHYTHMS.get(style, [[0.0, 2.0]])
         comp_rhythm = rng.choice(comp_rhythms)
         if sec_name in ("refrao", "solo"):
@@ -2210,14 +2271,14 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                                 and sections[sec_i + 1][0] == "refrao"
                                 and sec_i + 2 >= len(sections) - 1)
         for b in range(sec_bars):
-            # v9: arco dinâmico — cresce ao longo da música; fade no outro
+            # arco dinâmico — cresce ao longo da música; fade no outro
             arc = 0.86 + 0.28 * (abs_bar / max(1, total_bars - 1))
             if sec_name == "outro":
                 arc *= max(0.55, 1 - 0.18 * (b / max(1, sec_bars - 1)))
             bar_vel = int(min(115, profile["vel"] * arc))
-            # v9: breakdown — compasso de vácuo antes do refrão final
+            # breakdown — compasso de vácuo antes do refrão final
             breakdown = (next_is_final_chorus and b == sec_bars - 1 and abs_bar > 8)
-            # v9: dropout — 1 compasso esparso a cada ~16
+            # dropout — 1 compasso esparso a cada ~16
             dropout = (abs_bar % 16 == 15 and rng.random() < 0.25)
 
             if b > 0 and len(comp_rhythms) > 1 and rng.random() < p_rhythm_change:
@@ -2267,7 +2328,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             # ---- bateria (kit) ----
             if kit_id and kit_id in track_of and profile["drums"] and not breakdown:
                 pattern = _kit_pattern(style, abs_bar, rng)
-                if dropout:  # v9: só ataques fortes
+                if dropout:
                     pattern = [h for h in pattern if float(h[0]).is_integer()]
                 if is_last and sec_i < len(sections) - 1:
                     pattern = [h for h in pattern if h[0] < 2.0] + _fill(style, rng)
@@ -2302,7 +2363,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[pid], abs_bar, i * 0.25, dur / beat_sec,
                          pitch, int(v * (bar_vel / 76.0)))
 
-            # ---- melodia (frases com DESENVOLVIMENTO temático) ----
+            # ---- melodia (frases com desenvolvimento temático) ----
             if profile["melody"] and lead_id and lead_id in track_of:
                 if b % 4 == 0 and b > 0:
                     r = rng.random()
@@ -2351,7 +2412,8 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
 
     wav_path = _render_audio(midi_path, out_dir / f"musica_{style}_s{params.seed}.wav",
                              params.prefer_soundfont, log, track_map=track_map,
-                             style=style, forced_soundfont=params.forced_soundfont)
+                             style=style, forced_soundfont=params.forced_soundfont,
+                             personality=personality)
 
     meta = {
         "gerado_em": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2370,7 +2432,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                "reference": ref_info},
         "forced_soundfont": params.forced_soundfont,
         "files": {"midi": str(midi_path), "wav": str(wav_path) if wav_path else None},
-        "generator": "music_generator.py v9",
+        "generator": "music_generator.py v10",
     }
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2414,7 +2476,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--bpm", type=int, default=None)
     p.add_argument("--key", default=None, help="ex.: C, F#, Am")
     p.add_argument("--scale", default=None, choices=sorted(SCALES))
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None,
+                   help="seed do RNG (vazio/None = aleatório — cada geração sai diferente)")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--output-dir", type=Path, default=Path("song_output"))
     p.add_argument("--no-soundfont", action="store_true",
@@ -2429,10 +2492,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--render-midi", default=None,
                    help="renderiza um MIDI existente com os SoundFonts do repo")
     p.add_argument("--audition", action="store_true",
-                   help="v9: testa TODOS os .sf2 (sonda melódica + bateria), "
-                        "mede qualidade e salva o aprendizado em memory/")
+                   help="testa TODOS os .sf2 (sonda melódica + bateria), mede "
+                        "qualidade e salva o aprendizado em memory/")
     p.add_argument("--gm-instruments", action="store_true",
-                   help="v9: trilhas harmônicas (piano/órgão) com timbre GM em vez "
+                   help="trilhas harmônicas (piano/órgão) com timbre GM em vez "
                         "dos bancos de síntese do repo")
     p.add_argument("--list-instruments", action="store_true")
     p.add_argument("--verbose", action="store_true")
