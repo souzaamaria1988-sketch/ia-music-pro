@@ -40,6 +40,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+
+DRUMS_SF2_BY_STYLE: Dict[str, str] = {
+    "breakcore":  "Amen_Drum_Kit.sf2",   # ← SEU kit de breakcore
+    "dnb":        "Amen_Drum_Kit.sf2",   # jungle/dnb usam o Amen também
+    "trap":       "Amen_Drum_Kit.sf2",
+    "electronic": "Amen_Drum_Kit.sf2",
+    "hiphop":     "Amen_Drum_Kit.sf2",   # boom bap clássico (opcional — sua call)
+    "rock":       "Drum Set JD Rockset 5.sf2",
+    "metal":      "Drum Set JD Rockset 5.sf2",
+}
+
 try:
     import numpy as _np
 except ImportError:
