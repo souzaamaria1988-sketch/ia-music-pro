@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-music_generator.py — Gerador principal do IA Music Pro (v12).
+music_generator.py — Gerador principal do IA Music Pro (v13).
 
-v12 — AMEN BREAK + REMAPEAMENTO DE BATERIA:
-    1. SEUS DOIS KITS AMEN: DRUMS_SF2_BY_STYLE roda entre Amen_Drum_Kit.sf2
-       e AmenBreak.sf2 em breakcore/dnb/trap/electronic/hiphop.
-    2. REMAPEAMENTO AUTOMÁTICO DE BATERIA: kits com layout próprio (como os
-       de break) eram renderizados MUROS ("trilha drums ← GM (banco ficou
-       mudo)"). Agora o gerador escaneia o kit nota a nota (canal 10 e,
-       se mudo, canal melódico), descobre onde as amostras moram, constrói
-       o mapa GM→kit, reescreve as notas e CACHA em memory/sf2_scores.json.
-       Identidade preservada: tecla GM que já soa não é remapeada.
-    3. DIAGNÓSTICO DE SOUNDFONT no início de cada geração: bancos /
-       FluidSynth / GM — ou o motivo do fracasso com o comando de correção.
-    4. FIX PERSONALIDADE: gênero fora do schema do autoencoder (breakcore
-       saía com energia=0.39!) agora faz blend com os priors do estilo.
-    5. --drums-sf2 força o kit na linha de comando.
-    6. VARIEDADE: além do lead (30%), camadas harmônicas e o baixo também
-       variam entre gerações.
+v13 — REMAP DE BATERIA v2 (o problema das "duas primeiras notas"):
+    Kits de break mapeiam samples nas teclas baixas (24-45); o mapa v1 usava
+    zonas GM ABSOLUTAS (hats em 40-90 etc.) que não existem lá — quase tudo
+    colapsava em 1-2 teclas e você só ouvia kick+caixa. Agora:
+    * ZONAS RELATIVAS ao range do kit (terço grave=kick, médio=caixa,
+      agudo=hats/pratos), SEM repetir teclas quando há alternativa;
+    * limiar relativo (20% do pico) elimina ghost keys (samples vizinhos
+      re-pitchados, fracos);
+    * o MAPA aparece no log (kick→27 caixa→29 hhF→33 ...) para conferência;
+    * cache v1 é invalidado (drum_map_v2) e re-aprendido;
+    * --scan-kit mostra tecla por tecla de qualquer kit (pico + barrinha).
 
-v11: kits por estilo + audição com cobertura. v10: sempre os meus bancos,
-     bandit. v9: --audition, modulação, desenvolvimento temático. v8: render
-     por trilha, --reference. v7: FluidSynth CLI + IA.
+v12: os dois kits Amen (Amen_Drum_Kit.sf2 / AmenBreak.sf2) com rotação por
+     estilo, remapeamento automático, diagnóstico de SoundFont, fix da
+     personalidade (autoencoder+priors), --drums-sf2, bandit restrito a
+     bancos aptos ao papel.
+v11: kits por estilo + audição com cobertura. v10: sempre os meus bancos.
+v9: --audition, modulação, desenvolvimento temático. v8: por trilha,
+    --reference. v7: FluidSynth CLI + IA (knowledge_base, personalidade,
+    feedback, auto-avaliação de repetitividade).
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ except ImportError:
     pass
 
 LOG = logging.getLogger("ia_music_pro.generator")
-_GM_INSTRUMENTS = False       # --gm-instruments
+_GM_INSTRUMENTS = False              # --gm-instruments
 _DRUMS_FORCED: Optional[str] = None  # --drums-sf2
 
 
@@ -820,7 +820,6 @@ def _new_motif(rng: random.Random, dense: bool, up_bias: float = 0.5):
 
 
 def _develop_motif(motif, op: str, rng: Optional[random.Random] = None):
-    """Transforma um motivo (inversão/retrogrado/transposição/rarefação)."""
     if motif is None:
         return None
     out = [((p, d), s) for (p, d), s in motif]
@@ -1059,12 +1058,12 @@ def _ai_personality(style: str, rng: random.Random, log: logging.Logger,
     if e is None or c is None or v is None:
         e, c, v = _VIBE_FALLBACK.get(style, (0.6, 0.5, 0.5))
     elif src == "autoencoder":
-        # v12: gênero fora do schema de treino caiu em 'generic' no autoencoder
-        # (breakcore saía com energia=0.39!). Blend com os priors do estilo.
+        # gênero fora do schema de treino caiu em 'generic' (breakcore saía
+        # com energia=0.39!) — blend com os priors do estilo.
         pe, pc_, pv = _VIBE_FALLBACK.get(style, (e, c, v))
-        e = max(0.5 * e + 0.5 * pe, pe - 0.15)   # estilo intenso não sai morno
+        e = max(0.5 * e + 0.5 * pe, pe - 0.15)
         c = 0.5 * c + 0.5 * pc_
-        v = min(0.5 * v + 0.5 * pv, pv + 0.15)   # estilo sombrio não fica eufórico
+        v = min(0.5 * v + 0.5 * pv, pv + 0.15)
         src = "autoencoder+priors"
 
     def jit(x: float) -> float:
@@ -1195,7 +1194,6 @@ _SF_DIR = Path("soundfonts")
 _SR_MIX = 44100
 _SF_SCORES_PATH = Path("memory/sf2_scores.json")
 
-# BANCO "CORE" DE CADA PAPEL — troque pelo nome EXATO do arquivo.
 SOUNDFONT_CORE: Dict[str, str] = {
     "lead":    "198_Juno106_LeadSynth.sf2",
     "bass":    "Crunk [moog]2007.with.sustain.sf2",
@@ -1204,8 +1202,7 @@ SOUNDFONT_CORE: Dict[str, str] = {
     "strings": "Crunk String.SF2",
 }
 
-# v12: KIT DE BATERIA POR ESTILO — os SEUS kits Amen com rotação.
-# (tupla = sorteia entre eles a cada geração)
+# SEUS kits por estilo (roda entre eles a cada geração)
 DRUMS_SF2_BY_STYLE: Dict[str, Tuple[str, ...]] = {
     "breakcore":  ("Amen_Drum_Kit.sf2", "AmenBreak.sf2"),
     "dnb":        ("Amen_Drum_Kit.sf2", "AmenBreak.sf2"),
@@ -1223,7 +1220,6 @@ _ELECTRONIC_SF_STYLES = {"electronic", "synthwave", "breakcore", "dnb", "chiptun
 
 
 def _sf2_files() -> Dict[str, Path]:
-    """{nome_minúsculo: caminho}. Case-insensitive (.sf2 e .SF2)."""
     out: Dict[str, Path] = {}
     if _SF_DIR.is_dir():
         for p in sorted(_SF_DIR.iterdir()):
@@ -1241,8 +1237,6 @@ def _gm_bank() -> Optional[Path]:
 
 
 def _soundfont_diagnostic(log: logging.Logger) -> bool:
-    """v12: diz de cara se seus bancos/FluidSynth estão OK — ou o motivo
-    (com o comando de correção para cada sistema)."""
     import shutil
     files = _sf2_files()
     fs = shutil.which("fluidsynth")
@@ -1339,9 +1333,6 @@ def _bank_for_track(inst_id: str, role: str, files: Dict[str, Path],
                     rng: random.Random, learned: Dict[str, Any],
                     personality: Optional[Dict[str, Any]] = None,
                     style: str = "") -> Optional[Path]:
-    """v12 — DRUMS: --drums-sf2 > DRUMS_SF2_BY_STYLE (seus kits Amen com
-    rotação) > kit com melhor cobertura GM + rotação nos 3 melhores.
-    Melódicos: nome + audição + personalidade + bandit."""
     banks = learned.get("banks") or {}
     usage = learned.setdefault("usage", {})
 
@@ -1357,20 +1348,17 @@ def _bank_for_track(inst_id: str, role: str, files: Dict[str, Path],
                      if not banks.get(p.name.lower(), {}).get("silent")]
         if not cands:
             return None
-        # 1) --drums-sf2 (força total)
         if _DRUMS_FORCED:
             p = files.get(_DRUMS_FORCED.lower())
             if p is None and Path(_DRUMS_FORCED).exists():
                 p = Path(_DRUMS_FORCED)
             if p is not None:
                 return p
-        # 2) SEUS kits para este estilo (com rotação entre eles)
         cfg = DRUMS_SF2_BY_STYLE.get(style or "")
         if cfg:
             picks = [files[c.lower()] for c in cfg if c.lower() in files]
             if picks:
                 return rng.choice(picks)
-        # 3) melhor cobertura GM (audição/remap) + rotação nos 3 melhores
         def cov(p: Path) -> float:
             return float(banks.get(p.name.lower(), {}).get("drum_cov", 0.5))
         top = sorted(cands, key=cov, reverse=True)[:3]
@@ -1393,8 +1381,11 @@ def _bank_for_track(inst_id: str, role: str, files: Dict[str, Path],
     core_p = files.get(core.lower()) if core else None
     if core_p in cands and rng.random() < 0.45:
         return core_p
-    if rng.random() < 0.40:  # bandit: menos usado
-        return min(cands, key=lambda p: usage.get(p.name.lower(), 0))
+    if rng.random() < 0.40:
+        # bandit: menos usado — mas SÓ entre bancos aptos ao papel
+        pool = [p for p in cands
+                if _bank_name_score(inst_id, role, p.name.lower()) >= 0] or cands
+        return min(pool, key=lambda p: usage.get(p.name.lower(), 0))
 
     def cand_score(p: Path) -> float:
         bl = p.name.lower()
@@ -1415,12 +1406,10 @@ def _bank_for_track(inst_id: str, role: str, files: Dict[str, Path],
 
 
 # =============================================================================
-# v12: REMAPEAMENTO DE BATERIA (kits com layout próprio — ex. Amen)
+# v13: REMAP DE BATERIA v2 — zonas RELATIVAS (fim das "duas primeiras notas")
 # =============================================================================
 
 def _drum_scan_midi(path: Path, channel: int) -> None:
-    """Sonda: uma nota por vez (24..90) no canal dado — acha onde o kit
-    mapeou as amostras."""
     import mido
     mid = mido.MidiFile(type=1, ticks_per_beat=480)
     meta = mido.MidiTrack()
@@ -1436,7 +1425,6 @@ def _drum_scan_midi(path: Path, channel: int) -> None:
 
 
 def _scan_drum_notes(wav: Path, lo: int = 24, hi: int = 90) -> Dict[int, float]:
-    """{nota: pico} da sonda — cada nota ocupa 0.25 s."""
     try:
         data, sr = _wav_mono(wav)
     except Exception:
@@ -1450,71 +1438,142 @@ def _scan_drum_notes(wav: Path, lo: int = 24, hi: int = 90) -> Dict[int, float]:
 
 
 def _build_drum_map(loud: Dict[int, float], thresh: float = 0.01) -> Dict[int, int]:
-    """GM→kit: MANTÉM a tecla GM se ela soar; remapeia só as mudas.
-    (Identidade preservada — kits GM-compliant não são alterados.)"""
-    audible = sorted(n for n, v in loud.items() if v > thresh)
-    if not audible:
+    """GM→kit por ZONAS RELATIVAS ao range do kit (não GM absoluto).
+
+    Kits de break mapeiam os samples nas teclas baixas (24-45); zonas GM
+    absolutas não existem lá e o mapa antigo colapsava quase tudo em 1-2
+    teclas ('só as duas primeiras notas'). Agora: teclas audíveis ordenadas
+    → terço grave=kick, médio=caixa, agudo=hats/pratos; a mais FORTE de
+    cada trecho vira o alvo, SEM repetir teclas. Ghost keys (samples
+    vizinhos re-pitchados, fraquinhos) caem fora pelo limiar relativo de
+    20% do pico."""
+    if not loud:
+        return {}
+    max_loud = max(loud.values()) or 1.0
+    rel = max(thresh, 0.20 * max_loud)
+    keys = sorted(n for n, v in loud.items() if v > rel)
+    if not keys:
+        keys = sorted(n for n, v in loud.items() if v > 1e-4)
+    if not keys:
         return {}
 
-    def nearest(n: int) -> int:
-        return min(audible, key=lambda a: abs(a - n))
+    def best(pool, used):
+        pool = [n for n in pool if n not in used]
+        return max(pool, key=lambda n: loud[n]) if pool else None
 
-    def pick(prefer: int, lo_: int, hi_: int) -> int:
-        zone = [n for n in audible if lo_ <= n <= hi_]
-        if prefer in zone:
-            return prefer
-        if zone:
-            return max(zone, key=lambda n: loud[n])
-        return nearest(prefer)
+    lo, hi = keys[0], keys[-1]
+    span = max(1, hi - lo)
+    low = [n for n in keys if n <= lo + 0.30 * span]
+    mid = [n for n in keys if lo + 0.25 * span < n <= lo + 0.60 * span]
+    high = [n for n in keys if n > lo + 0.55 * span]
 
     m: Dict[int, int] = {}
-    m[36] = pick(36, 24, 47)          # kick
-    m[38] = pick(38, 36, 55)          # caixa
-    m[40] = m[38]
-    for h in (42, 44, 46):            # chimbais
-        m[h] = pick(h, 40, 90)
-    m[49] = pick(49, 55, 90)          # crash
-    m[51] = pick(51, 50, 90)          # ride
-    m[53] = m[59] = m[51]
-    m[41] = pick(41, 35, 55)          # tons
-    m[47] = pick(47, 45, 60)
-    m[50] = pick(50, 50, 70)
+    used: set = set()
+
+    kick = best(low, used) or keys[0]
+    m[36] = kick
+    used.add(kick)
+
+    snare = best(mid, used) or best(keys, used) or kick
+    m[38] = m[40] = snare
+    used.add(snare)
+
+    if len(keys) >= 4:
+        hpool = high or keys
+        for h in (42, 44, 46):
+            cand = best(hpool, used) or snare
+            m[h] = cand
+            used.add(cand)
+        cym = best(high, used) or best(keys, used) or snare
+        m[49] = cym
+        used.add(cym)
+        ride = best(high, used) or cym
+        m[51] = m[53] = m[59] = ride
+        used.add(ride)
+    else:
+        for h in (42, 44, 46, 49, 51, 53, 59):
+            m[h] = best(keys, used) or snare
+            used.add(m[h])
+
+    tpool = mid or keys
+    for t in (41, 47, 50):
+        cand = best(tpool, used)
+        m[t] = cand if cand is not None else snare
+        used.add(m[t])
+
     for n in range(35, 82):
         if n not in m:
-            m[n] = n if loud.get(n, 0.0) > thresh else nearest(n)
-    return {k: v for k, v in m.items() if v is not None}
+            m[n] = n if n in keys else (best(keys, used) or snare)
+            used.add(m[n])
+    return m
 
 
 def _ensure_drum_map(fs: str, bank: Path, learned: Dict[str, Any],
                      log: logging.Logger) -> Tuple[Optional[Dict[int, int]], Optional[int]]:
-    """Garante drum_map para o kit (escaneia na 1ª vez e persiste em memory/).
-    Retorna (mapa ou None, canal que funciona: 9=percussão GM ou 0=melódico)."""
+    """Garante drum_map v2 (escaneia na 1ª vez e persiste em memory/).
+    Cache v1 (zonas GM absolutas — ruim) é invalidado."""
     banks = learned.setdefault("banks", {})
     info = banks.get(bank.name.lower()) or {}
-    if info.get("drum_scanned"):
+    if info.get("drum_map_v2"):
         return (info.get("drum_map") or None), info.get("drum_channel", 9)
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         probe = td / "scan.mid"
-        for ch in (9, 0):  # canal de percussão primeiro; melódico se mudo
+        for ch in (9, 0):
             wav = td / f"scan_{ch}.wav"
             _drum_scan_midi(probe, ch)
             if _render_stem(fs, bank, probe, wav):
                 dmap = _build_drum_map(_scan_drum_notes(wav))
                 if dmap:
                     info.update({"drum_map": dmap, "drum_channel": ch,
-                                 "drum_scanned": True,
+                                 "drum_map_v2": True,
                                  "drum_cov": max(0.6, float(info.get("drum_cov", 0)))})
                     banks[bank.name.lower()] = info
-                    log.info("  kit %-34s remapeado p/ canal %d (%d teclas ativas)",
-                             bank.name, ch, len(set(dmap.values())))
+                    roles = {36: "kick", 38: "caixa", 42: "hhF", 46: "hhA",
+                             49: "crash", 51: "ride", 41: "tom"}
+                    lay = " ".join(f"{r}→{dmap.get(g, '?')}" for g, r in roles.items())
+                    log.info("  kit %-30s canal %d | %d teclas | %s",
+                             bank.name, ch, len(set(dmap.values())), lay)
                     return dmap, ch
     info.update({"drum_scanned": True, "drum_map": None, "drum_cov": 0.0})
     banks[bank.name.lower()] = info
     log.warning("  kit %s: nenhuma tecla respondeu nem no canal 10 nem no 1 "
                 "(banco vazio/corrompido?)", bank.name)
     return None, None
+
+
+def scan_kit(bank_name: str, log: logging.Logger) -> None:
+    """--scan-kit: mostra tecla por tecla do kit (pico + barrinha) e o
+    mapa proposto — para você conferir com seu ouvido/teclado."""
+    import shutil
+    import tempfile
+    fs = shutil.which("fluidsynth")
+    bank = _sf2_files().get(bank_name.lower())
+    if bank is None and Path(bank_name).exists():
+        bank = Path(bank_name)
+    if not fs or bank is None:
+        log.error("Uso: --scan-kit <nome em soundfonts/>. FluidSynth necessário.")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        probe = td / "scan.mid"
+        for ch in (9, 0):
+            wav = td / f"scan_{ch}.wav"
+            _drum_scan_midi(probe, ch)
+            if _render_stem(fs, bank, probe, wav):
+                loud = _scan_drum_notes(wav)
+                if loud and max(loud.values()) > 1e-3:
+                    log.info("Kit %s — canal %d (pico por tecla):", bank.name, ch)
+                    top = max(loud.values())
+                    for n, v in sorted(loud.items()):
+                        bar = "█" * int(20 * v / max(top, 1e-9))
+                        log.info("  tecla %3d  %6.4f  %s", n, v, bar)
+                    dmap = _build_drum_map(loud)
+                    log.info("Mapa proposto: %s",
+                             {g: dmap.get(g) for g in (36, 38, 42, 46, 49, 51)})
+                    return
+        log.warning("Nenhuma tecla respondeu no kit %s.", bank.name)
 
 
 # =============================================================================
@@ -1564,7 +1623,6 @@ def _bank_metrics(wav: Path) -> Optional[Dict[str, Any]]:
 
 
 def _drum_note_coverage(wav: Path) -> Dict[str, bool]:
-    """Cada nota GM da sonda soa? Detecta kits com layout próprio."""
     try:
         data, sr = _wav_mono(wav)
     except Exception:
@@ -1581,8 +1639,6 @@ def _drum_note_coverage(wav: Path) -> Dict[str, bool]:
 
 
 def run_audition(log: Optional[logging.Logger] = None) -> Dict[str, Any]:
-    """Testa TODOS os bancos: sondas melódica + bateria, RMS/brilho/graves,
-    cobertura de notas GM (kits com layout próprio) — salva o aprendizado."""
     log = log or LOG
     import shutil
     import tempfile
@@ -1680,7 +1736,7 @@ def _midi_offset(mid) -> int:
 
 
 # =============================================================================
-# RENDERIZAÇÃO — por trilha com os SEUS bancos + remap de bateria
+# RENDERIZAÇÃO — por trilha com os SEUS bancos + remap v2
 # =============================================================================
 
 _ROLE_GAIN = {"drums": 1.0, "perc": 0.9, "bass": 0.85, "lead": 0.95, "comp": 0.75}
@@ -1689,8 +1745,6 @@ _ROLE_GAIN = {"drums": 1.0, "perc": 0.9, "bass": 0.85, "lead": 0.95, "comp": 0.7
 def _stem_midi(src_mid, file_idx: int, out_path: Path, strip_programs: bool,
                drum_map: Optional[Dict[int, int]] = None,
                drum_channel: Optional[int] = None) -> bool:
-    """MIDI de UMA trilha. drum_map: reescreve notas GM→layout do kit;
-    drum_channel: canal que o kit responde (9=percussão ou 0=melódico)."""
     import mido
     if not (0 <= file_idx < len(src_mid.tracks)):
         return False
@@ -1746,8 +1800,6 @@ def _render_per_track(midi_path: Path, wav_path: Path,
                       track_map: Dict[int, Tuple[str, str]], style: str,
                       log: logging.Logger,
                       personality: Optional[Dict[str, Any]] = None) -> Optional[Path]:
-    """Cada trilha com um dos SEUS .sf2. Cascata por trilha:
-    seu banco (com remap de bateria) → GM → procedural."""
     import shutil
     import tempfile
     if _np is None or not track_map:
@@ -1799,7 +1851,7 @@ def _render_per_track(midi_path: Path, wav_path: Path,
                             log.info("  trilha %-14s ← %s", inst, bank.name)
                     except Exception:
                         pass
-            if mono is None:  # seu banco mudo/inexistente → GM → procedural
+            if mono is None:
                 stem_gm, wav_gm = td / f"t{file_idx}_gm.mid", td / f"t{file_idx}_gm.wav"
                 ok_stem = _stem_midi(mid, file_idx, stem_gm, strip_programs=False)
                 if ok_stem and gm and _render_stem(fs, gm, stem_gm, wav_gm):
@@ -1826,7 +1878,6 @@ def _render_per_track(midi_path: Path, wav_path: Path,
             else:
                 log.warning("  trilha %s não renderizou", inst)
 
-    # bandit: registra o uso dos bancos desta geração
     usage = learned.setdefault("usage", {})
     for b in used_banks:
         usage[b] = int(usage.get(b, 0)) + 1
@@ -1865,7 +1916,7 @@ def _try_fluidsynth_cli(midi_path: Path, wav_path: Path, log: logging.Logger,
         else:
             log.warning("--soundfont %r não encontrado — usando GM.", forced)
     if bank is None:
-        bank = _gm_bank()  # full-band SOMENTE com GM completo
+        bank = _gm_bank()
     if bank is None:
         return None
     try:
@@ -2070,7 +2121,6 @@ def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
                   style: str = "", forced_soundfont: Optional[str] = None,
                   personality: Optional[Dict[str, Any]] = None) -> Optional[Path]:
     if prefer_soundfont:
-        # 1) POR TRILHA — os SEUS bancos (método principal)
         if track_map and not forced_soundfont:
             try:
                 if _render_per_track(midi_path, wav_path, track_map, style, log,
@@ -2078,10 +2128,8 @@ def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
                     return wav_path
             except Exception as exc:
                 log.warning("Render por trilha falhou (%s) — full-band.", exc)
-        # 2) FULL-BAND — GM completo (ou banco forçado pelo usuário)
         if _try_fluidsynth_cli(midi_path, wav_path, log, forced=forced_soundfont):
             return wav_path
-        # 3) soundfont_renderer (compatibilidade)
         if _RENDERER is not None:
             import inspect
             try:
@@ -2096,7 +2144,6 @@ def _render_audio(midi_path: Path, wav_path: Path, prefer_soundfont: bool,
                     return wav_path
             except Exception as exc:
                 log.warning("soundfont_renderer falhou (%s) — caindo.", exc)
-    # 4) Embutido — procedural, APENAS fallback
     try:
         if _builtin_render_wav(midi_path, wav_path, log):
             return wav_path
@@ -2280,10 +2327,8 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     style_cfg = STYLES.get(style, STYLES["pop"])
     ai_on = bool(params.use_ai)
 
-    # v12: diagnóstico de SoundFont — de cara, antes de qualquer coisa
     _soundfont_diagnostic(log)
 
-    # temperatura adaptativa (feedback aprendido)
     temperature = params.temperature
     if ai_on:
         delta = float(_feedback_style_state(style).get("temp_delta", 0.0))
@@ -2292,7 +2337,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             log.info("IA (feedback): temperatura %.2f → %.2f (Δ%+.2f, aprendido)",
                      params.temperature, temperature, delta)
 
-    # BPM do dataset real
     bpm_source = "style_default"
     if ai_on and not params.bpm_explicit:
         kb = _kb_bpm(style, log)
@@ -2311,7 +2355,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     root_midi = 48 + params.key_root
     swing_on = style_cfg["swing"] > 0
 
-    # personalidade + referência
     personality = _ai_personality(style, rng, log, use_ae=ai_on)
     ref_info: Optional[Dict[str, Any]] = None
     if params.reference:
@@ -2334,7 +2377,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     p_bass_fill = 0.25 + 0.35 * personality["complexity"]
     up_bias = 0.35 + 0.30 * personality["valence"]
 
-    # instrumentação
     inst_ids: List[str] = list(params.instruments)
     if not inst_ids:
         for cand in style_cfg["instruments"]:
@@ -2343,7 +2385,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                 inst_ids.append(rid)
         log.info("Instrumentação padrão do estilo '%s': %s", style, inst_ids)
 
-    # variedade entre gerações: lead / camadas / baixo
     if ai_on:
         if rng.random() < 0.30 and style in _ELECTRONIC_SF_STYLES:
             for i, inst in enumerate(inst_ids):
@@ -2409,7 +2450,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     log.info("Instrumentos: lead=%s | acordes=%s | baixo=%s | kit=%s | percussão=%s",
              lead_id, comp_ids or "-", bass_id, kit_id, perc_ids or "-")
 
-    # canais únicos
     used_ch = {9}
     for inst in dict.fromkeys(inst_ids):
         entry = INSTRUMENTS.get(inst)
@@ -2454,7 +2494,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
             pit = min(127, max(21, pit))
         composer.add_note(track, start=start, duration=dur, pitch=pit, velocity=v)
 
-    # plano: forma + modulação
     bars = max(4, int(round(params.duration / (beat_sec * beats_per_bar))))
     sections = _fit_form(bars, style)
     sec_tr = _transpose_plan(sections, rng)
@@ -2524,7 +2563,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                 degree = 4
                 next_degree = prog[0]
 
-            # ---- acordes (comp) ----
             if profile["comp"] and comp_ids:
                 offsets = _chord_offsets(scale, degree, add7)
                 prev_voicing = _voice_chord(prev_voicing, offsets, sec_root + 12)
@@ -2540,7 +2578,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                             note(track_of[inst], abs_bar, hpos + off, dur,
                                  pit, bar_vel - 3 * j, swing=swing_on)
 
-            # ---- baixo ----
             if profile["bass"] and bass_id and bass_id in track_of and not breakdown:
                 use_fill = ((b % 4 == 3 or is_last) and rng.random() < p_bass_fill
                             and style not in ("ambient", "dungeon", "cinematic", "classical"))
@@ -2556,7 +2593,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[bass_id], abs_bar, pos, dur, pitch,
                          bar_vel - 8, swing=swing_on)
 
-            # ---- bateria (kit) ----
             if kit_id and kit_id in track_of and profile["drums"] and not breakdown:
                 pattern = _kit_pattern(style, abs_bar, rng)
                 if dropout:
@@ -2577,7 +2613,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[kit_id], abs_bar, pos, dur_beats,
                          GM[name], int(vel * gain), swing=swing_on)
 
-            # ---- percussão individual ----
             for pid in perc_ids:
                 if pid not in track_of or not profile["drums"] or breakdown:
                     continue
@@ -2594,7 +2629,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                     note(track_of[pid], abs_bar, i * 0.25, dur / beat_sec,
                          pitch, int(v * (bar_vel / 76.0)))
 
-            # ---- melodia ----
             if profile["melody"] and lead_id and lead_id in track_of:
                 if b % 4 == 0 and b > 0:
                     r = rng.random()
@@ -2617,7 +2651,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     score = _auto_evaluate_and_update(composer, style, beat_sec, temperature,
                                       ai_on, log)
 
-    # exportação
     out_dir = params.output_dir / f"{time.strftime('%Y%m%d-%H%M%S')}_{style}_s{params.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
     midi_path = out_dir / f"musica_{style}_s{params.seed}.mid"
@@ -2630,7 +2663,6 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
     except Exception as exc:
         log.debug("save_json() indisponível: %s", exc)
 
-    # track_map com índices DO ARQUIVO (offset da track de tempo)
     import mido as _mido
     _mid = _mido.MidiFile(str(midi_path))
     _off = _midi_offset(_mid)
@@ -2663,7 +2695,7 @@ def generate_song(params: SongParams, log: logging.Logger = LOG) -> Dict[str, An
                "reference": ref_info},
         "forced_soundfont": params.forced_soundfont,
         "files": {"midi": str(midi_path), "wav": str(wav_path) if wav_path else None},
-        "generator": "music_generator.py v12",
+        "generator": "music_generator.py v13",
     }
     meta_path = out_dir / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2719,7 +2751,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="força um .sf2 (nome em soundfonts/ ou caminho) para a "
                         "música INTEIRA")
     p.add_argument("--drums-sf2", default=None,
-                   help="v12: força o kit de bateria (nome em soundfonts/ ou caminho)")
+                   help="força o kit de bateria (nome em soundfonts/ ou caminho)")
     p.add_argument("--reference", default=None,
                    help="áudio de referência (MP3/WAV) — BPM/energia guiam a geração")
     p.add_argument("--render-midi", default=None,
@@ -2727,6 +2759,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--audition", action="store_true",
                    help="testa TODOS os .sf2 (sondas + cobertura de bateria), "
                         "mede qualidade e salva o aprendizado em memory/")
+    p.add_argument("--scan-kit", default=None,
+                   help="v13: mostra o layout de teclas de um kit (pico por tecla) "
+                        "e o mapa proposto")
     p.add_argument("--gm-instruments", action="store_true",
                    help="trilhas harmônicas (piano/órgão) com timbre GM")
     p.add_argument("--list-instruments", action="store_true")
@@ -2745,6 +2780,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     _RI_ERR)
     if args.list_instruments:
         list_instruments()
+        return 0
+    if args.scan_kit:
+        scan_kit(args.scan_kit, log)
         return 0
     if args.audition:
         run_audition(log)
