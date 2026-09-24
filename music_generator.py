@@ -819,7 +819,7 @@ def _new_motif(rng: random.Random, dense: bool, up_bias: float = 0.5):
     return sorted(zip(cell, steps), key=lambda x: x[0][0])
 
 
-def _develop_motif(motif, op: str):
+def _develop_motif(motif, op: str, rng: Optional[random.Random] = None):
     """Transforma um motivo (técnica clássica de desenvolvimento temático)."""
     if motif is None:
         return None
@@ -827,13 +827,12 @@ def _develop_motif(motif, op: str):
     if op == "invert":        # contorno espelhado
         out = [((p, d), max(-3, min(10, 2 - s))) for (p, d), s in out]
     elif op == "shift":       # transposição do tema
-        out = [((p, d), max(-3, min(10, s + rng.choice((2, -2, 3))))) for (p, d), s in out]
-        # (rng usado dentro de _develop_phrase para escolher; aqui fixo)
-        out = [((p, d), max(-3, min(10, s + 2))) for (p, d), s in out]
+        step = rng.choice((2, -2, 3)) if rng is not None else 2
+        out = [((p, d), max(-3, min(10, s + step))) for (p, d), s in out]
     elif op == "retro":       # melodia de trás pra frente
         steps = [s for _, s in out][::-1]
-        out = [((p, d), s) for (p, d), s in zip([(pd) for pd, _ in out], steps)]
-    elif op == "sparse":      # rarefação (menos notas, mesmos tempos fortes)
+        out = [((p, d), s) for (p, d), s in zip([pd for pd, _ in out], steps)]
+    elif op == "sparse":      # rarefação (menos notas)
         out = out[::2] or out[:1]
     return out
 
