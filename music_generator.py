@@ -150,7 +150,39 @@ def _setup_logging(verbose: bool = False) -> logging.Logger:
     return LOG
 
 
-# =============================================================================
+_PATTERNS_PATH = Path("memory/patterns.json")
+
+
+def _load_patterns() -> Dict[str, Any]:
+    try:
+        return json.loads(_PATTERNS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"genres": {}}
+
+
+def _markov_progression(style: str, rng: random.Random,
+                        length: int = 4) -> Optional[List[int]]:
+    """Amostra uma progressão CAMINHANDO na matriz de Markov aprendida de
+    MIDIs reais (memory/patterns.json). None → usa as tabelas manuais."""
+    g = _load_patterns().get("genres", {}).get(style)
+    if not g or not g.get("markov"):
+        return None
+    mat = g["markov"]
+    prog = [0]                                   # começa na tônica
+    for _ in range(length - 1):
+        row = mat[prog[-1]]
+        r, acc = rng.random(), 0.0
+        for d, w in enumerate(row):
+            acc += w
+            if r <= acc:
+                prog.append(d)
+                break
+        else:
+            prog.append(0)
+    # deixa o último grau puxar de volta à tônica (turnaround natural)
+    if rng.random() < 0.5 and prog[-1] not in (0, 4):
+        prog[-1] = 4 if len(mat) > 4 else 0
+    return prog =============================================================================
 # PERCUSSÃO GM
 # =============================================================================
 
